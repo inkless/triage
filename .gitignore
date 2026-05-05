@@ -1,1 +1,31 @@
+# Rust build artifacts
 /target
+**/*.rs.bk
+*.profraw
+rustc-ice-*.txt
+
+# macOS
+.DS_Store
+._*
+
+# Editors / IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# AI agent local config — per-machine, never committed
+.claude/*.local.*
+.claude/settings.local.json
+.codex/*.local.*
+.cursor/*.local.*
+.aider.local.*
