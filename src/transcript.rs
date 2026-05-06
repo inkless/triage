@@ -1,17 +1,26 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
+
+/// Window in which a prompt newer than the latest away_summary is considered
+/// "current work." away_summary fires ~184s after a turn ends; we add buffer
+/// so brief network/hook hiccups don't strand the prompt as the headline forever.
+const PROMPT_FRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 use crate::discovery::{encode_cwd, projects_dir};
 use crate::models::Session;
 
 #[allow(dead_code)]
+#[derive(Clone)]
 pub struct TranscriptDigest {
     pub path: PathBuf,
     pub headline: Option<String>,
+    pub headline_at: Option<SystemTime>,
     pub last_prompt: Option<String>,
+    pub last_prompt_at: Option<SystemTime>,
     pub last_turn_duration_ms: Option<u64>,
     pub last_turn_msg_count: Option<u64>,
     pub last_event_at: Option<SystemTime>,
@@ -20,10 +29,120 @@ pub struct TranscriptDigest {
     pub last_stop_had_errors: bool,
 }
 
+/// (path → (mtime, digest)). Skip re-parsing JSONL when its mtime hasn't
+/// advanced since the last read. Most jsonls don't change between refresh
+/// ticks; the active session's file does, but only it pays the parse cost.
+#[derive(Default)]
+pub struct DigestCache {
+    entries: HashMap<PathBuf, (SystemTime, TranscriptDigest)>,
+}
+
+impl DigestCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn get(&mut self, path: &Path) -> Option<TranscriptDigest> {
+        let mtime = fs::metadata(path).and_then(|m| m.modified()).ok()?;
+        if let Some((cached_mtime, d)) = self.entries.get(path)
+            && *cached_mtime == mtime
+        {
+            return Some(d.clone());
+        }
+        let d = digest(path)?;
+        self.entries.insert(path.to_path_buf(), (mtime, d.clone()));
+        Some(d)
+    }
+
+    /// Drop entries for files that no longer exist. Called once per refresh
+    /// so the cache doesn't grow unboundedly across renamed/deleted jsonls.
+    pub fn evict_missing(&mut self) {
+        self.entries.retain(|p, _| p.exists());
+    }
+}
+
+/// Pair every live session in the same cwd to a transcript .jsonl. We can't
+/// trust the sessionId recorded in `~/.claude/sessions/<pid>.json`: after
+/// `/clear`, Claude writes the new conversation to a freshly-named .jsonl but
+/// often doesn't rewrite the sessions JSON, leaving it pointing at a stale
+/// file. We also can't trust file mtime alone, because away_summary writes can
+/// touch an idle session's jsonl after the user has moved focus elsewhere.
+///
+/// The most reliable signal for "which jsonl is the user actively typing in"
+/// is the latest user-text event timestamp inside each .jsonl. Pair the
+/// currently-focused tmux pane's pid with the jsonl whose latest user-text is
+/// newest; pair the rest greedily by mtime against updatedAt.
+pub fn assign_transcripts(sessions: &mut [Session], cache: &mut DigestCache) {
+    let mut by_cwd: HashMap<PathBuf, Vec<usize>> = HashMap::new();
+    for (i, s) in sessions.iter().enumerate() {
+        by_cwd.entry(s.cwd.clone()).or_default().push(i);
+    }
+
+    for (cwd, mut idxs) in by_cwd {
+        let dir = projects_dir().join(encode_cwd(&cwd));
+        let Ok(read) = fs::read_dir(&dir) else { continue };
+
+        // (mtime, last_user_text_at, path). last_user_text_at falls back to
+        // mtime when the file has no qualifying user-text event, so files with
+        // only system/assistant noise still sort somewhere reasonable.
+        let mut jsonls: Vec<(SystemTime, SystemTime, PathBuf)> = Vec::new();
+        for entry in read.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.len() == 0 {
+                continue;
+            }
+            let Ok(mtime) = meta.modified() else { continue };
+            // Use the cached digest's last_prompt_at as the user-text
+            // timestamp. Falls back to mtime when no qualifying user-text
+            // exists. The cache makes this free on unchanged files.
+            let user_ts = cache
+                .get(&path)
+                .and_then(|d| d.last_prompt_at)
+                .unwrap_or(mtime);
+            jsonls.push((mtime, user_ts, path));
+        }
+
+        // Active session in this cwd, if any. There is at most one active
+        // pane per attached tmux client.
+        let active_idx = idxs
+            .iter()
+            .position(|&i| sessions[i].pane.as_ref().is_some_and(|p| p.active));
+
+        if let (Some(pos), false) = (active_idx, jsonls.is_empty()) {
+            // Active pane gets the jsonl with newest last-user-text.
+            let pick = jsonls
+                .iter()
+                .enumerate()
+                .max_by_key(|(_, (_, uts, _))| *uts)
+                .map(|(i, _)| i);
+            if let Some(j) = pick {
+                let (_, _, path) = jsonls.swap_remove(j);
+                let session_idx = idxs.swap_remove(pos);
+                sessions[session_idx].transcript_path = Some(path);
+            }
+        }
+
+        // Remaining sessions: greedy by updatedAt DESC against mtime DESC.
+        jsonls.sort_by(|a, b| b.0.cmp(&a.0));
+        idxs.sort_by_key(|&i| std::cmp::Reverse(sessions[i].updated_at_ms));
+        for (k, &si) in idxs.iter().enumerate() {
+            if k >= jsonls.len() {
+                break;
+            }
+            sessions[si].transcript_path = Some(jsonls[k].2.clone());
+        }
+    }
+}
+
 /// For a given session, locate its transcript JSONL.
 /// Prefer the file matching `sessionId` (the canonical pointer when fresh);
 /// fall back to newest-mtime if the sessionId file is missing or empty
 /// (handles the post-`/clear` lag case documented in PLAN.md).
+/// Used as a single-session fallback when assign_transcripts hasn't run.
 pub fn locate_transcript(cwd: &Path, session_id: &str) -> Option<PathBuf> {
     let dir = projects_dir().join(encode_cwd(cwd));
 
@@ -60,6 +179,7 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
 
     let mut headline: Option<(SystemTime, String)> = None;
     let mut last_prompt: Option<String> = None;
+    let mut last_prompt_at: Option<SystemTime> = None;
     let mut last_turn_duration_ms: Option<u64> = None;
     let mut last_turn_msg_count: Option<u64> = None;
     let mut last_event_at: Option<SystemTime> = None;
@@ -79,8 +199,25 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match ty {
             "last-prompt" => {
+                // last-prompt events have no timestamp, but they carry the canonical
+                // prompt text. Use as a fallback source for last_prompt; timestamp
+                // comes from the user-text events below.
                 if let Some(p) = v.get("lastPrompt").and_then(|p| p.as_str()) {
                     last_prompt = Some(p.to_string());
+                }
+            }
+            "user" => {
+                // The transcript records both real user-typed messages and tool_result
+                // echoes under type=user. Only the former are "prompts." Discriminate
+                // by looking for a content block of type=text.
+                if let Some(text) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(extract_user_text)
+                    && let Some(t) = ts
+                {
+                    last_prompt = Some(text);
+                    last_prompt_at = Some(t);
                     user_prompt_count += 1;
                 }
             }
@@ -120,10 +257,17 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
         }
     }
 
+    let (headline_at, headline_text) = match headline {
+        Some((t, s)) => (Some(t), Some(s)),
+        None => (None, None),
+    };
+
     Some(TranscriptDigest {
         path: path.to_path_buf(),
-        headline: headline.map(|(_, s)| s),
+        headline: headline_text,
+        headline_at,
         last_prompt,
+        last_prompt_at,
         last_turn_duration_ms,
         last_turn_msg_count,
         last_event_at,
@@ -133,20 +277,95 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
     })
 }
 
-pub fn enrich(session: &mut Session) {
-    let Some(path) = locate_transcript(&session.cwd, &session.session_id) else {
-        return;
+pub fn enrich(session: &mut Session, now: SystemTime, cache: &mut DigestCache) {
+    let path = match &session.transcript_path {
+        Some(p) => p.clone(),
+        None => match locate_transcript(&session.cwd, &session.session_id) {
+            Some(p) => p,
+            None => return,
+        },
     };
     session.transcript_path = Some(path.clone());
-    let Some(d) = digest(&path) else { return };
-    session.headline = d.headline.or_else(|| d.last_prompt.clone());
+    let Some(d) = cache.get(&path) else { return };
+    // Prompt supersedes the recap when the user started new work AND the session
+    // is genuinely still active. We gate on last_event_at (latest transcript
+    // event) rather than session.status, because the sessions JSON status lags
+    // and can stay "busy" long after activity has stopped. If the transcript
+    // hasn't seen any event in PROMPT_FRESH_WINDOW, the away_summary should have
+    // caught up; if it didn't, the prompt is stale and the recap is preferable.
+    let session_is_active = d
+        .last_event_at
+        .and_then(|t| now.duration_since(t).ok())
+        .map(|age| age <= PROMPT_FRESH_WINDOW)
+        .unwrap_or(false);
+    let prompt_supersedes = match (d.headline_at, d.last_prompt_at) {
+        (Some(h), Some(p)) => p > h && session_is_active,
+        (None, Some(_)) => session_is_active,
+        _ => false,
+    };
+    session.headline = if prompt_supersedes {
+        d.last_prompt.clone().map(|p| format!("→ {p}"))
+    } else {
+        d.headline.clone()
+    }
+    .or_else(|| d.headline.clone())
+    .or_else(|| d.last_prompt.clone());
     session.last_prompt = d.last_prompt;
+    session.last_prompt_at = d.last_prompt_at;
     session.last_turn_duration_ms = d.last_turn_duration_ms;
     session.last_turn_msg_count = d.last_turn_msg_count;
     session.last_event_at = d.last_event_at;
     session.last_stop_at = d.last_stop_at;
     session.user_prompt_count = d.user_prompt_count;
     session.last_stop_had_errors = d.last_stop_had_errors;
+}
+
+/// Extract user-typed text from a message.content value.
+/// Content is either a string (rare) or an array of blocks; we only want
+/// real prompt text. Returns None if the content is purely tool results,
+/// auto-attached image-source markers, or interrupt sentinels.
+fn extract_user_text(content: &Value) -> Option<String> {
+    if let Some(s) = content.as_str() {
+        return clean_prompt_text(s);
+    }
+    let arr = content.as_array()?;
+    let mut parts: Vec<String> = Vec::new();
+    for block in arr {
+        if block.get("type").and_then(|t| t.as_str()) == Some("text")
+            && let Some(t) = block.get("text").and_then(|t| t.as_str())
+            && let Some(cleaned) = clean_prompt_text(t)
+        {
+            parts.push(cleaned);
+        }
+    }
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(" "))
+}
+
+/// Drop auto-generated noise that arrives in user events: image-attachment
+/// metadata, slash-command sentinels, and interrupt markers. Returns None if
+/// the trimmed text is empty or pure noise.
+fn clean_prompt_text(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("[Image: source:") {
+        return None;
+    }
+    if trimmed == "[Request interrupted by user]" {
+        return None;
+    }
+    // Slash-command invocations are emitted into the transcript as XML-tagged
+    // synthetic messages (`<command-name>/clear</command-name>`,
+    // `<local-command-stdout>...`, `<local-command-caveat>...` etc.). Skip them
+    // so they don't masquerade as prompts.
+    if trimmed.starts_with("<command-") || trimmed.starts_with("<local-command-") {
+        return None;
+    }
+    Some(trimmed.to_string())
 }
 
 /// Parse RFC3339 timestamp "2026-05-04T22:34:00.000Z" → SystemTime.

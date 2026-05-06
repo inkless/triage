@@ -1,6 +1,9 @@
+mod approval;
 mod classifier;
 mod discovery;
 mod models;
+mod notify_os;
+mod persist;
 mod transcript;
 mod tmux;
 mod ui;
@@ -22,12 +25,26 @@ use crate::watcher::FsWatcher;
 
 const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
+/// Minimum gap between watcher-triggered refreshes. Without this, an actively
+/// writing jsonl can fire fs events fast enough that refresh runs every loop
+/// iteration, blocking key handling. The 2s REFRESH_INTERVAL still applies as
+/// the upper bound when nothing is changing.
+const WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--probe") {
         return probe();
     }
+    if args.iter().any(|a| a == "--install-hooks-hint") {
+        approval::print_install_hint();
+        return Ok(());
+    }
+
+    // Aliveness guard sticks around for the whole interactive session. The
+    // hook checks for ~/.claude/triage/.alive; without this it bails out and
+    // Claude's normal permission prompt takes over.
+    let _alive = approval::AliveGuard::install();
 
     let mut terminal = setup_terminal()?;
     let result = run(&mut terminal);
@@ -40,9 +57,16 @@ fn probe() -> io::Result<()> {
     let mut sessions = discovery::discover_live_sessions();
     let panes = tmux::list_panes();
     println!("# discovered {} live sessions, {} tmux panes\n", sessions.len(), panes.len());
+    // Resolve panes before pairing so assign_transcripts can see which session
+    // is in the currently-focused tmux pane.
+    let ppid_map = tmux::build_ppid_map();
     for s in &mut sessions {
-        s.pane = tmux::find_owning_pane(s.pid, &panes, 8);
-        transcript::enrich(s);
+        s.pane = tmux::find_owning_pane(s.pid, &panes, &ppid_map, 8);
+    }
+    let mut cache = transcript::DigestCache::new();
+    transcript::assign_transcripts(&mut sessions, &mut cache);
+    for s in &mut sessions {
+        transcript::enrich(s, now, &mut cache);
         s.state = classifier::classify(s, now);
         let pane = s.pane.as_ref().map(|p| p.target.as_str()).unwrap_or("(none)");
         let headline = s
@@ -91,9 +115,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
             }
         }
 
-        let due = last_refresh.elapsed() >= REFRESH_INTERVAL;
+        let elapsed = last_refresh.elapsed();
+        let due = elapsed >= REFRESH_INTERVAL;
         let triggered = watcher.as_ref().map(|w| w.drain()).unwrap_or(false);
-        if due || triggered {
+        if due || (triggered && elapsed >= WATCHER_DEBOUNCE) {
             refresh(&mut app);
             last_refresh = Instant::now();
         }
@@ -127,6 +152,21 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
         KeyCode::Char(' ') => app.detail_open = !app.detail_open,
+        KeyCode::Char('m') => {
+            app.toggle_mute_selected();
+        }
+        KeyCode::Char('a') => {
+            if let Some(uuid) = app.oldest_pending_uuid() {
+                approval::approve(&uuid);
+                app.status_msg = Some("approved".to_string());
+            }
+        }
+        KeyCode::Char('d') => {
+            if let Some(uuid) = app.oldest_pending_uuid() {
+                approval::deny(&uuid, "denied via triage");
+                app.status_msg = Some("denied".to_string());
+            }
+        }
         KeyCode::Char('/') => {
             app.filter_active = true;
             app.filter.clear();
@@ -156,18 +196,82 @@ fn refresh(app: &mut AppState) {
     let mut sessions = discovery::discover_live_sessions();
     let panes = tmux::list_panes();
 
+    let now = SystemTime::now();
+    let ppid_map = tmux::build_ppid_map();
     for s in &mut sessions {
-        s.pane = tmux::find_owning_pane(s.pid, &panes, 8);
-        transcript::enrich(s);
-        s.state = classifier::classify(s, SystemTime::now());
+        s.pane = tmux::find_owning_pane(s.pid, &panes, &ppid_map, 8);
+    }
+    transcript::assign_transcripts(&mut sessions, &mut app.digest_cache);
+    for s in &mut sessions {
+        transcript::enrich(s, now, &mut app.digest_cache);
+    }
+    // Pending approvals attach BEFORE classify so a pending request can force
+    // the Blocked state even when the heuristic would say something else.
+    let pending = approval::read_pending();
+    approval::attach_to_sessions(pending, &mut sessions);
+    for s in &mut sessions {
+        s.state = classifier::classify(s, now);
+    }
+    app.digest_cache.evict_missing();
+
+    // Auto-unmute any session whose user-text timestamp has advanced past the
+    // mute-at time. The user typing in a muted pane is the strongest possible
+    // signal that they want it surfaced again. Mute entries for sessions that
+    // are no longer live are kept on disk — the session might come back when
+    // the user opens that pane again.
+    let mute_count_before = app.muted.len();
+    app.muted.retain(|key, mute_at| {
+        let session = sessions
+            .iter()
+            .find(|s| s.cwd == key.cwd && s.started_at_ms == key.started_at_ms);
+        match session {
+            // Not currently live — keep the entry; it'll apply if the session
+            // shows up again, and become orphaned otherwise (still harmless).
+            None => true,
+            Some(s) => match s.last_prompt_at {
+                Some(ts) if ts > *mute_at => false,
+                _ => true,
+            },
+        }
+    });
+    for s in &mut sessions {
+        let key = crate::persist::MuteKey {
+            cwd: s.cwd.clone(),
+            started_at_ms: s.started_at_ms,
+        };
+        s.muted = app.muted.contains_key(&key);
+    }
+    if app.muted.len() != mute_count_before {
+        app.persist_mutes();
     }
 
     sessions.sort_by(|a, b| {
-        a.state
-            .priority()
-            .cmp(&b.state.priority())
+        a.muted
+            .cmp(&b.muted) // unmuted first
+            .then_with(|| a.state.priority().cmp(&b.state.priority()))
             .then_with(|| a.cwd.cmp(&b.cwd))
     });
+
+    // Fire macOS notifications for sessions that just transitioned to an
+    // actionable state. Skip muted sessions and the first refresh so we don't
+    // re-notify on startup or for sessions the user has explicitly hushed.
+    if app.notifications_armed {
+        for s in &sessions {
+            if s.muted {
+                continue;
+            }
+            if !matches!(s.state, models::AttentionState::Blocked | models::AttentionState::Error) {
+                continue;
+            }
+            let prev = app.last_states.get(&s.pid).copied();
+            if prev == Some(s.state) {
+                continue;
+            }
+            notify_os::alert(s);
+        }
+    }
+    app.last_states = sessions.iter().map(|s| (s.pid, s.state)).collect();
+    app.notifications_armed = true;
 
     app.sessions = sessions;
     app.clamp_selection();

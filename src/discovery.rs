@@ -57,6 +57,7 @@ pub fn discover_live_sessions() -> Vec<Session> {
             transcript_path: None,
             headline: None,
             last_prompt: None,
+            last_prompt_at: None,
             last_turn_duration_ms: None,
             last_turn_msg_count: None,
             last_event_at: None,
@@ -64,6 +65,8 @@ pub fn discover_live_sessions() -> Vec<Session> {
             user_prompt_count: 0,
             last_stop_had_errors: false,
             state: AttentionState::Unknown,
+            muted: false,
+            pending_approvals: Vec::new(),
         });
     }
     out
