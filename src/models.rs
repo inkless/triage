@@ -22,6 +22,10 @@ pub struct Session {
     pub cwd: PathBuf,
     pub name: Option<String>,
     pub status: String,
+    /// `waitingFor` from sessions JSON — populated when `status == "waiting"`
+    /// (e.g. `"approve Bash"`). This is Claude Code's own canonical signal that
+    /// the session is paused on a permission prompt.
+    pub waiting_for: Option<String>,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
 
@@ -37,14 +41,60 @@ pub struct Session {
     pub last_stop_at: Option<SystemTime>,
     pub user_prompt_count: u64,
     pub last_stop_had_errors: bool,
+    /// (tool_name, one-line input brief) of the latest assistant `tool_use`
+    /// event in the transcript. When `status == "waiting"`, this is the
+    /// specific tool call Claude is asking permission for.
+    pub last_tool_use: Option<(String, String)>,
 
     pub state: AttentionState,
     /// True when the user has muted this session. Muted sessions still update
     /// in the background but render dimmed and sort to the bottom of the list.
     pub muted: bool,
-    /// Pending tool-use approval requests from the PreToolUse hook. Newest
-    /// last. When non-empty, the session is forced to `Blocked`.
+    /// Pending tool-use approval requests captured by the hook. Newest last.
+    /// These enrich the headline/detail and hook-mode `a`/`d` flow, but they
+    /// are only actionable when Claude itself reports `status == "waiting"`.
     pub pending_approvals: Vec<PendingApproval>,
+}
+
+/// How `a`/`d` deliver an approve/deny when a session is at a permission
+/// prompt. Two distinct mechanisms exist and we don't auto-fall-back between
+/// them — the user picks explicitly so behavior is predictable.
+///
+/// - `Hook`: write a decision file the PreToolUse hook is polling for. Carries
+///   a deny reason. Requires the hook to actually run, which is blocked on
+///   machines with `allowManagedHooksOnly: true` in managed-settings.json.
+/// - `Tmux`: `tmux send-keys` against the pane to dismiss Claude's native
+///   permission prompt. Works regardless of managed policy. Deny is just
+///   Escape — no reason payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ApprovalMode {
+    Hook,
+    Tmux,
+}
+
+impl Default for ApprovalMode {
+    fn default() -> Self {
+        // Hook gives a richer approve/deny path (full tool_input, deny-with-
+        // reason). Falls back to Tmux when the hook is bypassed by managed
+        // policy — toggle with `h`.
+        Self::Hook
+    }
+}
+
+impl ApprovalMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            ApprovalMode::Hook => "hook",
+            ApprovalMode::Tmux => "tmux",
+        }
+    }
+
+    pub fn toggled(self) -> Self {
+        match self {
+            ApprovalMode::Hook => ApprovalMode::Tmux,
+            ApprovalMode::Tmux => ApprovalMode::Hook,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

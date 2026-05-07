@@ -9,7 +9,7 @@ use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, 
 use std::collections::HashMap;
 
 use crate::classifier::idle_age;
-use crate::models::{AttentionState, Session};
+use crate::models::{ApprovalMode, AttentionState, Session};
 use crate::persist::{self, MuteKey};
 use crate::transcript::DigestCache;
 
@@ -29,16 +29,16 @@ pub struct AppState {
     /// (e.g. into `Blocked`) so we can fire a desktop notification once per
     /// transition rather than on every refresh while the session stays blocked.
     pub last_states: HashMap<u32, AttentionState>,
-    /// Stays false through the first refresh so we don't notify for every
-    /// already-blocked session at startup. Flips to true after one tick.
-    pub notifications_armed: bool,
+    /// Which mechanism `a`/`d` use to deliver an approval. Toggled with `h`.
+    pub approval_mode: ApprovalMode,
 }
 
 impl AppState {
     pub fn new() -> Self {
         let mut state = TableState::default();
         state.select(Some(0));
-        let muted = persist::load_mutes().into_iter().collect();
+        let loaded = persist::load_state();
+        let muted = loaded.mutes.into_iter().collect();
         Self {
             sessions: Vec::new(),
             selected: state,
@@ -49,12 +49,18 @@ impl AppState {
             digest_cache: DigestCache::new(),
             muted,
             last_states: HashMap::new(),
-            notifications_armed: false,
+            approval_mode: loaded.approval_mode,
         }
+    }
+
+    pub fn toggle_approval_mode(&mut self) {
+        self.approval_mode = self.approval_mode.toggled();
+        self.persist_state();
     }
 
     pub fn oldest_pending_uuid(&self) -> Option<String> {
         self.selected_session()
+            .filter(|s| s.status == "waiting")
             .and_then(|s| s.pending_approvals.first())
             .map(|a| a.uuid.clone())
     }
@@ -68,11 +74,11 @@ impl AppState {
         if self.muted.remove(&key).is_none() {
             self.muted.insert(key, SystemTime::now());
         }
-        self.persist_mutes();
+        self.persist_state();
     }
 
-    pub fn persist_mutes(&self) {
-        persist::save_mutes(self.muted.iter());
+    pub fn persist_state(&self) {
+        persist::save_state(self.muted.iter(), self.approval_mode);
     }
 
     pub fn visible(&self) -> Vec<&Session> {
@@ -173,32 +179,81 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
     f.render_widget(Paragraph::new(line), area);
 }
 
+/// Terminal-width tiers. Picked once per draw based on `area.width`.
+/// `Narrow` is for phone-sized SSH (~40–60 cols), `Medium` is a split-screen
+/// laptop window, `Wide` is the standard desktop layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutMode {
+    Narrow,
+    Medium,
+    Wide,
+}
+
+impl LayoutMode {
+    fn from_width(w: u16) -> Self {
+        if w < 60 {
+            LayoutMode::Narrow
+        } else if w < 100 {
+            LayoutMode::Medium
+        } else {
+            LayoutMode::Wide
+        }
+    }
+}
+
 fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
     let visible = app.visible();
-    // STATE(7) + AGE(5) + SESSION(20) + CWD(28) + 4 column gaps + 2 highlight indent
-    let fixed = 7 + 5 + 20 + 28 + 4 + 2;
+    let layout = LayoutMode::from_width(area.width);
+
+    // Fixed = sum of non-headline column widths + per-column gap (1) + highlight indent (2).
+    let (fixed, widths, header_cells): (usize, Vec<Constraint>, Vec<Cell>) = match layout {
+        LayoutMode::Narrow => (
+            7 + 1 + 2,
+            vec![Constraint::Length(7), Constraint::Min(20)],
+            vec![Cell::from("STATE"), Cell::from("HEADLINE")],
+        ),
+        LayoutMode::Medium => (
+            7 + 5 + 16 + 3 + 2,
+            vec![
+                Constraint::Length(7),
+                Constraint::Length(5),
+                Constraint::Length(16),
+                Constraint::Min(20),
+            ],
+            vec![
+                Cell::from("STATE"),
+                Cell::from("AGE"),
+                Cell::from("SESSION"),
+                Cell::from("HEADLINE"),
+            ],
+        ),
+        LayoutMode::Wide => (
+            7 + 5 + 20 + 28 + 4 + 2,
+            vec![
+                Constraint::Length(7),
+                Constraint::Length(5),
+                Constraint::Length(20),
+                Constraint::Length(28),
+                Constraint::Min(20),
+            ],
+            vec![
+                Cell::from("STATE"),
+                Cell::from("AGE"),
+                Cell::from("SESSION"),
+                Cell::from("CWD"),
+                Cell::from("HEADLINE"),
+            ],
+        ),
+    };
+
     let headline_width = (area.width as usize).saturating_sub(fixed).max(1);
     let rows: Vec<Row> = visible
         .iter()
-        .map(|s| build_row(s, now, headline_width))
+        .map(|s| build_row(s, now, headline_width, layout))
         .collect();
 
-    let widths = [
-        Constraint::Length(7),    // STATE
-        Constraint::Length(5),    // AGE
-        Constraint::Length(20),   // SESSION
-        Constraint::Length(28),   // CWD
-        Constraint::Min(20),      // HEADLINE
-    ];
-
-    let header = Row::new(vec![
-        Cell::from("STATE"),
-        Cell::from("AGE"),
-        Cell::from("SESSION"),
-        Cell::from("CWD"),
-        Cell::from("HEADLINE"),
-    ])
-    .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    let header = Row::new(header_cells)
+        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
     let table = Table::new(rows, widths)
         .header(header)
@@ -209,7 +264,12 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
     f.render_stateful_widget(table, area, &mut app.selected);
 }
 
-fn build_row(s: &Session, now: SystemTime, headline_width: usize) -> Row<'static> {
+fn build_row(
+    s: &Session,
+    now: SystemTime,
+    headline_width: usize,
+    layout: LayoutMode,
+) -> Row<'static> {
     let (state_str, color) = state_glyph(s.state);
     let age = idle_age(s, now)
         .map(format_duration)
@@ -226,14 +286,28 @@ fn build_row(s: &Session, now: SystemTime, headline_width: usize) -> Row<'static
         .unwrap_or_else(|| "?".to_string());
 
     let cwd_short = shorten_path(&s.cwd.to_string_lossy(), 28);
-    // A pending tool-use approval is the most relevant thing to show — it's
-    // why the user is being notified. Override headline with tool + brief
-    // input. Otherwise fall back to recap-or-prompt as before.
-    let headline_raw = if let Some(a) = s.pending_approvals.first() {
-        if a.tool_input_brief.is_empty() {
-            format!("⏸ approve? {}", a.tool_name)
+    // Only show a permission headline when Claude itself is actually paused on
+    // user input. Pending files alone are not enough: the hook also sees
+    // auto-approved tool calls.
+    let headline_raw = if s.status == "waiting" {
+        if let Some(a) = s.pending_approvals.first() {
+            if a.tool_input_brief.is_empty() {
+                format!("⏸ approve? {}", a.tool_name)
+            } else {
+                format!("⏸ approve? {} — {}", a.tool_name, a.tool_input_brief)
+            }
+        // Prefer the actual tool_use (full Claude question) over `waitingFor`
+        // (just "approve Bash"). Both come from Claude itself; the tool_use
+        // is the same data the hook would have shown.
+        } else if let Some((name, brief)) = &s.last_tool_use {
+            if brief.is_empty() {
+                format!("⏸ approve {name}?")
+            } else {
+                format!("⏸ approve {name}? — {brief}")
+            }
         } else {
-            format!("⏸ approve? {} — {}", a.tool_name, a.tool_input_brief)
+            let what = s.waiting_for.as_deref().unwrap_or("input");
+            format!("⏸ {what}?")
         }
     } else {
         s.headline
@@ -241,6 +315,13 @@ fn build_row(s: &Session, now: SystemTime, headline_width: usize) -> Row<'static
             .or_else(|| s.last_prompt.clone())
             .map(|t| t.replace('\n', " "))
             .unwrap_or_else(|| "(no transcript)".to_string())
+    };
+
+    // Narrow layout has only STATE+HEADLINE columns, so prefix the headline
+    // with session label + age — otherwise the user can't tell rows apart.
+    let headline_raw = match layout {
+        LayoutMode::Narrow => format!("{session_label}  {age}  · {headline_raw}"),
+        _ => headline_raw,
     };
 
     let wrapped = wrap_text(&headline_raw, headline_width, 4);
@@ -267,16 +348,30 @@ fn build_row(s: &Session, now: SystemTime, headline_width: usize) -> Row<'static
     };
     let cwd_style = Style::default().fg(Color::DarkGray);
 
-    Row::new(vec![
-        Cell::from(state_label).style(Style::default().fg(state_color)),
-        Cell::from(age).style(cwd_style),
-        Cell::from(session_label).style(session_style),
-        Cell::from(cwd_short).style(cwd_style),
-        Cell::from(Text::from(headline_lines)),
-    ])
-    .height(height)
-    .bottom_margin(1)
-    .style(row_style)
+    let cells: Vec<Cell> = match layout {
+        LayoutMode::Narrow => vec![
+            Cell::from(state_label).style(Style::default().fg(state_color)),
+            Cell::from(Text::from(headline_lines)),
+        ],
+        LayoutMode::Medium => vec![
+            Cell::from(state_label).style(Style::default().fg(state_color)),
+            Cell::from(age).style(cwd_style),
+            Cell::from(session_label).style(session_style),
+            Cell::from(Text::from(headline_lines)),
+        ],
+        LayoutMode::Wide => vec![
+            Cell::from(state_label).style(Style::default().fg(state_color)),
+            Cell::from(age).style(cwd_style),
+            Cell::from(session_label).style(session_style),
+            Cell::from(cwd_short).style(cwd_style),
+            Cell::from(Text::from(headline_lines)),
+        ],
+    };
+
+    Row::new(cells)
+        .height(height)
+        .bottom_margin(1)
+        .style(row_style)
 }
 
 fn wrap_text(text: &str, width: usize, max_lines: usize) -> Vec<String> {
@@ -414,6 +509,29 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState) {
             Span::raw(format!("{}.{}s · {} msgs", d / 1000, (d % 1000) / 100, c)),
         ]));
     }
+    // Surface what Claude is currently asking permission for. Headline shows
+    // the same content, but here we render it untruncated and wrapped so the
+    // user can see a long Bash command in full.
+    if s.status == "waiting" {
+        if let Some(a) = s.pending_approvals.first() {
+            lines.push(Line::from(vec![
+                Span::styled("pending: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    a.tool_name.clone(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("  "),
+                Span::raw(a.tool_input_brief.clone()),
+            ]));
+        } else if let Some((name, brief)) = &s.last_tool_use {
+            lines.push(Line::from(vec![
+                Span::styled("pending: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::raw("  "),
+                Span::raw(brief.clone()),
+            ]));
+        }
+    }
     if let Some(p) = &s.last_prompt {
         lines.push(Line::from(vec![
             Span::styled("last prompt: ", Style::default().fg(Color::DarkGray)),
@@ -454,10 +572,17 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
     } else if let Some(msg) = &app.status_msg {
         Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Yellow)))
     } else {
-        Line::from(Span::styled(
-            "  ↑↓ select  ⏎ jump  / filter  space detail  a approve  d deny  m mute  r refresh  q quit",
-            Style::default().fg(Color::DarkGray),
-        ))
+        let mode = app.approval_mode.label();
+        let hint = match LayoutMode::from_width(area.width) {
+            LayoutMode::Narrow => format!(" ⏎ a d h:{mode} m / q"),
+            LayoutMode::Medium => format!(
+                " ⏎ jump  a/d  h [{mode}]  m mute  / filter  q"
+            ),
+            LayoutMode::Wide => format!(
+                "  ↑↓ select  ⏎ jump  / filter  space detail  a approve  d deny  h mode [{mode}]  m mute  r refresh  q quit"
+            ),
+        };
+        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
     };
     f.render_widget(Paragraph::new(line), area);
 }

@@ -67,6 +67,24 @@ fn probe() -> io::Result<()> {
     transcript::assign_transcripts(&mut sessions, &mut cache);
     for s in &mut sessions {
         transcript::enrich(s, now, &mut cache);
+    }
+    for s in &mut sessions {
+        if s.status == "waiting"
+            && s.last_tool_use.is_none()
+            && let Some(pane) = &s.pane
+            && let Some(content) = tmux::capture_pane(&pane.target)
+            && let Some(brief) = tmux::parse_pending_brief(&content)
+        {
+            let name = s
+                .waiting_for
+                .as_deref()
+                .and_then(|w| w.strip_prefix("approve "))
+                .unwrap_or("?")
+                .to_string();
+            s.last_tool_use = Some((name, brief));
+        }
+    }
+    for s in &mut sessions {
         s.state = classifier::classify(s, now);
         let pane = s.pane.as_ref().map(|p| p.target.as_str()).unwrap_or("(none)");
         let headline = s
@@ -85,6 +103,10 @@ fn probe() -> io::Result<()> {
             s.cwd.display()
         );
         println!("    headline: {head_short}");
+        if let Some((n, b)) = &s.last_tool_use {
+            let b_short: String = b.chars().take(120).collect();
+            println!("    pending:  {n} — {b_short}");
+        }
     }
     Ok(())
 }
@@ -155,17 +177,61 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         KeyCode::Char('m') => {
             app.toggle_mute_selected();
         }
-        KeyCode::Char('a') => {
-            if let Some(uuid) = app.oldest_pending_uuid() {
-                approval::approve(&uuid);
-                app.status_msg = Some("approved".to_string());
+        KeyCode::Char('a') => match app.approval_mode {
+            models::ApprovalMode::Hook => {
+                if let Some(uuid) = app.oldest_pending_uuid() {
+                    approval::approve(&uuid);
+                    app.status_msg = Some("approved (hook)".to_string());
+                } else {
+                    app.status_msg =
+                        Some("session not at a prompt (or hook not running)".to_string());
+                }
             }
-        }
-        KeyCode::Char('d') => {
-            if let Some(uuid) = app.oldest_pending_uuid() {
-                approval::deny(&uuid, "denied via triage");
-                app.status_msg = Some("denied".to_string());
+            models::ApprovalMode::Tmux => {
+                let target = app
+                    .selected_session()
+                    .filter(|s| s.status == "waiting")
+                    .and_then(|s| s.pane.as_ref().map(|p| p.target.clone()));
+                match target {
+                    Some(t) => match tmux::send_keys(&t, &["1", "Enter"]) {
+                        Ok(()) => app.status_msg = Some(format!("approved → {t}")),
+                        Err(e) => app.status_msg = Some(format!("approve failed: {e}")),
+                    },
+                    None => {
+                        app.status_msg = Some("session not at a prompt (or no pane)".to_string());
+                    }
+                }
             }
+        },
+        KeyCode::Char('d') => match app.approval_mode {
+            models::ApprovalMode::Hook => {
+                if let Some(uuid) = app.oldest_pending_uuid() {
+                    approval::deny(&uuid, "denied via triage");
+                    app.status_msg = Some("denied (hook)".to_string());
+                } else {
+                    app.status_msg =
+                        Some("session not at a prompt (or hook not running)".to_string());
+                }
+            }
+            models::ApprovalMode::Tmux => {
+                let target = app
+                    .selected_session()
+                    .filter(|s| s.status == "waiting")
+                    .and_then(|s| s.pane.as_ref().map(|p| p.target.clone()));
+                match target {
+                    Some(t) => match tmux::send_keys(&t, &["Escape"]) {
+                        Ok(()) => app.status_msg = Some(format!("denied → {t}")),
+                        Err(e) => app.status_msg = Some(format!("deny failed: {e}")),
+                    },
+                    None => {
+                        app.status_msg = Some("session not at a prompt (or no pane)".to_string());
+                    }
+                }
+            }
+        },
+        KeyCode::Char('h') => {
+            app.toggle_approval_mode();
+            app.status_msg = Some(format!("approve mode: {}", app.approval_mode.label()));
         }
         KeyCode::Char('/') => {
             app.filter_active = true;
@@ -205,8 +271,29 @@ fn refresh(app: &mut AppState) {
     for s in &mut sessions {
         transcript::enrich(s, now, &mut app.digest_cache);
     }
-    // Pending approvals attach BEFORE classify so a pending request can force
-    // the Blocked state even when the heuristic would say something else.
+    // For sessions paused at a permission prompt, the pending tool_use isn't
+    // yet in the JSONL — Claude only flushes tool_use+tool_result together
+    // after the round-trip completes. Capture the pane and pull the brief
+    // from the prompt UI directly. Tool name comes from sessions JSON
+    // `waitingFor` ("approve Bash" → "Bash").
+    for s in &mut sessions {
+        if s.status == "waiting"
+            && s.last_tool_use.is_none()
+            && let Some(pane) = &s.pane
+            && let Some(content) = tmux::capture_pane(&pane.target)
+            && let Some(brief) = tmux::parse_pending_brief(&content)
+        {
+            let name = s
+                .waiting_for
+                .as_deref()
+                .and_then(|w| w.strip_prefix("approve "))
+                .unwrap_or("?")
+                .to_string();
+            s.last_tool_use = Some((name, brief));
+        }
+    }
+    // Pending approvals attach before classify so genuinely waiting sessions
+    // can render the hook-captured tool input in the headline/detail.
     let pending = approval::read_pending();
     approval::attach_to_sessions(pending, &mut sessions);
     for s in &mut sessions {
@@ -242,7 +329,7 @@ fn refresh(app: &mut AppState) {
         s.muted = app.muted.contains_key(&key);
     }
     if app.muted.len() != mute_count_before {
-        app.persist_mutes();
+        app.persist_state();
     }
 
     sessions.sort_by(|a, b| {
@@ -252,26 +339,29 @@ fn refresh(app: &mut AppState) {
             .then_with(|| a.cwd.cmp(&b.cwd))
     });
 
-    // Fire macOS notifications for sessions that just transitioned to an
-    // actionable state. Skip muted sessions and the first refresh so we don't
-    // re-notify on startup or for sessions the user has explicitly hushed.
-    if app.notifications_armed {
-        for s in &sessions {
-            if s.muted {
-                continue;
-            }
-            if !matches!(s.state, models::AttentionState::Blocked | models::AttentionState::Error) {
-                continue;
-            }
-            let prev = app.last_states.get(&s.pid).copied();
-            if prev == Some(s.state) {
-                continue;
-            }
-            notify_os::alert(s);
+    // Fire macOS notifications when a session enters an actionable state for
+    // the first time we've seen this pid. "Actionable" means Claude itself is
+    // waiting on the user (`Blocked`) or the last stop hook errored. Pending
+    // hook files alone are not actionable because PreToolUse also fires for
+    // auto-approved tool calls.
+    for s in &sessions {
+        if s.muted {
+            continue;
         }
+        let is_actionable = matches!(
+            s.state,
+            models::AttentionState::Blocked | models::AttentionState::Error
+        );
+        if !is_actionable {
+            continue;
+        }
+        let prev = app.last_states.get(&s.pid).copied();
+        if prev == Some(s.state) {
+            continue;
+        }
+        notify_os::alert(s);
     }
     app.last_states = sessions.iter().map(|s| (s.pid, s.state)).collect();
-    app.notifications_armed = true;
 
     app.sessions = sessions;
     app.clamp_selection();

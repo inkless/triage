@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -27,6 +27,7 @@ pub struct TranscriptDigest {
     pub last_stop_at: Option<SystemTime>,
     pub user_prompt_count: u64,
     pub last_stop_had_errors: bool,
+    pub last_tool_use: Option<(String, String)>,
 }
 
 /// (path → (mtime, digest)). Skip re-parsing JSONL when its mtime hasn't
@@ -186,6 +187,14 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
     let mut last_stop_at: Option<SystemTime> = None;
     let mut user_prompt_count: u64 = 0;
     let mut last_stop_had_errors = false;
+    // Every tool_use in transcript order, plus the set of ids that have a
+    // matching tool_result (i.e. completed). The pending tool_use — the one
+    // Claude is currently asking permission for — is the latest entry whose
+    // id is NOT in `completed`. Last-tool-use-wins is wrong because Claude
+    // can auto-run later tool calls (e.g. Edit when defaultMode=acceptEdits)
+    // while still blocked on an earlier Bash.
+    let mut tool_uses: Vec<(String, String, String)> = Vec::new();
+    let mut completed_tool_ids: HashSet<String> = HashSet::new();
 
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -208,17 +217,49 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
             }
             "user" => {
                 // The transcript records both real user-typed messages and tool_result
-                // echoes under type=user. Only the former are "prompts." Discriminate
-                // by looking for a content block of type=text.
-                if let Some(text) = v
-                    .get("message")
-                    .and_then(|m| m.get("content"))
-                    .and_then(extract_user_text)
-                    && let Some(t) = ts
+                // echoes under type=user. Discriminate by content shape: text blocks
+                // are prompts, tool_result blocks complete a prior tool_use.
+                if let Some(content) = v.get("message").and_then(|m| m.get("content")) {
+                    if let Some(text) = extract_user_text(content)
+                        && let Some(t) = ts
+                    {
+                        last_prompt = Some(text);
+                        last_prompt_at = Some(t);
+                        user_prompt_count += 1;
+                    }
+                    if let Some(arr) = content.as_array() {
+                        for block in arr {
+                            if block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
+                                && let Some(id) =
+                                    block.get("tool_use_id").and_then(|i| i.as_str())
+                            {
+                                completed_tool_ids.insert(id.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            "assistant" => {
+                if let Some(content) = v.get("message").and_then(|m| m.get("content"))
+                    && let Some(arr) = content.as_array()
                 {
-                    last_prompt = Some(text);
-                    last_prompt_at = Some(t);
-                    user_prompt_count += 1;
+                    for block in arr {
+                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                            let id = block
+                                .get("id")
+                                .and_then(|i| i.as_str())
+                                .unwrap_or_default()
+                                .to_string();
+                            let name = block
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("?")
+                                .to_string();
+                            let brief =
+                                crate::approval::brief_tool_input(block.get("input"));
+                            tool_uses.push((id, name, brief));
+                        }
+                    }
                 }
             }
             "system" => {
@@ -262,6 +303,15 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
         None => (None, None),
     };
 
+    // The pending tool_use is the latest emitted whose id isn't in the
+    // completed set. Empty id (older transcript schemas) → treat as not
+    // completable, so we still surface the latest one.
+    let last_tool_use = tool_uses
+        .into_iter()
+        .rev()
+        .find(|(id, _, _)| id.is_empty() || !completed_tool_ids.contains(id))
+        .map(|(_, name, brief)| (name, brief));
+
     Some(TranscriptDigest {
         path: path.to_path_buf(),
         headline: headline_text,
@@ -274,6 +324,7 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
         last_stop_at,
         user_prompt_count,
         last_stop_had_errors,
+        last_tool_use,
     })
 }
 
@@ -318,6 +369,7 @@ pub fn enrich(session: &mut Session, now: SystemTime, cache: &mut DigestCache) {
     session.last_stop_at = d.last_stop_at;
     session.user_prompt_count = d.user_prompt_count;
     session.last_stop_had_errors = d.last_stop_had_errors;
+    session.last_tool_use = d.last_tool_use;
 }
 
 /// Extract user-typed text from a message.content value.

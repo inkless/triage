@@ -4,6 +4,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::models::ApprovalMode;
+
 /// Stable identity for a Claude session that survives a triage restart.
 /// We can't use pid (recycled by the OS) or sessionId (rewritten by `/clear`),
 /// but `(cwd, started_at_ms)` doesn't change for a process's lifetime, and a
@@ -24,7 +26,12 @@ struct PersistedMute {
 
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct PersistedState {
+    #[serde(default)]
     mutes: Vec<PersistedMute>,
+    /// Optional for backward-compat with state.json files written before the
+    /// approval-mode toggle existed. Missing → use `ApprovalMode::default()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    approval_mode: Option<ApprovalMode>,
 }
 
 fn state_path() -> PathBuf {
@@ -32,15 +39,26 @@ fn state_path() -> PathBuf {
     PathBuf::from(home).join(".config/triage/state.json")
 }
 
-pub fn load_mutes() -> Vec<(MuteKey, SystemTime)> {
+pub struct LoadedState {
+    pub mutes: Vec<(MuteKey, SystemTime)>,
+    pub approval_mode: ApprovalMode,
+}
+
+pub fn load_state() -> LoadedState {
     let path = state_path();
     let Ok(bytes) = fs::read(&path) else {
-        return Vec::new();
+        return LoadedState {
+            mutes: Vec::new(),
+            approval_mode: ApprovalMode::default(),
+        };
     };
     let Ok(state) = serde_json::from_slice::<PersistedState>(&bytes) else {
-        return Vec::new();
+        return LoadedState {
+            mutes: Vec::new(),
+            approval_mode: ApprovalMode::default(),
+        };
     };
-    state
+    let mutes = state
         .mutes
         .into_iter()
         .map(|m| {
@@ -53,12 +71,16 @@ pub fn load_mutes() -> Vec<(MuteKey, SystemTime)> {
                 mute_at,
             )
         })
-        .collect()
+        .collect();
+    LoadedState {
+        mutes,
+        approval_mode: state.approval_mode.unwrap_or_default(),
+    }
 }
 
-/// Best-effort save. Failures are ignored — losing a mute set is annoying
+/// Best-effort save. Failures are ignored — losing prefs is annoying
 /// but not catastrophic, and we don't want IO errors to surface in the TUI.
-pub fn save_mutes<'a, I>(entries: I)
+pub fn save_state<'a, I>(entries: I, approval_mode: ApprovalMode)
 where
     I: IntoIterator<Item = (&'a MuteKey, &'a SystemTime)>,
 {
@@ -73,7 +95,10 @@ where
             })
         })
         .collect();
-    let state = PersistedState { mutes };
+    let state = PersistedState {
+        mutes,
+        approval_mode: Some(approval_mode),
+    };
     let Ok(json) = serde_json::to_vec_pretty(&state) else {
         return;
     };

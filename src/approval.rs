@@ -1,8 +1,15 @@
 use std::fs;
 use std::path::PathBuf;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
+
+/// Pending files older than this are stale. The hook itself only waits a few
+/// seconds before falling back to Claude's native permission flow, so anything
+/// that survives longer is from a hook process that died without running its
+/// cleanup trap (cancelled tool call, SIGKILL, crash). We auto-delete on read
+/// so orphaned files don't keep showing a fake pending approval.
+const PENDING_TTL: Duration = Duration::from_secs(30);
 
 /// Single tool-use approval request the hook is waiting on.
 #[derive(Debug, Clone)]
@@ -57,11 +64,17 @@ impl Drop for AliveGuard {
 /// can't parse are skipped silently — the hook owns lifecycle, so a malformed
 /// file means triage just won't surface it (the hook will time out and Claude
 /// will fall back to its own prompt).
+///
+/// Side effect: deletes pending files older than `PENDING_TTL`. The hook
+/// itself falls back after a few seconds, so anything that survives longer is
+/// from a process that died without running its cleanup trap (cancelled tool
+/// call, SIGKILL, crash).
 pub fn read_pending() -> Vec<PendingApproval> {
     let dir = pending_dir();
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
+    let now = SystemTime::now();
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -71,6 +84,18 @@ pub fn read_pending() -> Vec<PendingApproval> {
         let Some(uuid) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
+        let created_at = entry
+            .metadata()
+            .and_then(|m| m.created().or_else(|_| m.modified()))
+            .unwrap_or(now);
+        if now
+            .duration_since(created_at)
+            .is_ok_and(|age| age > PENDING_TTL)
+        {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(decisions_dir().join(format!("{uuid}.json")));
+            continue;
+        }
         let Ok(bytes) = fs::read(&path) else { continue };
         let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
@@ -91,10 +116,6 @@ pub fn read_pending() -> Vec<PendingApproval> {
             .unwrap_or("?")
             .to_string();
         let tool_input_brief = brief_tool_input(v.get("tool_input"));
-        let created_at = entry
-            .metadata()
-            .and_then(|m| m.created().or_else(|_| m.modified()))
-            .unwrap_or(SystemTime::now());
         out.push(PendingApproval {
             uuid: uuid.to_string(),
             session_id,
@@ -130,29 +151,51 @@ fn write_decision(uuid: &str, body: &str) {
     let _ = fs::write(path, body);
 }
 
-/// Render a one-line preview of the tool input. Different tools have different
-/// shapes — Bash has `command`, Edit has `file_path`+`old_string`, etc. We pull
-/// the most-useful field per tool, falling back to a JSON-truncated form.
-fn brief_tool_input(input: Option<&Value>) -> String {
+/// Render a preview of the tool input. The hook payload has the full tool
+/// argument JSON, so we can show meaningfully more than what we'd parse from
+/// the pane: command + description for Bash, file path + edit summary for
+/// Edit/Write, etc. Headline wraps to 4 lines so we lift the truncation cap.
+pub fn brief_tool_input(input: Option<&Value>) -> String {
     let Some(input) = input else {
         return String::new();
     };
     if let Some(cmd) = input.get("command").and_then(|s| s.as_str()) {
-        return truncate(cmd, 120);
+        // Bash: show command + description on the same line so the row's
+        // wrap_text can split them across visual lines naturally.
+        let desc = input
+            .get("description")
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty());
+        return match desc {
+            Some(d) => truncate(&format!("{cmd}  ·  {d}"), 400),
+            None => truncate(cmd, 400),
+        };
     }
     if let Some(path) = input.get("file_path").and_then(|s| s.as_str()) {
-        return truncate(path, 120);
+        // Edit/Write: path + a short hint of what's changing. Edit has
+        // `old_string`; Write has `content`. Truncate hard since long diffs
+        // would dominate the row.
+        let detail = input
+            .get("old_string")
+            .or_else(|| input.get("content"))
+            .and_then(|s| s.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| truncate(s, 120));
+        return match detail {
+            Some(d) => truncate(&format!("{path}  ·  {d}"), 400),
+            None => truncate(path, 200),
+        };
     }
     if let Some(url) = input.get("url").and_then(|s| s.as_str()) {
-        return truncate(url, 120);
+        return truncate(url, 200);
     }
     if let Some(s) = input.as_str() {
-        return truncate(s, 120);
+        return truncate(s, 200);
     }
-    truncate(&input.to_string(), 120)
+    truncate(&input.to_string(), 200)
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub fn truncate(s: &str, n: usize) -> String {
     let s = s.replace('\n', " ");
     if s.chars().count() <= n {
         s
@@ -163,19 +206,36 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// Match each pending approval to its session, preferring sessionId match.
-/// Falls back to cwd match if sessionId doesn't line up (which can happen when
-/// the user has `/clear`'d — the sessions JSON keeps the stale sessionId but
-/// the hook payload uses the live one).
+/// Match each pending approval to its session.
+///
+/// 1. Prefer `session_id` match — exact identity when sessions JSON is fresh.
+/// 2. Fall back to cwd match. After `/clear` the sessions JSON keeps the
+///    stale sessionId pointing at the pre-clear file, while the hook payload
+///    carries the live sessionId — so a direct sessionId lookup misses.
+///    When multiple sessions share a cwd (e.g. two lakehouse panes), prefer
+///    one whose tmux pane is currently active over arbitrary first-match.
+/// 3. If still ambiguous, attach to the first cwd-matching session — better
+///    than dropping the approval entirely.
 pub fn attach_to_sessions(approvals: Vec<PendingApproval>, sessions: &mut [crate::models::Session]) {
     for a in approvals {
-        let by_id = sessions.iter_mut().find(|s| s.session_id == a.session_id);
-        let target = match by_id {
-            Some(s) => Some(s),
-            None => sessions.iter_mut().find(|s| s.cwd == a.cwd),
-        };
-        if let Some(s) = target {
-            s.pending_approvals.push(a);
+        // 1. session_id exact match.
+        if let Some(idx) = sessions.iter().position(|s| s.session_id == a.session_id) {
+            sessions[idx].pending_approvals.push(a);
+            continue;
+        }
+        // 2. cwd match, preferring an active pane.
+        let cwd_matches: Vec<usize> = sessions
+            .iter()
+            .enumerate()
+            .filter_map(|(i, s)| (s.cwd == a.cwd).then_some(i))
+            .collect();
+        let chosen = cwd_matches
+            .iter()
+            .copied()
+            .find(|&i| sessions[i].pane.as_ref().is_some_and(|p| p.active))
+            .or_else(|| cwd_matches.first().copied());
+        if let Some(idx) = chosen {
+            sessions[idx].pending_approvals.push(a);
         }
     }
 }

@@ -56,21 +56,34 @@ fn send_via_terminal_notifier(
     cmd.args(["-subtitle", &format!("{label} — {title}")]);
     cmd.args(["-message", preview]);
     cmd.args(["-group", "triage"]); // collapse repeats
-    // Sender attribution: pretend the notification comes from the user's own
-    // terminal app so the banner shows a familiar icon. Detected from env
-    // vars and process tree (handles tmux-inside-terminal cases too).
-    if let Some(bundle) = terminal_bundle_id() {
+    // Sender attribution is OPT-IN only: macOS silently drops (or hangs)
+    // notifications when the sender app doesn't have notification permission,
+    // and kitty/Ghostty/etc. usually don't have it set up. Default behavior
+    // is to let the notification appear under terminal-notifier's own icon.
+    // Set `TRIAGE_TERMINAL_BUNDLE=net.kovidgoyal.kitty` (or similar) after
+    // granting that app notification permission to opt in.
+    if let Some(bundle) = forced_terminal_bundle_id() {
         cmd.args(["-sender", bundle]);
     }
 
-    // Click action: switch the tmux client to the blocked pane. Requires both
-    // the Pane (for the target) and a tmux on PATH (for the command). Falls
-    // through silently if either is missing — the notification still fires,
-    // it just won't do anything when clicked.
+    // Click action: bring the user's terminal app to the foreground, then
+    // switch the tmux client to the blocked pane. Requires the Pane (for the
+    // target) and tmux on PATH (for the command). Activating the terminal
+    // first matters when the user is in a different macOS app — without it,
+    // tmux's internal focus changes but the terminal window stays hidden.
     if let (Some(pane), Some(tmux)) = (pane, tmux_path()) {
         let session_name = pane.target.split_once(':').map(|(s, _)| s).unwrap_or("");
+        let activate_cmd = detected_terminal_bundle()
+            .map(|bundle| {
+                format!(
+                    "/usr/bin/osascript -e 'tell application id {0} to activate' && ",
+                    shell_quote(bundle)
+                )
+            })
+            .unwrap_or_default();
         let exec = format!(
-            "{tmux} switch-client -t {session} && {tmux} select-pane -t {target}",
+            "{activate}{tmux} switch-client -t {session} && {tmux} select-pane -t {target}",
+            activate = activate_cmd,
             tmux = shell_quote(tmux),
             session = shell_quote(session_name),
             target = shell_quote(&pane.target),
@@ -111,18 +124,35 @@ fn spawn_detached(mut cmd: Command) {
     });
 }
 
-/// Best-effort detection of which terminal app triage is running under, so
-/// macOS notifications can be attributed to a familiar icon. Checks env vars
-/// first (works when triage is launched directly), then walks the process
-/// tree (works when triage is inside tmux which strips most env vars).
-fn terminal_bundle_id() -> Option<&'static str> {
+/// User-forced terminal bundle ID via `TRIAGE_TERMINAL_BUNDLE`. Used as the
+/// `-sender` for terminal-notifier. Auto-detection isn't safe here: macOS
+/// silently drops notifications when the sender app lacks permission AND
+/// (newer macOS) terminal-notifier's sender-spoofing is unreliable in
+/// general. Force it by env var only.
+fn forced_terminal_bundle_id() -> Option<&'static str> {
     static CACHED: OnceLock<Option<&'static str>> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        if let Ok(forced) = std::env::var("TRIAGE_TERMINAL_BUNDLE")
-            && !forced.is_empty()
-        {
-            // Leak the user override so it can live in &'static str.
-            return Some(Box::leak(forced.into_boxed_str()));
+        let forced = std::env::var("TRIAGE_TERMINAL_BUNDLE").ok()?;
+        let trimmed = forced.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Leak the override so we can hand out &'static str. Once-per-process,
+        // negligible memory cost.
+        Some(Box::leak(trimmed.to_string().into_boxed_str()) as &'static str)
+    })
+}
+
+/// Detect which terminal app triage is running under, for the click-action
+/// activate path only. Unlike `-sender`, activating an app on click works
+/// reliably on modern macOS — it just brings that bundle to the foreground.
+/// Checks `TRIAGE_TERMINAL_BUNDLE` first, then env vars, then walks the
+/// process tree (handles tmux-inside-terminal, since tmux strips most env).
+fn detected_terminal_bundle() -> Option<&'static str> {
+    static CACHED: OnceLock<Option<&'static str>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if let Some(forced) = forced_terminal_bundle_id() {
+            return Some(forced);
         }
         if let Some(b) = bundle_from_env() {
             return Some(b);

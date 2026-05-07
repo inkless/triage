@@ -105,3 +105,96 @@ pub fn jump_to(target: &str) -> std::io::Result<()> {
         .status()?;
     Ok(())
 }
+
+/// Send tmux key sequences to a pane. Each entry is either a literal string
+/// (e.g. `"1"`) or a tmux key name (e.g. `"Enter"`, `"Escape"`). Used to
+/// answer Claude Code's native permission prompt remotely when our own hook
+/// is bypassed (e.g. by a managed-settings `allowManagedHooksOnly` policy).
+pub fn send_keys(target: &str, keys: &[&str]) -> std::io::Result<()> {
+    let mut cmd = Command::new("tmux");
+    cmd.args(["send-keys", "-t", target]);
+    for k in keys {
+        cmd.arg(k);
+    }
+    cmd.status()?;
+    Ok(())
+}
+
+/// Capture the visible pane content plus 200 lines of scrollback. Used as a
+/// fallback source for "what is Claude asking permission for" — the transcript
+/// JSONL doesn't include a pending tool_use until after the user approves and
+/// the round-trip completes.
+pub fn capture_pane(target: &str) -> Option<String> {
+    let out = Command::new("tmux")
+        .args(["capture-pane", "-p", "-S", "-200", "-t", target])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Pull the human-readable preview of what Claude is asking from a captured
+/// pane. Anchors on `1. Yes` (the option list, reliable across all prompt
+/// variants) and walks upward, collecting every content line until we hit
+/// the outer box separator (a long run of `─`). Inner separators (`╌`, used
+/// inside Edit/Write diffs) are skipped, not used as boundaries. The chip
+/// header line (e.g. "Bash command", "Edit file") is dropped since the tool
+/// name is already in the row prefix.
+///
+/// We don't anchor on "Do you want to" — it varies by tool and version.
+pub fn parse_pending_brief(pane: &str) -> Option<String> {
+    let lines: Vec<&str> = pane.lines().collect();
+    let opt_idx = lines.iter().rposition(|l| l.contains("1. Yes"))?;
+    let mut collected: Vec<&str> = Vec::new();
+    for line in lines[..opt_idx].iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("Do you want") {
+            continue;
+        }
+        if is_outer_separator(trimmed) {
+            break;
+        }
+        if is_inner_separator(trimmed) {
+            continue;
+        }
+        collected.push(trimmed);
+        if collected.len() >= 20 {
+            break;
+        }
+    }
+    if collected.is_empty() {
+        return None;
+    }
+    collected.reverse();
+    // Drop the chip header ("Bash command", "Edit file", "Web search", …) so
+    // we don't duplicate the tool name. Single-word tools like `pwd` survive
+    // this filter because they don't match the `<Tool> <category>` shape.
+    if collected.first().is_some_and(|l| is_chip_header(l)) {
+        collected.remove(0);
+    }
+    Some(collected.join(" "))
+}
+
+fn is_outer_separator(s: &str) -> bool {
+    !s.is_empty() && s.chars().count() >= 20 && s.chars().all(|c| c == '─')
+}
+
+fn is_inner_separator(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| matches!(c, '╌' | '╴' | '╶'))
+}
+
+fn is_chip_header(s: &str) -> bool {
+    let mut iter = s.split_whitespace();
+    let Some(first) = iter.next() else { return false };
+    let Some(second) = iter.next() else { return false };
+    if iter.next().is_some() {
+        return false;
+    }
+    first.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+        && matches!(second, "command" | "file" | "search" | "fetch" | "URL" | "request")
+}

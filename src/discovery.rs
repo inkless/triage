@@ -19,6 +19,8 @@ struct RawSession {
     started_at: u64,
     #[serde(rename = "updatedAt", default)]
     updated_at: u64,
+    #[serde(rename = "waitingFor", default)]
+    waiting_for: Option<String>,
 }
 
 pub fn sessions_dir() -> PathBuf {
@@ -53,6 +55,7 @@ pub fn discover_live_sessions() -> Vec<Session> {
             status: raw.status.unwrap_or_else(|| "unknown".to_string()),
             started_at_ms: raw.started_at,
             updated_at_ms: raw.updated_at,
+            waiting_for: raw.waiting_for,
             pane: None,
             transcript_path: None,
             headline: None,
@@ -64,6 +67,7 @@ pub fn discover_live_sessions() -> Vec<Session> {
             last_stop_at: None,
             user_prompt_count: 0,
             last_stop_had_errors: false,
+            last_tool_use: None,
             state: AttentionState::Unknown,
             muted: false,
             pending_approvals: Vec::new(),

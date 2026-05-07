@@ -8,21 +8,21 @@ const IDLE_LONG_THRESHOLD: Duration = Duration::from_secs(30 * 60);
 /// the user has likely moved on and the row should sink to the bottom even if
 /// sessions JSON still says `status=busy` (which lags badly for stale sessions).
 const STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
-/// While `status=busy`, an event gap exceeding this is most likely Claude
-/// pausing on a permission prompt rather than running a long tool. False
-/// positive risk: very long-running shell commands. Acceptable for v1; the
-/// proper signal needs hooks (T-19).
-const BLOCKED_THRESHOLD: Duration = Duration::from_secs(90);
 
 pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
     if session.last_stop_had_errors {
         return AttentionState::Error;
     }
 
-    // A pending tool-use approval is the strongest possible "needs your input"
-    // signal — Claude is literally hung waiting on the user. Classify Blocked
-    // even if the busy-and-quiet heuristic wouldn't have caught it.
-    if !session.pending_approvals.is_empty() {
+    // Sessions JSON `status=waiting` is the canonical "user attention needed"
+    // signal (Claude Code 2.1.13x+ sets this when it pauses on a permission
+    // prompt). We deliberately do NOT use `pending_approvals` alone: our
+    // PreToolUse hook fires for every tool call (including auto-approved
+    // Reads/Edits/etc.), so a pending file just means the hook is blocking
+    // — not that Claude is actually waiting on a user decision. Pending files
+    // still feed into the headline + `a`/`d` actions, but only when status
+    // also says waiting.
+    if session.status == "waiting" {
         return AttentionState::Blocked;
     }
 
@@ -44,14 +44,6 @@ pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
     }
 
     if session.status == "busy" {
-        // Distinguish active work from "stuck waiting on user." When Claude
-        // is generating or running a tool, events fire frequently; a 90s gap
-        // mid-turn is most likely a permission prompt the user hasn't answered.
-        if let Some(age) = event_age
-            && age >= BLOCKED_THRESHOLD
-        {
-            return AttentionState::Blocked;
-        }
         return AttentionState::Working;
     }
 
@@ -71,16 +63,22 @@ pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
         return AttentionState::IdleShort;
     }
 
-    // No stop yet observed; fall back to last_event_at.
+    // No stop yet observed; fall back to last_event_at. Newer Claude Code
+    // (2.1.13x+) doesn't emit `stop_hook_summary`, so this is the common
+    // path. Treat sessions JSON `status=idle` itself as the implicit
+    // turn-end signal: any recent event on an idle session means the turn
+    // just ended (otherwise the earlier `status=busy` branch would have
+    // caught it as Working).
     if let Some(last) = session.last_event_at
         && let Ok(age) = now.duration_since(last)
     {
+        if age <= JUST_FINISHED_WINDOW {
+            return AttentionState::JustFinished;
+        }
         if age >= IDLE_LONG_THRESHOLD {
             return AttentionState::IdleLong;
         }
-        if age >= JUST_FINISHED_WINDOW {
-            return AttentionState::IdleShort;
-        }
+        return AttentionState::IdleShort;
     }
 
     AttentionState::Unknown
