@@ -37,9 +37,11 @@ pub struct AppState {
     /// spawns a `claude -p` auditor for each `waiting` session and routes
     /// APPROVE/DENY through the same machinery as manual `a`/`d`.
     pub autonomous: bool,
-    /// Pids whose auditor is currently running. Prevents double-firing on
-    /// successive refresh ticks while a verdict is in flight.
-    pub audit_in_flight: HashSet<u32>,
+    /// Pids whose auditor is currently running, keyed to the SystemTime the
+    /// worker thread was spawned. Prevents double-firing on successive refresh
+    /// ticks while a verdict is in flight; the timestamp drives the
+    /// "auditor running… (Xs)" indicator in the detail view.
+    pub audit_in_flight: HashMap<u32, SystemTime>,
     /// (cwd, started_at_ms) → last decision the auditor returned for this
     /// stable session identity. Re-deciding on every tick would burn tokens;
     /// we only re-fire when the session leaves and re-enters `waiting`.
@@ -70,7 +72,7 @@ impl AppState {
             last_states: HashMap::new(),
             approval_mode: loaded.approval_mode,
             autonomous: loaded.autonomous,
-            audit_in_flight: HashSet::new(),
+            audit_in_flight: HashMap::new(),
             audit_decided: HashSet::new(),
             audit_notes: HashMap::new(),
             audit_tx,
@@ -175,7 +177,7 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
         .constraints([
             Constraint::Length(1),                                    // header
             Constraint::Min(5),                                       // table
-            Constraint::Length(if app.detail_open { 8 } else { 0 }),  // detail
+            Constraint::Length(if app.detail_open { 14 } else { 0 }), // detail
             Constraint::Length(1),                                    // footer
         ])
         .split(f.area());
@@ -183,7 +185,7 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
     draw_header(f, chunks[0], app);
     draw_table(f, chunks[1], app, now);
     if app.detail_open {
-        draw_detail(f, chunks[2], app);
+        draw_detail(f, chunks[2], app, now);
     }
     draw_footer(f, chunks[3], app);
 }
@@ -532,75 +534,185 @@ fn shorten_path(path: &str, max: usize) -> String {
     format!("…{}", &p[cut..])
 }
 
-fn draw_detail(f: &mut Frame, area: Rect, app: &AppState) {
+fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
     let Some(s) = app.selected_session() else {
         return;
     };
 
+    let dim = || Style::default().fg(Color::DarkGray);
+    let bold = || Style::default().add_modifier(Modifier::BOLD);
+    let mag = || Style::default().fg(Color::Magenta);
+    let yellow = || Style::default().fg(Color::Yellow);
+
     let mut lines = Vec::new();
-    if let Some(pane) = &s.pane {
-        lines.push(Line::from(vec![
-            Span::styled("pane: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(pane.target.clone()),
-            Span::styled("  pid: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(s.pid.to_string()),
-            Span::styled("  status: ", Style::default().fg(Color::DarkGray)),
-            Span::raw(s.status.clone()),
-        ]));
+
+    // Row 1: pane / pid / status / state. Hardest-to-derive identity first.
+    let pane_target = s
+        .pane
+        .as_ref()
+        .map(|p| p.target.clone())
+        .unwrap_or_else(|| "(none)".to_string());
+    lines.push(Line::from(vec![
+        Span::styled("pane: ", dim()),
+        Span::raw(pane_target),
+        Span::styled("  pid: ", dim()),
+        Span::raw(s.pid.to_string()),
+        Span::styled("  status: ", dim()),
+        Span::raw(s.status.clone()),
+        Span::styled("  state: ", dim()),
+        Span::raw(s.state.label().to_string()),
+    ]));
+
+    // Row 2: short session id, uptime, approve mode, mute flag.
+    let short_id: String = s.session_id.chars().take(8).collect();
+    let uptime = format_uptime(s.started_at_ms, now);
+    let mut row2 = vec![
+        Span::styled("session: ", dim()),
+        Span::raw(short_id),
+        Span::styled("  uptime: ", dim()),
+        Span::raw(uptime),
+        Span::styled("  mode: ", dim()),
+        Span::raw(app.approval_mode.label().to_string()),
+    ];
+    if s.muted {
+        row2.push(Span::styled("  [muted]", yellow()));
     }
-    if let Some((_, note)) = app.audit_notes.get(&s.pid) {
+    lines.push(Line::from(row2));
+
+    // Auditor: in-flight indicator OR the most recent decision.
+    if let Some(start) = app.audit_in_flight.get(&s.pid) {
+        let secs = now.duration_since(*start).map(|d| d.as_secs()).unwrap_or(0);
         lines.push(Line::from(vec![
-            Span::styled("auditor: ", Style::default().fg(Color::Magenta)),
+            Span::styled("auditor: ", mag()),
+            Span::styled("running…", mag().add_modifier(Modifier::BOLD)),
+            Span::styled(format!("  ({}s)", secs), dim()),
+        ]));
+    } else if let Some((ts, note)) = app.audit_notes.get(&s.pid) {
+        let ago = now.duration_since(*ts).map(|d| d.as_secs()).unwrap_or(0);
+        lines.push(Line::from(vec![
+            Span::styled("auditor: ", mag()),
             Span::raw(note.clone()),
+            Span::styled(format!("  ({}s ago)", ago), dim()),
         ]));
     }
+
+    // Event timing — useful to tell "actively progressing" from "stuck".
+    let events_line = format!(
+        "last {} · prompt {} · stop {}",
+        format_age_opt(s.last_event_at, now),
+        format_age_opt(s.last_prompt_at, now),
+        format_age_opt(s.last_stop_at, now),
+    );
+    lines.push(Line::from(vec![
+        Span::styled("events: ", dim()),
+        Span::raw(events_line),
+    ]));
+
+    // Last turn timing (when both fields are populated).
     if let (Some(d), Some(c)) = (s.last_turn_duration_ms, s.last_turn_msg_count) {
-        lines.push(Line::from(vec![
-            Span::styled("last turn: ", Style::default().fg(Color::DarkGray)),
+        let mut spans = vec![
+            Span::styled("last turn: ", dim()),
             Span::raw(format!("{}.{}s · {} msgs", d / 1000, (d % 1000) / 100, c)),
-        ]));
+        ];
+        if s.user_prompt_count > 0 {
+            spans.push(Span::styled(
+                format!("  ·  {} prompts total", s.user_prompt_count),
+                dim(),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
-    // Surface what Claude is currently asking permission for. Headline shows
-    // the same content, but here we render it untruncated and wrapped so the
-    // user can see a long Bash command in full.
+
+    // Pending tool input. Two paths depending on capture source:
+    //   - Hook (richer): full `tool_input_full` JSON, parsed into a per-tool
+    //     pretty rendering (Bash command with real newlines, Edit path + diff).
+    //   - Tmux scrape (truncated): show the brief verbatim with a "(tmux
+    //     scrape, may be truncated)" tag so the user knows why the auditor
+    //     might WAIT on this row.
     if s.status == "waiting" {
         if let Some(a) = s.pending_approvals.first() {
             lines.push(Line::from(vec![
-                Span::styled("pending: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    a.tool_name.clone(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("  "),
-                Span::raw(a.tool_input_brief.clone()),
+                Span::styled("pending: ", yellow()),
+                Span::styled(a.tool_name.clone(), bold()),
+                Span::styled("  (hook)", dim()),
             ]));
+            for line in a.tool_input_detail().lines().take(6) {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(truncate(line, 400)),
+                ]));
+            }
         } else if let Some((name, brief)) = &s.last_tool_use {
             lines.push(Line::from(vec![
-                Span::styled("pending: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled("pending: ", yellow()),
+                Span::styled(name.clone(), bold()),
+                Span::styled("  (tmux scrape, may be truncated)", dim()),
+            ]));
+            lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::raw(brief.clone()),
+                Span::raw(truncate(brief, 400)),
             ]));
         }
     }
+
     if let Some(p) = &s.last_prompt {
         lines.push(Line::from(vec![
-            Span::styled("last prompt: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("last prompt: ", dim()),
             Span::raw(truncate(p, 200)),
         ]));
     }
     if let Some(h) = &s.headline {
         lines.push(Line::from(vec![
-            Span::styled("recap: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("recap: ", dim()),
             Span::raw(truncate(h, 400)),
         ]));
     }
 
     let block = Block::default()
         .borders(Borders::TOP)
-        .title(Span::styled(" detail ", Style::default().fg(Color::DarkGray)));
+        .title(Span::styled(" detail ", dim()));
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(para, area);
+}
+
+fn format_age_opt(ts: Option<SystemTime>, now: SystemTime) -> String {
+    let Some(ts) = ts else { return "—".to_string() };
+    let Ok(d) = now.duration_since(ts) else {
+        return "—".to_string();
+    };
+    let s = d.as_secs();
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86400 {
+        format!("{}h", s / 3600)
+    } else {
+        format!("{}d", s / 86400)
+    }
+}
+
+fn format_uptime(started_at_ms: u64, now: SystemTime) -> String {
+    if started_at_ms == 0 {
+        return "—".to_string();
+    }
+    let Ok(now_ms) = now.duration_since(SystemTime::UNIX_EPOCH) else {
+        return "—".to_string();
+    };
+    let now_ms = now_ms.as_millis() as u64;
+    if now_ms <= started_at_ms {
+        return "0s".to_string();
+    }
+    let s = (now_ms - started_at_ms) / 1000;
+    if s < 60 {
+        format!("{s}s")
+    } else if s < 3600 {
+        format!("{}m", s / 60)
+    } else if s < 86400 {
+        format!("{}h{}m", s / 3600, (s % 3600) / 60)
+    } else {
+        format!("{}d{}h", s / 86400, (s % 86400) / 3600)
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {

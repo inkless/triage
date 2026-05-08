@@ -461,7 +461,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         .iter()
         .filter(|s| s.state == models::AttentionState::Blocked && !s.muted)
     {
-        if app.audit_in_flight.contains(&s.pid) {
+        if app.audit_in_flight.contains_key(&s.pid) {
             continue;
         }
         let key = persist::MuteKey {
@@ -500,7 +500,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         if let Some(ref uuid) = uuid {
             approval::write_claim(uuid);
         }
-        app.audit_in_flight.insert(pid);
+        app.audit_in_flight.insert(pid, SystemTime::now());
         std::thread::spawn(move || {
             let v = auditor::run_audit(pid, &cwd, &intent, &tool_name, &tool_input);
             // Route APPROVE/DENY here so the decision file lands BEFORE

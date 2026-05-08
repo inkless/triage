@@ -33,6 +33,48 @@ pub struct PendingApproval {
     pub pending_path: PathBuf,
 }
 
+impl PendingApproval {
+    /// Multi-line, human-friendly rendering of `tool_input` for the detail
+    /// pane. Re-parses `tool_input_full` and extracts the salient field per
+    /// tool: Bash → command (real newlines), Edit/Write → file_path + the
+    /// old_string/content, etc. Falls back to the raw JSON string when the
+    /// tool isn't one we know how to summarize. Caller is responsible for
+    /// truncating to the available render area.
+    pub fn tool_input_detail(&self) -> String {
+        let Ok(v) = serde_json::from_str::<Value>(&self.tool_input_full) else {
+            return self.tool_input_full.clone();
+        };
+        if let Some(cmd) = v.get("command").and_then(|s| s.as_str()) {
+            let desc = v
+                .get("description")
+                .and_then(|s| s.as_str())
+                .filter(|s| !s.is_empty());
+            return match desc {
+                Some(d) => format!("{cmd}\n# {d}"),
+                None => cmd.to_string(),
+            };
+        }
+        if let Some(path) = v.get("file_path").and_then(|s| s.as_str()) {
+            let detail = v
+                .get("old_string")
+                .or_else(|| v.get("content"))
+                .or_else(|| v.get("new_string"))
+                .and_then(|s| s.as_str());
+            return match detail {
+                Some(d) => format!("{path}\n---\n{d}"),
+                None => path.to_string(),
+            };
+        }
+        if let Some(url) = v.get("url").and_then(|s| s.as_str()) {
+            return url.to_string();
+        }
+        if let Some(s) = v.as_str() {
+            return s.to_string();
+        }
+        self.tool_input_full.clone()
+    }
+}
+
 pub fn triage_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
     PathBuf::from(home).join(".claude/triage")
