@@ -72,7 +72,7 @@ fn send_via_terminal_notifier(
     // first matters when the user is in a different macOS app — without it,
     // tmux's internal focus changes but the terminal window stays hidden.
     if let (Some(pane), Some(tmux)) = (pane, tmux_path()) {
-        let session_name = pane.target.split_once(':').map(|(s, _)| s).unwrap_or("");
+        let session_name = pane.tmux_session.as_str();
         let activate_cmd = detected_terminal_bundle()
             .map(|bundle| {
                 format!(

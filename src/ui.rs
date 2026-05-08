@@ -1,3 +1,4 @@
+use std::sync::mpsc;
 use std::time::SystemTime;
 
 use ratatui::Frame;
@@ -6,8 +7,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
+use crate::auditor::Verdict;
 use crate::classifier::idle_age;
 use crate::models::{ApprovalMode, AttentionState, Session};
 use crate::persist::{self, MuteKey};
@@ -31,6 +33,22 @@ pub struct AppState {
     pub last_states: HashMap<u32, AttentionState>,
     /// Which mechanism `a`/`d` use to deliver an approval. Toggled with `h`.
     pub approval_mode: ApprovalMode,
+    /// Autonomous mode (T-56). Toggle with `A`. When on, the refresh loop
+    /// spawns a `claude -p` auditor for each `waiting` session and routes
+    /// APPROVE/DENY through the same machinery as manual `a`/`d`.
+    pub autonomous: bool,
+    /// Pids whose auditor is currently running. Prevents double-firing on
+    /// successive refresh ticks while a verdict is in flight.
+    pub audit_in_flight: HashSet<u32>,
+    /// (cwd, started_at_ms) → last decision the auditor returned for this
+    /// stable session identity. Re-deciding on every tick would burn tokens;
+    /// we only re-fire when the session leaves and re-enters `waiting`.
+    pub audit_decided: HashSet<MuteKey>,
+    /// Per-session verdict annotation, surfaced in detail view + status line.
+    pub audit_notes: HashMap<u32, (SystemTime, String)>,
+    /// Worker threads send completed verdicts here; `refresh()` drains.
+    pub audit_tx: mpsc::Sender<Verdict>,
+    pub audit_rx: mpsc::Receiver<Verdict>,
 }
 
 impl AppState {
@@ -39,6 +57,7 @@ impl AppState {
         state.select(Some(0));
         let loaded = persist::load_state();
         let muted = loaded.mutes.into_iter().collect();
+        let (audit_tx, audit_rx) = mpsc::channel();
         Self {
             sessions: Vec::new(),
             selected: state,
@@ -50,11 +69,26 @@ impl AppState {
             muted,
             last_states: HashMap::new(),
             approval_mode: loaded.approval_mode,
+            autonomous: loaded.autonomous,
+            audit_in_flight: HashSet::new(),
+            audit_decided: HashSet::new(),
+            audit_notes: HashMap::new(),
+            audit_tx,
+            audit_rx,
         }
     }
 
     pub fn toggle_approval_mode(&mut self) {
         self.approval_mode = self.approval_mode.toggled();
+        self.persist_state();
+    }
+
+    pub fn toggle_autonomous(&mut self) {
+        self.autonomous = !self.autonomous;
+        if !self.autonomous {
+            // Drop the "already decided" set so re-enabling is fresh.
+            self.audit_decided.clear();
+        }
         self.persist_state();
     }
 
@@ -78,7 +112,7 @@ impl AppState {
     }
 
     pub fn persist_state(&self) {
-        persist::save_state(self.muted.iter(), self.approval_mode);
+        persist::save_state(self.muted.iter(), self.approval_mode, self.autonomous);
     }
 
     pub fn visible(&self) -> Vec<&Session> {
@@ -275,9 +309,20 @@ fn build_row(
         .map(format_duration)
         .unwrap_or_else(|| "—".to_string());
 
+    // Order: Claude `/rename` (most deliberate, session-specific) → tmux
+    // session name (workspace label the user actively chose) → cwd basename
+    // (default). Tmux's auto-assigned numeric names ("0", "1", …) are skipped
+    // because they're worse than the cwd basename for telling rows apart.
     let session_label = s
         .name
         .clone()
+        .or_else(|| {
+            s.pane
+                .as_ref()
+                .map(|p| p.tmux_session.as_str())
+                .filter(|n| !n.is_empty() && !n.chars().all(|c| c.is_ascii_digit()))
+                .map(|n| n.to_string())
+        })
         .or_else(|| {
             s.cwd
                 .file_name()
@@ -503,6 +548,12 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState) {
             Span::raw(s.status.clone()),
         ]));
     }
+    if let Some((_, note)) = app.audit_notes.get(&s.pid) {
+        lines.push(Line::from(vec![
+            Span::styled("auditor: ", Style::default().fg(Color::Magenta)),
+            Span::raw(note.clone()),
+        ]));
+    }
     if let (Some(d), Some(c)) = (s.last_turn_duration_ms, s.last_turn_msg_count) {
         lines.push(Line::from(vec![
             Span::styled("last turn: ", Style::default().fg(Color::DarkGray)),
@@ -573,16 +624,27 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Yellow)))
     } else {
         let mode = app.approval_mode.label();
+        let auto = if app.autonomous {
+            let n = app.audit_in_flight.len();
+            if n > 0 { format!("AUTO·{n}") } else { "AUTO".to_string() }
+        } else {
+            "auto:off".to_string()
+        };
         let hint = match LayoutMode::from_width(area.width) {
-            LayoutMode::Narrow => format!(" ⏎ a d h:{mode} m / q"),
+            LayoutMode::Narrow => format!(" ⏎ a d h:{mode} A:{auto} / q"),
             LayoutMode::Medium => format!(
-                " ⏎ jump  a/d  h [{mode}]  m mute  / filter  q"
+                " ⏎ jump  a/d  h [{mode}]  A [{auto}]  m mute  / filter  q"
             ),
             LayoutMode::Wide => format!(
-                "  ↑↓ select  ⏎ jump  / filter  space detail  a approve  d deny  h mode [{mode}]  m mute  r refresh  q quit"
+                "  ↑↓ select  ⏎ jump  / filter  space detail  a approve  d deny  h mode [{mode}]  A auto [{auto}]  m mute  r refresh  q quit"
             ),
         };
-        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
+        let style = if app.autonomous {
+            Style::default().fg(Color::Magenta)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        Line::from(Span::styled(hint, style))
     };
     f.render_widget(Paragraph::new(line), area);
 }

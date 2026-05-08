@@ -32,6 +32,9 @@ struct PersistedState {
     /// approval-mode toggle existed. Missing → use `ApprovalMode::default()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     approval_mode: Option<ApprovalMode>,
+    /// Autonomous-mode toggle (T-56). Off by default; explicit opt-in only.
+    #[serde(default)]
+    autonomous: bool,
 }
 
 fn state_path() -> PathBuf {
@@ -42,6 +45,7 @@ fn state_path() -> PathBuf {
 pub struct LoadedState {
     pub mutes: Vec<(MuteKey, SystemTime)>,
     pub approval_mode: ApprovalMode,
+    pub autonomous: bool,
 }
 
 pub fn load_state() -> LoadedState {
@@ -50,12 +54,14 @@ pub fn load_state() -> LoadedState {
         return LoadedState {
             mutes: Vec::new(),
             approval_mode: ApprovalMode::default(),
+            autonomous: false,
         };
     };
     let Ok(state) = serde_json::from_slice::<PersistedState>(&bytes) else {
         return LoadedState {
             mutes: Vec::new(),
             approval_mode: ApprovalMode::default(),
+            autonomous: false,
         };
     };
     let mutes = state
@@ -75,12 +81,13 @@ pub fn load_state() -> LoadedState {
     LoadedState {
         mutes,
         approval_mode: state.approval_mode.unwrap_or_default(),
+        autonomous: state.autonomous,
     }
 }
 
 /// Best-effort save. Failures are ignored — losing prefs is annoying
 /// but not catastrophic, and we don't want IO errors to surface in the TUI.
-pub fn save_state<'a, I>(entries: I, approval_mode: ApprovalMode)
+pub fn save_state<'a, I>(entries: I, approval_mode: ApprovalMode, autonomous: bool)
 where
     I: IntoIterator<Item = (&'a MuteKey, &'a SystemTime)>,
 {
@@ -98,6 +105,7 @@ where
     let state = PersistedState {
         mutes,
         approval_mode: Some(approval_mode),
+        autonomous,
     };
     let Ok(json) = serde_json::to_vec_pretty(&state) else {
         return;

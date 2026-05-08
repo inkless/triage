@@ -37,6 +37,7 @@ pub fn list_panes() -> HashMap<u32, Pane> {
             pid,
             Pane {
                 target: format!("{}:{}", parts[0], parts[1]),
+                tmux_session: parts[0].to_string(),
                 pid,
                 tty: parts[3].to_string(),
                 current_command: parts[4].to_string(),

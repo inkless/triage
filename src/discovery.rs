@@ -47,6 +47,12 @@ pub fn discover_live_sessions() -> Vec<Session> {
         if !pid_alive(raw.pid) {
             continue;
         }
+        // Filter the auditor's own short-lived Claude process so it doesn't
+        // appear as a row (and never gets recursively audited). The auditor
+        // tags itself via `claude --name triage-auditor`.
+        if raw.name.as_deref() == Some(crate::auditor::AUDITOR_NAME) {
+            continue;
+        }
         out.push(Session {
             pid: raw.pid,
             session_id: raw.session_id,

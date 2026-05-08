@@ -1,4 +1,5 @@
 mod approval;
+mod auditor;
 mod classifier;
 mod discovery;
 mod models;
@@ -38,6 +39,20 @@ fn main() -> io::Result<()> {
     }
     if args.iter().any(|a| a == "--install-hooks-hint") {
         approval::print_install_hint();
+        return Ok(());
+    }
+    // T-56 spike: feed the selected session's pending tool_use to a
+    // separate `claude -p` and print the auditor's verdict. No actual
+    // approve/deny — just exercising the prompt + parse path.
+    if let Some(idx) = args.iter().position(|a| a == "--audit") {
+        let pid = args
+            .get(idx + 1)
+            .and_then(|s| s.parse::<u32>().ok())
+            .ok_or_else(|| io::Error::other("usage: triage --audit <pid>"))?;
+        return auditor::audit(pid);
+    }
+    if args.iter().any(|a| a == "--audit-prompt") {
+        auditor::print_prompt();
         return Ok(());
     }
 
@@ -177,61 +192,18 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         KeyCode::Char('m') => {
             app.toggle_mute_selected();
         }
-        KeyCode::Char('a') => match app.approval_mode {
-            models::ApprovalMode::Hook => {
-                if let Some(uuid) = app.oldest_pending_uuid() {
-                    approval::approve(&uuid);
-                    app.status_msg = Some("approved (hook)".to_string());
-                } else {
-                    app.status_msg =
-                        Some("session not at a prompt (or hook not running)".to_string());
-                }
-            }
-            models::ApprovalMode::Tmux => {
-                let target = app
-                    .selected_session()
-                    .filter(|s| s.status == "waiting")
-                    .and_then(|s| s.pane.as_ref().map(|p| p.target.clone()));
-                match target {
-                    Some(t) => match tmux::send_keys(&t, &["1", "Enter"]) {
-                        Ok(()) => app.status_msg = Some(format!("approved → {t}")),
-                        Err(e) => app.status_msg = Some(format!("approve failed: {e}")),
-                    },
-                    None => {
-                        app.status_msg = Some("session not at a prompt (or no pane)".to_string());
-                    }
-                }
-            }
-        },
-        KeyCode::Char('d') => match app.approval_mode {
-            models::ApprovalMode::Hook => {
-                if let Some(uuid) = app.oldest_pending_uuid() {
-                    approval::deny(&uuid, "denied via triage");
-                    app.status_msg = Some("denied (hook)".to_string());
-                } else {
-                    app.status_msg =
-                        Some("session not at a prompt (or hook not running)".to_string());
-                }
-            }
-            models::ApprovalMode::Tmux => {
-                let target = app
-                    .selected_session()
-                    .filter(|s| s.status == "waiting")
-                    .and_then(|s| s.pane.as_ref().map(|p| p.target.clone()));
-                match target {
-                    Some(t) => match tmux::send_keys(&t, &["Escape"]) {
-                        Ok(()) => app.status_msg = Some(format!("denied → {t}")),
-                        Err(e) => app.status_msg = Some(format!("deny failed: {e}")),
-                    },
-                    None => {
-                        app.status_msg = Some("session not at a prompt (or no pane)".to_string());
-                    }
-                }
-            }
-        },
+        KeyCode::Char('a') => app.status_msg = Some(deliver_approve(app)),
+        KeyCode::Char('d') => app.status_msg = Some(deliver_deny(app)),
         KeyCode::Char('h') => {
             app.toggle_approval_mode();
             app.status_msg = Some(format!("approve mode: {}", app.approval_mode.label()));
+        }
+        KeyCode::Char('A') => {
+            app.toggle_autonomous();
+            app.status_msg = Some(format!(
+                "autonomous mode: {}",
+                if app.autonomous { "ON" } else { "off" }
+            ));
         }
         KeyCode::Char('/') => {
             app.filter_active = true;
@@ -256,6 +228,57 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         _ => {}
     }
     true
+}
+
+/// Approve via whichever path is wired: in Hook mode, prefer the hook decision
+/// file; if there's no pending UUID (e.g. Claude is in `permission_mode=auto`
+/// and our hook bailed), fall back to tmux send-keys when the selected session
+/// is genuinely paused. Tmux mode always sends keys directly. Returns the
+/// status-bar string to show.
+fn deliver_approve(app: &AppState) -> String {
+    if app.approval_mode == models::ApprovalMode::Hook
+        && let Some(uuid) = app.oldest_pending_uuid()
+    {
+        approval::approve(&uuid);
+        return "approved (hook)".to_string();
+    }
+    let target = app
+        .selected_session()
+        .filter(|s| s.status == "waiting")
+        .and_then(|s| s.pane.as_ref().map(|p| p.target.clone()));
+    let Some(t) = target else {
+        return "session not at a prompt (or no pane)".to_string();
+    };
+    match tmux::send_keys(&t, &["1", "Enter"]) {
+        Ok(()) if app.approval_mode == models::ApprovalMode::Hook => {
+            format!("approved → {t} (tmux fallback)")
+        }
+        Ok(()) => format!("approved → {t}"),
+        Err(e) => format!("approve failed: {e}"),
+    }
+}
+
+fn deliver_deny(app: &AppState) -> String {
+    if app.approval_mode == models::ApprovalMode::Hook
+        && let Some(uuid) = app.oldest_pending_uuid()
+    {
+        approval::deny(&uuid, "denied via triage");
+        return "denied (hook)".to_string();
+    }
+    let target = app
+        .selected_session()
+        .filter(|s| s.status == "waiting")
+        .and_then(|s| s.pane.as_ref().map(|p| p.target.clone()));
+    let Some(t) = target else {
+        return "session not at a prompt (or no pane)".to_string();
+    };
+    match tmux::send_keys(&t, &["Escape"]) {
+        Ok(()) if app.approval_mode == models::ApprovalMode::Hook => {
+            format!("denied → {t} (tmux fallback)")
+        }
+        Ok(()) => format!("denied → {t}"),
+        Err(e) => format!("deny failed: {e}"),
+    }
 }
 
 fn refresh(app: &mut AppState) {
@@ -332,6 +355,8 @@ fn refresh(app: &mut AppState) {
         app.persist_state();
     }
 
+    drive_autonomous(app, &sessions);
+
     sessions.sort_by(|a, b| {
         a.muted
             .cmp(&b.muted) // unmuted first
@@ -366,6 +391,138 @@ fn refresh(app: &mut AppState) {
     app.sessions = sessions;
     app.clamp_selection();
     app.status_msg = None;
+}
+
+/// T-56: autonomous-mode driver. Runs every refresh tick whether the toggle is
+/// on or off — drains finished verdicts (so an in-flight worker doesn't leak
+/// channel capacity after toggle-off) and clears stale `audit_decided` entries.
+/// Only the spawn-new-workers path is gated on `app.autonomous`.
+///
+/// Invariants:
+/// - one worker per pid at a time (`audit_in_flight`)
+/// - one decision per (cwd, started_at_ms) per Blocked spell (`audit_decided`,
+///   reset when the session leaves Blocked)
+/// - muted sessions are skipped in both routing and spawning
+/// - if the user toggled autonomous off while a worker was running, the
+///   returning verdict is logged in `audit_notes` for visibility but NOT
+///   actioned
+fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
+    use std::collections::HashSet;
+
+    // Reset audit_decided for sessions that have left the Blocked state. Next
+    // time they pause on a permission prompt we'll audit again.
+    let blocked_keys: HashSet<persist::MuteKey> = sessions
+        .iter()
+        .filter(|s| s.state == models::AttentionState::Blocked)
+        .map(|s| persist::MuteKey {
+            cwd: s.cwd.clone(),
+            started_at_ms: s.started_at_ms,
+        })
+        .collect();
+    app.audit_decided.retain(|k| blocked_keys.contains(k));
+
+    // Drain returning verdicts. Action gated on app.autonomous so a toggle-off
+    // mid-flight discards the action (but still cleans up state + leaves a
+    // visible note in the detail pane).
+    while let Ok(v) = app.audit_rx.try_recv() {
+        app.audit_in_flight.remove(&v.pid);
+        let note = format!("{} — {}", v.decision, v.reason);
+        app.audit_notes.insert(v.pid, (SystemTime::now(), note));
+        if !app.autonomous {
+            continue;
+        }
+        let Some(s) = sessions.iter().find(|s| {
+            s.pid == v.pid && s.state == models::AttentionState::Blocked && !s.muted
+        }) else {
+            // Session moved on (user pressed a/d, session ended) or got muted.
+            // Drop the verdict — acting now would route to the wrong prompt.
+            continue;
+        };
+        let key = persist::MuteKey {
+            cwd: s.cwd.clone(),
+            started_at_ms: s.started_at_ms,
+        };
+        app.audit_decided.insert(key);
+        let msg = match v.decision.as_str() {
+            "APPROVE" => auto_route(s, app.approval_mode, true, &v.reason),
+            "DENY" => auto_route(s, app.approval_mode, false, &v.reason),
+            _ => format!("auditor WAIT: pid {} ({})", v.pid, v.tool_name),
+        };
+        app.status_msg = Some(msg);
+    }
+
+    if !app.autonomous {
+        return;
+    }
+
+    // Spawn new workers for Blocked sessions not in flight, not yet decided,
+    // not muted, and with an actual tool_use to feed the auditor.
+    for s in sessions
+        .iter()
+        .filter(|s| s.state == models::AttentionState::Blocked && !s.muted)
+    {
+        if app.audit_in_flight.contains(&s.pid) {
+            continue;
+        }
+        let key = persist::MuteKey {
+            cwd: s.cwd.clone(),
+            started_at_ms: s.started_at_ms,
+        };
+        if app.audit_decided.contains(&key) {
+            continue;
+        }
+        // Prefer hook-captured (richer, structured); fall back to tmux capture.
+        let (tool_name, tool_input) = if let Some(a) = s.pending_approvals.first() {
+            (a.tool_name.clone(), a.tool_input_brief.clone())
+        } else if let Some((n, b)) = &s.last_tool_use {
+            (n.clone(), b.clone())
+        } else {
+            continue;
+        };
+        let intent = s
+            .last_prompt
+            .clone()
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let pid = s.pid;
+        let cwd = s.cwd.clone();
+        let tx = app.audit_tx.clone();
+        app.audit_in_flight.insert(pid);
+        std::thread::spawn(move || {
+            let v = auditor::run_audit(pid, &cwd, &intent, &tool_name, &tool_input);
+            let _ = tx.send(v);
+        });
+    }
+}
+
+/// Route an auditor verdict through the same approve/deny machinery as `a`/`d`.
+/// `approve=true` selects "1+Enter" (tmux) or `approval::approve` (hook);
+/// `approve=false` selects "Escape" / `approval::deny`. Returns the status-bar
+/// string to surface.
+fn auto_route(
+    s: &models::Session,
+    mode: models::ApprovalMode,
+    approve: bool,
+    reason: &str,
+) -> String {
+    let action = if approve { "APPROVE" } else { "DENY" };
+    if mode == models::ApprovalMode::Hook
+        && let Some(a) = s.pending_approvals.first()
+    {
+        if approve {
+            approval::approve(&a.uuid);
+        } else {
+            approval::deny(&a.uuid, reason);
+        }
+        return format!("auditor {action} (hook): pid {}", s.pid);
+    }
+    let Some(pane) = &s.pane else {
+        return format!("auditor {action} but no pane: pid {}", s.pid);
+    };
+    let keys: &[&str] = if approve { &["1", "Enter"] } else { &["Escape"] };
+    match tmux::send_keys(&pane.target, keys) {
+        Ok(()) => format!("auditor {action} (tmux): pid {} → {}", s.pid, pane.target),
+        Err(e) => format!("auditor {action} failed: {e}"),
+    }
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {

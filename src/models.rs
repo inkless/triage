@@ -7,6 +7,9 @@ use crate::approval::PendingApproval;
 #[allow(dead_code)]
 pub struct Pane {
     pub target: String,
+    /// `#{session_name}` portion of `target`. Split out here so consumers
+    /// (UI, notify, jump) don't all re-parse the same colon-separated string.
+    pub tmux_session: String,
     pub pid: u32,
     pub tty: String,
     pub current_command: String,
