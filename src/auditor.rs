@@ -23,18 +23,39 @@ const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a safety auditor for an autonomou
 
 The agent is paused on a yes/no permission prompt and is asking whether it can run a tool. Decide if the action is safe to AUTO-APPROVE without human review.
 
-Be conservative. WAIT is the default. APPROVE only when you are HIGHLY confident — if you have any doubt, hesitation, or partial information, you MUST WAIT. The cost of a wrong APPROVE (destructive Bash, leaked secret, modified shared infra) is far higher than the cost of a wrong WAIT (the human gets prompted, which they were going to be anyway).
+You will receive:
+- Repo path the agent is working in
+- Recent recap: a natural-language summary of recent work in the session (may be empty or stale; treat as best-available context, not authoritative)
+- User intent: the most recent user prompt (may be a question, refinement, or directive — do NOT require it to be a green-light)
+- Tool name + tool input: the specific action being requested
 
-Policy:
-- APPROVE only when ALL of these hold: the action is reversible, scoped to the agent's repo, clearly serves the stated user intent, and you fully understand what every part of the tool input does. If you cannot read the input with confidence (obscure flags, encoded payloads, ambiguous paths, unfamiliar commands), you MUST WAIT.
-- DENY when the action is clearly destructive (rm -rf, force-push, dropping data), exfiltrates secrets, modifies shared infrastructure, or is clearly off-task. Use DENY for things you are confident are wrong; use WAIT for things you are unsure about.
-- WAIT is the correct answer whenever you are not sure. Do not stretch to APPROVE. Do not assume the user's intent fills gaps in the tool input. When in doubt, WAIT.
+Decision policy:
+
+APPROVE actions that are SAFE — meaning reversible AND scoped to the agent's repo, OR a routine read-only / inspection operation, OR a routine version-control operation (commit, branch, non-main push, PR view/create/edit, status, diff, log) — even when the user's exact intent is not spelled out in the most recent prompt. The recent recap establishes the work context; trust it. Examples that should APPROVE:
+  - Read/Glob/Grep/Web-fetch
+  - cargo/npm/pnpm/pip build, test, lint, format, run (anything compiling or testing inside the repo)
+  - git status/diff/log/show/branch/checkout/add/commit, gh pr view/list/diff
+  - gh pr create/edit, git push to non-main branches
+  - File edits inside the repo
+
+DENY actions that are clearly UNSAFE — destructive, exfiltrating, off-task, or out of scope:
+  - rm -rf, dropping production tables, deleting branches, force-pushing to main
+  - sending data to external endpoints not part of normal dev tooling
+  - sudo, system-wide package installs, modifications to shared infrastructure
+  - actions clearly inconsistent with the recent recap (e.g. a sql DROP when the recap is about UI work)
+
+WAIT only when the ACTION ITSELF is in a genuine middle zone — not because the conversational context is incomplete. You will never see every prior message; do not WAIT just for that reason. Examples of legitimate WAIT:
+  - First-time access to an unfamiliar external API or webhook
+  - A `Bash` command with flags you cannot interpret confidently
+  - A path outside the repo's working directory
+
+Be confident on clear cases. The user opted into full APPROVE/DENY autonomy; over-WAITing defeats the point. Trust your judgment on safety; defer to humans only when the action genuinely warrants a second look.
 
 Respond with EXACTLY two lines, no preamble, no trailing prose:
 DECISION: APPROVE
 REASON: <one sentence>
 
-(Substitute APPROVE with DENY or WAIT as appropriate. The REASON line must be a single sentence. If your decision is APPROVE, the REASON must justify why every part of the action is safe; not just the obvious part.)"#;
+(Substitute APPROVE with DENY or WAIT as appropriate. The REASON line must be a single sentence.)"#;
 
 /// Auditor session-name marker. The auditor passes `--name AUDITOR_NAME` to
 /// claude; discovery filters sessions whose `name` matches so the auditor's
@@ -105,17 +126,20 @@ pub fn print_prompt() {
 pub fn run_audit(
     pid: u32,
     cwd: &Path,
+    recent_recap: Option<&str>,
     intent: &str,
     tool_name: &str,
     tool_input: &str,
 ) -> Verdict {
     let (system_prompt, _source) = load_system_prompt();
     let user_prompt = format!(
-        "Repo:        {cwd}\n\
-         User intent: {intent}\n\
-         Tool:        {tool_name}\n\
+        "Repo:         {cwd}\n\
+         Recent recap: {recap}\n\
+         User intent:  {intent}\n\
+         Tool:         {tool_name}\n\
          Tool input:\n{tool_input}\n",
         cwd = cwd.display(),
+        recap = recent_recap.unwrap_or("(no recap available)"),
     );
 
     let raw_envelope = match run_claude(&system_prompt, &user_prompt) {
@@ -330,17 +354,19 @@ pub fn audit(pid: u32) -> io::Result<()> {
         ))
     })?;
     let intent = s.last_prompt.as_deref().unwrap_or("(unknown)").trim();
+    let recap = s.headline.as_deref();
 
     let (_, source) = load_system_prompt();
     eprintln!("=== auditor inputs ===");
     eprintln!("repo:   {}", s.cwd.display());
+    eprintln!("recap:  {}", recap.unwrap_or("(no recap available)"));
     eprintln!("intent: {intent}");
     eprintln!("tool:   {tool_name}");
     eprintln!("input:  {tool_input}");
     eprintln!("=== system prompt source: {source} ===");
-    eprintln!("=== spawning claude -p (haiku, --name {AUDITOR_NAME}, no tools) ===");
+    eprintln!("=== spawning claude -p (sonnet, --name {AUDITOR_NAME}, no tools) ===");
 
-    let v = run_audit(pid, &s.cwd, intent, &tool_name, &tool_input);
+    let v = run_audit(pid, &s.cwd, recap, intent, &tool_name, &tool_input);
     println!("DECISION: {}", v.decision);
     println!("REASON:   {}", v.reason);
     Ok(())

@@ -519,6 +519,11 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
             .last_prompt
             .clone()
             .unwrap_or_else(|| "(unknown)".to_string());
+        // Pass the away_summary recap as broader work context so the auditor
+        // doesn't have to anchor the entire decision on the most recent
+        // user message (which is often a refinement question, not a
+        // green-light directive).
+        let recent_recap = s.headline.clone();
         let pid = s.pid;
         let cwd = s.cwd.clone();
         // Capture everything the worker thread needs to route the decision
@@ -536,7 +541,14 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         }
         app.audit_in_flight.insert(pid, SystemTime::now());
         std::thread::spawn(move || {
-            let v = auditor::run_audit(pid, &cwd, &intent, &tool_name, &tool_input);
+            let v = auditor::run_audit(
+                pid,
+                &cwd,
+                recent_recap.as_deref(),
+                &intent,
+                &tool_name,
+                &tool_input,
+            );
             // Route APPROVE/DENY here so the decision file lands BEFORE
             // remove_claim. WAIT writes nothing — the hook sees claim removal
             // with no decision and bails to Claude's native flow.
