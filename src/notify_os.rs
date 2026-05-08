@@ -73,12 +73,21 @@ fn send_via_terminal_notifier(
     // tmux's internal focus changes but the terminal window stays hidden.
     if let (Some(pane), Some(tmux)) = (pane, tmux_path()) {
         let session_name = pane.tmux_session.as_str();
+        // AppleScript: `tell application id "<bundle>" to activate`. The
+        // bundle ID needs DOUBLE quotes inside the AppleScript (it's a string
+        // literal there); the entire expression then needs SINGLE quotes for
+        // the shell. Earlier this used `shell_quote(bundle)` for the inner
+        // wrap, which produced `'tell application id 'net.foo.bar' to
+        // activate'` — sh consumed the quote pairs, leaving the bundle
+        // unquoted in AppleScript, which parses as a chained property and
+        // errors. The `&&` short-circuited, so click → nothing happened.
         let activate_cmd = detected_terminal_bundle()
             .map(|bundle| {
-                format!(
-                    "/usr/bin/osascript -e 'tell application id {0} to activate' && ",
-                    shell_quote(bundle)
-                )
+                let applescript = format!(
+                    "tell application id {} to activate",
+                    applescript_string(bundle)
+                );
+                format!("/usr/bin/osascript -e {} && ", shell_quote(&applescript))
             })
             .unwrap_or_default();
         let exec = format!(
