@@ -101,6 +101,19 @@ pub fn alive_file() -> PathBuf {
     triage_dir().join(".alive")
 }
 
+/// Read the user's default model setting from `~/.claude/settings.json`. This
+/// is the only deterministic source of the variant tag (e.g. `opus[1m]`) —
+/// the per-message `model` field in transcripts strips the `[1m]` suffix
+/// before logging. Returns None if the file is missing/unreadable/malformed
+/// or if no `model` key is set.
+pub fn read_default_model() -> Option<String> {
+    let home = std::env::var_os("HOME")?;
+    let path = PathBuf::from(home).join(".claude/settings.json");
+    let bytes = fs::read(&path).ok()?;
+    let v: Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("model")?.as_str().map(|s| s.to_string())
+}
+
 /// Best-effort claim write. The hook reads `claims/<uuid>.json` and extends
 /// its deadline when present; absence means triage isn't going to decide, so
 /// the hook can bail to Claude's native flow.

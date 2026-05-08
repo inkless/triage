@@ -51,6 +51,10 @@ pub struct AppState {
     /// Worker threads send completed verdicts here; `refresh()` drains.
     pub audit_tx: mpsc::Sender<Verdict>,
     pub audit_rx: mpsc::Receiver<Verdict>,
+    /// User's default model from `~/.claude/settings.json` (e.g. `"opus[1m]"`).
+    /// Read once at startup; the only deterministic source of the variant tag
+    /// since the transcript's per-message `model` field strips `[1m]`.
+    pub default_model: Option<String>,
 }
 
 impl AppState {
@@ -77,6 +81,7 @@ impl AppState {
             audit_notes: HashMap::new(),
             audit_tx,
             audit_rx,
+            default_model: crate::approval::read_default_model(),
         }
     }
 
@@ -559,6 +564,17 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
         .unwrap_or_else(|| "(no pane)".to_string());
     let uptime = format_uptime(s.started_at_ms, now);
     let sep = || Span::styled("  ·  ", dim());
+    // Compute the context window once up front so both the header model
+    // annotation and the stats line use the same value.
+    let app_peak = app
+        .sessions
+        .iter()
+        .map(|s| s.peak_context_tokens)
+        .max()
+        .unwrap_or(0);
+    let window = context_window_for_session(s, app_peak, app.default_model.as_deref());
+    let is_1m = window >= 1_000_000;
+
     let mut header = vec![
         Span::styled(
             state_str,
@@ -566,11 +582,29 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
         ),
         sep(),
         Span::styled(pane_target, bold()),
-        sep(),
-        Span::styled(uptime, dim()),
-        sep(),
-        Span::styled(format!("{} mode", app.approval_mode.label()), dim()),
     ];
+    // Model label: prefer the per-message `model` (most precise — includes
+    // the version, e.g. `opus-4-7`); fall back to the user's global default
+    // from settings.json (e.g. `opus[1m]`). Strip the `claude-` prefix and
+    // append ` (1M)` when we've confirmed the 1M variant via any signal.
+    let model_raw = s.latest_model.as_deref().or(app.default_model.as_deref());
+    if let Some(m) = model_raw {
+        let short = m.strip_prefix("claude-").unwrap_or(m);
+        let label = if is_1m && !short.contains("[1m]") && !short.contains("(1M)") {
+            format!("{} (1M)", short)
+        } else {
+            short.to_string()
+        };
+        header.push(sep());
+        header.push(Span::styled(label, dim()));
+    }
+    header.push(sep());
+    header.push(Span::styled(uptime, dim()));
+    header.push(sep());
+    header.push(Span::styled(
+        format!("{} mode", app.approval_mode.label()),
+        dim(),
+    ));
     if s.muted {
         header.push(sep());
         header.push(Span::styled("[muted]", yellow()));
@@ -668,16 +702,8 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
             Span::raw(format_cost(s.total_cost_usd)),
         ];
         if s.latest_context_tokens > 0 {
-            // App-wide peak: a single observation of >210k anywhere in the
-            // fleet is hard proof the user is on the 1M variant, even if
-            // *this* session hasn't yet crossed the threshold.
-            let app_peak = app
-                .sessions
-                .iter()
-                .map(|s| s.peak_context_tokens)
-                .max()
-                .unwrap_or(0);
-            let window = context_window_for_session(s, app_peak);
+            // `window` was computed once up front for the header's (1M)
+            // annotation; reuse it here so header and stats agree.
             let pct = (s.latest_context_tokens as f64 / window as f64) * 100.0;
             let pct_color = if pct >= 95.0 {
                 Color::Red
@@ -789,16 +815,22 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Context-window size for a session. The 4.x model families all ship with a
-/// 200k default; the 1M-context variant is gated behind a beta header and the
-/// transcript's `model` field doesn't always carry a `[1m]` tag — so we use
-/// four heuristics in priority order before falling back to 200k.
+/// Context-window size for a session. Five signals in priority order before
+/// falling back to 200k:
 ///
-/// `app_peak` is the max `peak_context_tokens` across *all* sessions in the
-/// fleet — if any session has ever observed >210k, the user must be on the
-/// 1M variant globally, so we bump even fresh sessions that haven't yet hit
-/// that mark.
-fn context_window_for_session(s: &Session, app_peak: u64) -> u64 {
+/// 1. `TRIAGE_CONTEXT_WINDOW` env var — explicit override.
+/// 2. The session's own model name carries a `[1m]` tag (future-proof; today
+///    the transcript strips it).
+/// 3. `~/.claude/settings.json` default model has a `[1m]` tag — this is the
+///    deterministic source for the user's global preference.
+/// 4. Per-session peak `> 210k` tokens — empirical proof the variant isn't
+///    200k-capped.
+/// 5. Fleet-wide peak `> 210k` tokens — same proof from a sibling session.
+fn context_window_for_session(
+    s: &Session,
+    app_peak: u64,
+    default_model: Option<&str>,
+) -> u64 {
     if let Ok(v) = std::env::var("TRIAGE_CONTEXT_WINDOW")
         && let Ok(n) = v.parse::<u64>()
         && n > 0
@@ -810,10 +842,9 @@ fn context_window_for_session(s: &Session, app_peak: u64) -> u64 {
     {
         return 1_000_000;
     }
-    // A single observation of >200k tokens proves the model isn't 200k-capped.
-    // Add a 10k buffer so we don't false-positive near the cap. Check this
-    // session's own peak first, then fall back to the fleet-wide peak so
-    // fresh sessions inherit the 1M assumption.
+    if default_model.is_some_and(|m| m.contains("[1m]")) {
+        return 1_000_000;
+    }
     if s.peak_context_tokens > 210_000 || app_peak > 210_000 {
         return 1_000_000;
     }
