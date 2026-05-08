@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>com.inkless.triage-notify</string>
+  <key>CFBundleName</key>
+  <string>triage</string>
+  <key>CFBundleDisplayName</key>
+  <string>triage</string>
+  <key>CFBundleExecutable</key>
+  <string>triage-notify</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleVersion</key>
+  <string>0.2</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.2</string>
+  <!-- LSUIElement keeps this out of the Dock + Cmd-Tab so the helper stays
+       invisible while waiting for the click. The notification itself is the
+       only user-visible surface. -->
+  <key>LSUIElement</key>
+  <true/>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+</dict>
+</plist>

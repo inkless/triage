@@ -4,6 +4,10 @@
 *.profraw
 rustc-ice-*.txt
 
+# Built notification-helper bundle (assembled by scripts/triage-notify/build.sh
+# from the tracked main.swift + Info.plist; the output bundle isn't checked in)
+scripts/triage-notify/triage-notify.app/
+
 # macOS
 .DS_Store
 ._*

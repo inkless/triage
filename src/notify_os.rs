@@ -8,11 +8,12 @@ use crate::models::{AttentionState, Session};
 /// (Blocked or Error). Best-effort — failures are silently ignored, since
 /// running inside a TUI we can't surface them anywhere useful.
 ///
-/// Prefers `terminal-notifier` (Homebrew) when installed because it lets the
-/// notification carry a click action that jumps tmux focus to the blocked
-/// pane, and it isn't attributed to the Script Editor app the way `osascript
-/// display notification` is. Falls back to `osascript` otherwise — the
-/// notification still fires, but clicking it goes nowhere useful.
+/// Prefers our own `triage-notify` Swift helper (under
+/// `scripts/triage-notify/triage-notify.app/`) when available — it uses the
+/// modern UNUserNotificationCenter API so click actions actually fire on
+/// macOS 14+. Falls back to `osascript display notification` (display-only,
+/// no click action). `terminal-notifier` was tried earlier but its
+/// `-execute` callback was silently broken on recent macOS.
 pub fn alert(session: &Session) {
     let title = match session.state {
         AttentionState::Blocked => "needs your input",
@@ -37,14 +38,14 @@ pub fn alert(session: &Session) {
         .map(|s| s.chars().take(140).collect::<String>())
         .unwrap_or_default();
 
-    if let Some(notifier) = terminal_notifier_path() {
-        send_via_terminal_notifier(notifier, title, &label, &preview, session.pane.as_ref());
+    if let Some(notifier) = triage_notify_path() {
+        send_via_triage_notify(notifier, title, &label, &preview, session.pane.as_ref());
         return;
     }
     send_via_osascript(title, &label, &preview);
 }
 
-fn send_via_terminal_notifier(
+fn send_via_triage_notify(
     notifier: &str,
     title: &str,
     label: &str,
@@ -52,37 +53,21 @@ fn send_via_terminal_notifier(
     pane: Option<&crate::models::Pane>,
 ) {
     let mut cmd = Command::new(notifier);
-    cmd.args(["-title", "triage"]);
-    cmd.args(["-subtitle", &format!("{label} — {title}")]);
-    cmd.args(["-message", preview]);
-    cmd.args(["-group", "triage"]); // collapse repeats
-    // Sender attribution is OPT-IN only: macOS silently drops (or hangs)
-    // notifications when the sender app doesn't have notification permission,
-    // and kitty/Ghostty/etc. usually don't have it set up. Default behavior
-    // is to let the notification appear under terminal-notifier's own icon.
-    // Set `TRIAGE_TERMINAL_BUNDLE=net.kovidgoyal.kitty` (or similar) after
-    // granting that app notification permission to opt in.
-    if let Some(bundle) = forced_terminal_bundle_id() {
-        cmd.args(["-sender", bundle]);
-    }
+    cmd.args(["--title", "triage"]);
+    cmd.args(["--subtitle", &format!("{label} — {title}")]);
+    cmd.args(["--message", preview]);
 
-    // Click action: bring the user's terminal app to the foreground, then
-    // switch the tmux client to the blocked pane. Requires the Pane (for the
-    // target) and tmux on PATH (for the command). Activating the terminal
-    // first matters when the user is in a different macOS app — without it,
-    // tmux's internal focus changes but the terminal window stays hidden.
+    // Click action: activate the user's terminal app, then `tmux
+    // switch-client + select-pane` to the blocked pane. Activation matters
+    // when the user is in a different macOS app — without it, tmux's
+    // internal focus changes but the terminal window stays hidden.
     if let (Some(pane), Some(tmux)) = (pane, tmux_path()) {
         let session_name = pane.tmux_session.as_str();
-        // AppleScript: `tell application id "<bundle>" to activate`. The
-        // bundle ID needs DOUBLE quotes inside the AppleScript (it's a string
-        // literal there); the entire expression then needs SINGLE quotes for
-        // the shell. Earlier this used `shell_quote(bundle)` for the inner
-        // wrap, which produced `'tell application id 'net.foo.bar' to
-        // activate'` — sh consumed the quote pairs, leaving the bundle
-        // unquoted in AppleScript, which parses as a chained property and
-        // errors. The `&&` short-circuited, so click → nothing happened.
         let activate_cmd = detected_terminal_bundle()
             .map(|bundle| {
+                // AppleScript needs DOUBLE quotes around the bundle ID
+                // (string literal); the entire AppleScript expression then
+                // needs SINGLE quotes for /bin/sh -c.
                 let applescript = format!(
                     "tell application id {} to activate",
                     applescript_string(bundle)
@@ -90,15 +75,19 @@ fn send_via_terminal_notifier(
                 format!("/usr/bin/osascript -e {} && ", shell_quote(&applescript))
             })
             .unwrap_or_default();
-        let exec = format!(
+        let action = format!(
             "{activate}{tmux} switch-client -t {session} && {tmux} select-pane -t {target}",
             activate = activate_cmd,
             tmux = shell_quote(tmux),
             session = shell_quote(session_name),
             target = shell_quote(&pane.target),
         );
-        cmd.args(["-execute", &exec]);
+        cmd.args(["--action", &action]);
     }
+    // 60s default timeout; matches the hook claim handshake's timeout for
+    // auto-mode notifications. Helper exits cleanly when interacted-with
+    // sooner.
+    cmd.args(["--timeout", "60"]);
     spawn_detached(cmd);
 }
 
@@ -133,11 +122,23 @@ fn spawn_detached(mut cmd: Command) {
     });
 }
 
-/// User-forced terminal bundle ID via `TRIAGE_TERMINAL_BUNDLE`. Used as the
-/// `-sender` for terminal-notifier. Auto-detection isn't safe here: macOS
-/// silently drops notifications when the sender app lacks permission AND
-/// (newer macOS) terminal-notifier's sender-spoofing is unreliable in
-/// general. Force it by env var only.
+/// Detect which terminal app triage is running under, for the click-action
+/// activate path only. Checks `TRIAGE_TERMINAL_BUNDLE` first, then env vars,
+/// then walks the process tree (handles tmux-inside-terminal, since tmux
+/// strips most env).
+fn detected_terminal_bundle() -> Option<&'static str> {
+    static CACHED: OnceLock<Option<&'static str>> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if let Some(forced) = forced_terminal_bundle_id() {
+            return Some(forced);
+        }
+        if let Some(b) = bundle_from_env() {
+            return Some(b);
+        }
+        bundle_from_proc_tree()
+    })
+}
+
 fn forced_terminal_bundle_id() -> Option<&'static str> {
     static CACHED: OnceLock<Option<&'static str>> = OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -149,24 +150,6 @@ fn forced_terminal_bundle_id() -> Option<&'static str> {
         // Leak the override so we can hand out &'static str. Once-per-process,
         // negligible memory cost.
         Some(Box::leak(trimmed.to_string().into_boxed_str()) as &'static str)
-    })
-}
-
-/// Detect which terminal app triage is running under, for the click-action
-/// activate path only. Unlike `-sender`, activating an app on click works
-/// reliably on modern macOS — it just brings that bundle to the foreground.
-/// Checks `TRIAGE_TERMINAL_BUNDLE` first, then env vars, then walks the
-/// process tree (handles tmux-inside-terminal, since tmux strips most env).
-fn detected_terminal_bundle() -> Option<&'static str> {
-    static CACHED: OnceLock<Option<&'static str>> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        if let Some(forced) = forced_terminal_bundle_id() {
-            return Some(forced);
-        }
-        if let Some(b) = bundle_from_env() {
-            return Some(b);
-        }
-        bundle_from_proc_tree()
     })
 }
 
@@ -244,10 +227,35 @@ fn command_of(pid: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn terminal_notifier_path() -> Option<&'static str> {
+/// Locate the `triage-notify` helper binary inside its `.app` bundle.
+/// Searches a few candidate paths relative to the running triage binary:
+/// the workspace `scripts/` dir (cargo build context), a sibling `scripts/`
+/// (cargo install with --root .), and a sibling `.app` (manual install).
+fn triage_notify_path() -> Option<&'static str> {
     static CACHED: OnceLock<Option<String>> = OnceLock::new();
     CACHED
-        .get_or_init(|| which("terminal-notifier"))
+        .get_or_init(|| {
+            let exe = std::env::current_exe().ok()?;
+            let exe_dir = exe.parent()?;
+            let candidates = [
+                // Workspace layout: target/release/triage → ../../scripts/...
+                exe_dir
+                    .join("../../scripts/triage-notify/triage-notify.app/Contents/MacOS/triage-notify"),
+                // Sibling layout: <prefix>/bin/triage → <prefix>/scripts/...
+                exe_dir
+                    .join("../scripts/triage-notify/triage-notify.app/Contents/MacOS/triage-notify"),
+                // Same-dir layout: triage-notify.app next to triage binary
+                exe_dir.join("triage-notify.app/Contents/MacOS/triage-notify"),
+            ];
+            for c in &candidates {
+                if let Ok(p) = c.canonicalize()
+                    && p.exists()
+                {
+                    return Some(p.display().to_string());
+                }
+            }
+            None
+        })
         .as_deref()
 }
 
