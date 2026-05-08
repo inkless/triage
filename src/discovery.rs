@@ -80,6 +80,7 @@ pub fn discover_live_sessions() -> Vec<Session> {
             total_tokens_cache_write: 0,
             total_tokens_cache_read: 0,
             latest_context_tokens: 0,
+            peak_context_tokens: 0,
             latest_model: None,
             latest_assistant_text: None,
             state: AttentionState::Unknown,

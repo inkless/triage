@@ -642,11 +642,14 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
         ]));
     }
 
-    // Context-window occupancy. Most claude models cap at 200k; we hardcode
-    // that for the percentage display since the variant tag (e.g. 1M Sonnet)
-    // isn't in the transcript message's `model` field.
+    // Context-window occupancy. Detection in priority order:
+    //   1. TRIAGE_CONTEXT_WINDOW env var (explicit user override)
+    //   2. Model name carries a `[1m]` tag → 1M
+    //   3. Peak observed input tokens for this session > 200k → 1M
+    //      (a >200k input is hard evidence the model isn't 200k-capped)
+    //   4. Default 200k
     if s.latest_context_tokens > 0 {
-        let window = context_window_for(s.latest_model.as_deref());
+        let window = context_window_for_session(s);
         let pct = (s.latest_context_tokens as f64 / window as f64) * 100.0;
         let pct_color = if pct >= 95.0 {
             Color::Red
@@ -771,12 +774,28 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-/// Context-window size by model family. All current 4.x models (Opus, Sonnet,
-/// Haiku) ship with a 200k default. Long-context Sonnet (1M) is gated behind
-/// a beta header that doesn't show up in the transcript's `model` field, so
-/// we'd just under-report on those — accept the imprecision; the percentage
-/// would simply read >100% to flag "you have more headroom than this shows."
-fn context_window_for(_model: Option<&str>) -> u64 {
+/// Context-window size for a session. The 4.x model families all ship with a
+/// 200k default; the 1M-context variant is gated behind a beta header and the
+/// transcript's `model` field doesn't always carry a `[1m]` tag — so we use
+/// three heuristics in priority order before falling back to 200k.
+fn context_window_for_session(s: &Session) -> u64 {
+    if let Ok(v) = std::env::var("TRIAGE_CONTEXT_WINDOW")
+        && let Ok(n) = v.parse::<u64>()
+        && n > 0
+    {
+        return n;
+    }
+    if let Some(m) = &s.latest_model
+        && m.contains("[1m]")
+    {
+        return 1_000_000;
+    }
+    // A single observation of >200k tokens proves the model isn't 200k-capped.
+    // Add a small buffer (210k) so we don't false-positive on tokens that
+    // happen to land near the cap. Once tripped, snap to 1M.
+    if s.peak_context_tokens > 210_000 {
+        return 1_000_000;
+    }
     200_000
 }
 

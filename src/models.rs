@@ -61,6 +61,9 @@ pub struct Session {
     /// current context-window occupancy. Pair with `latest_model` (and the
     /// model's documented context size) to get a percentage.
     pub latest_context_tokens: u64,
+    /// Peak `latest_context_tokens` observed across the session. >200k is
+    /// solid evidence the user is on a 1M-context variant.
+    pub peak_context_tokens: u64,
     pub latest_model: Option<String>,
     /// Most recent assistant text response. For Blocked sessions this is
     /// usually Claude's *explanation* of the pending tool call.

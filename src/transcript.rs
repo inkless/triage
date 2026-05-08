@@ -43,6 +43,10 @@ pub struct TranscriptDigest {
     /// `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`.
     /// Approximates the current context-window occupancy. 0 if no usage seen.
     pub latest_context_tokens: u64,
+    /// Max `latest_context_tokens` observed across the session. A peak >200k
+    /// is hard evidence the user is on a 1M-context model variant, even when
+    /// the message's `model` field doesn't carry the `[1m]` tag.
+    pub peak_context_tokens: u64,
     /// Model name from the most recent assistant message. Used to look up the
     /// context-window size for the percentage display.
     pub latest_model: Option<String>,
@@ -275,6 +279,7 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
     let mut total_tokens_cache_read: u64 = 0;
     let mut counted_msg_ids: HashSet<String> = HashSet::new();
     let mut latest_context_tokens: u64 = 0;
+    let mut peak_context_tokens: u64 = 0;
     let mut latest_model: Option<String> = None;
     // Track the latest assistant text alongside its event timestamp so a
     // late-arriving older event (rare but possible) doesn't overwrite a
@@ -415,7 +420,11 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
                         // context-window indicator. Always update with the
                         // most recent observation; transcripts are append-
                         // only, so the last counted message wins.
-                        latest_context_tokens = in_tok + cw_tok + cr_tok;
+                        let ctx = in_tok + cw_tok + cr_tok;
+                        latest_context_tokens = ctx;
+                        if ctx > peak_context_tokens {
+                            peak_context_tokens = ctx;
+                        }
                         if !model.is_empty() {
                             latest_model = Some(model.to_string());
                         }
@@ -491,6 +500,7 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
         total_tokens_cache_write,
         total_tokens_cache_read,
         latest_context_tokens,
+        peak_context_tokens,
         latest_model,
         latest_assistant_text: latest_assistant_text.map(|(_, t)| t),
     })
@@ -544,6 +554,7 @@ pub fn enrich(session: &mut Session, now: SystemTime, cache: &mut DigestCache) {
     session.total_tokens_cache_write = d.total_tokens_cache_write;
     session.total_tokens_cache_read = d.total_tokens_cache_read;
     session.latest_context_tokens = d.latest_context_tokens;
+    session.peak_context_tokens = d.peak_context_tokens;
     session.latest_model = d.latest_model;
     session.latest_assistant_text = d.latest_assistant_text;
 }
