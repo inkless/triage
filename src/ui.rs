@@ -668,7 +668,16 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
             Span::raw(format_cost(s.total_cost_usd)),
         ];
         if s.latest_context_tokens > 0 {
-            let window = context_window_for_session(s);
+            // App-wide peak: a single observation of >210k anywhere in the
+            // fleet is hard proof the user is on the 1M variant, even if
+            // *this* session hasn't yet crossed the threshold.
+            let app_peak = app
+                .sessions
+                .iter()
+                .map(|s| s.peak_context_tokens)
+                .max()
+                .unwrap_or(0);
+            let window = context_window_for_session(s, app_peak);
             let pct = (s.latest_context_tokens as f64 / window as f64) * 100.0;
             let pct_color = if pct >= 95.0 {
                 Color::Red
@@ -783,8 +792,13 @@ fn format_tokens(n: u64) -> String {
 /// Context-window size for a session. The 4.x model families all ship with a
 /// 200k default; the 1M-context variant is gated behind a beta header and the
 /// transcript's `model` field doesn't always carry a `[1m]` tag — so we use
-/// three heuristics in priority order before falling back to 200k.
-fn context_window_for_session(s: &Session) -> u64 {
+/// four heuristics in priority order before falling back to 200k.
+///
+/// `app_peak` is the max `peak_context_tokens` across *all* sessions in the
+/// fleet — if any session has ever observed >210k, the user must be on the
+/// 1M variant globally, so we bump even fresh sessions that haven't yet hit
+/// that mark.
+fn context_window_for_session(s: &Session, app_peak: u64) -> u64 {
     if let Ok(v) = std::env::var("TRIAGE_CONTEXT_WINDOW")
         && let Ok(n) = v.parse::<u64>()
         && n > 0
@@ -797,9 +811,10 @@ fn context_window_for_session(s: &Session) -> u64 {
         return 1_000_000;
     }
     // A single observation of >200k tokens proves the model isn't 200k-capped.
-    // Add a small buffer (210k) so we don't false-positive on tokens that
-    // happen to land near the cap. Once tripped, snap to 1M.
-    if s.peak_context_tokens > 210_000 {
+    // Add a 10k buffer so we don't false-positive near the cap. Check this
+    // session's own peak first, then fall back to the fleet-wide peak so
+    // fresh sessions inherit the 1M assumption.
+    if s.peak_context_tokens > 210_000 || app_peak > 210_000 {
         return 1_000_000;
     }
     200_000
