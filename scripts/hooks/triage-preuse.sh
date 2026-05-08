@@ -35,8 +35,13 @@
 DIR="${HOME}/.claude/triage"
 PENDING_DIR="${DIR}/pending"
 DECISIONS_DIR="${DIR}/decisions"
+CLAIMS_DIR="${DIR}/claims"
 ALIVE_FILE="${DIR}/.alive"
+# Short window for a manual `a`/`d` keypress in triage. If autonomous mode
+# claims the request (writes claims/<uuid>.json), we extend by TIMEOUT_AUTO
+# to give the LLM auditor time to reach a verdict.
 TIMEOUT_SECS=3
+TIMEOUT_AUTO=60
 
 # --- 1. Bail out if triage isn't running -------------------------------------
 
@@ -59,6 +64,7 @@ if [ -z "$uuid" ]; then
 fi
 pending_file="${PENDING_DIR}/${uuid}.json"
 decision_file="${DECISIONS_DIR}/${uuid}.json"
+claim_file="${CLAIMS_DIR}/${uuid}.json"
 pending_tmp="${PENDING_DIR}/.${uuid}.tmp"
 
 # Pipe stdin to a temp file first so we can cheaply inspect the payload before
@@ -79,18 +85,42 @@ if ! mv "$pending_tmp" "$pending_file"; then
   exit 0
 fi
 
-# Always clean up temp/pending/decision files on exit (success, error, signal).
+# Always clean up temp/pending/decision/claim files on exit (success, error,
+# signal). Claim cleanup is belt-and-suspenders; triage's worker thread
+# normally removes it itself when the auditor finishes.
 cleanup() {
-  rm -f "$pending_tmp" "$pending_file" "$decision_file" 2>/dev/null
+  rm -f "$pending_tmp" "$pending_file" "$decision_file" "$claim_file" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
 # --- 3. Wait for decision ----------------------------------------------------
+#
+# Two timeouts:
+# - TIMEOUT_SECS (3s): for manual `a`/`d` in triage. If nothing's happening,
+#   bail fast so Claude's native permission UI takes over without a long stall.
+# - TIMEOUT_AUTO (60s): only kicks in after triage's autonomous-mode auditor
+#   has claimed this uuid. Sonnet round-trip is 10–25s, so the short timeout
+#   would otherwise expire before the auditor reached a verdict.
+#
+# In extended mode, claim absence means the auditor finished as either WAIT
+# (no decision file) or with an error — bail fast in both cases so Claude
+# can take over.
 
 deadline=$(( $(date +%s) + TIMEOUT_SECS ))
+extended=0
 while [ ! -f "$decision_file" ]; do
-  if [ "$(date +%s)" -gt "$deadline" ]; then
-    # Timed out — let Claude's normal permission flow take over.
+  now=$(date +%s)
+  if [ "$now" -gt "$deadline" ]; then
+    if [ "$extended" -eq 0 ] && [ -f "$claim_file" ]; then
+      # Auditor claimed it. Extend once.
+      deadline=$(( now + TIMEOUT_AUTO ))
+      extended=1
+    else
+      exit 0
+    fi
+  fi
+  if [ "$extended" -eq 1 ] && [ ! -f "$claim_file" ]; then
+    # Auditor finished without writing a decision (WAIT or error).
     exit 0
   fi
   sleep 0.5

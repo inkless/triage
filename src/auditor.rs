@@ -57,15 +57,24 @@ pub struct Verdict {
 ///   2. `~/.config/triage/auditor-prompt.md` if present
 ///   3. compiled-in `DEFAULT_SYSTEM_PROMPT`
 fn load_system_prompt() -> (String, String) {
+    // Skip empty/whitespace-only overrides instead of silently passing them
+    // through. An accidentally-empty file (e.g. `touch auditor-prompt.md`)
+    // would otherwise wedge every audit with `API Error: 400 system: text
+    // content blocks must contain non-whitespace text`.
     if let Ok(path) = std::env::var("TRIAGE_AUDITOR_PROMPT_FILE") {
         match std::fs::read_to_string(&path) {
-            Ok(content) => return (content, format!("env TRIAGE_AUDITOR_PROMPT_FILE={path}")),
+            Ok(content) if !content.trim().is_empty() => {
+                return (content, format!("env TRIAGE_AUDITOR_PROMPT_FILE={path}"));
+            }
+            Ok(_) => eprintln!("[warn] TRIAGE_AUDITOR_PROMPT_FILE={path} is empty; falling through"),
             Err(e) => eprintln!("[warn] TRIAGE_AUDITOR_PROMPT_FILE={path} unreadable: {e}"),
         }
     }
     if let Some(home) = std::env::var_os("HOME") {
         let p = PathBuf::from(home).join(".config/triage/auditor-prompt.md");
-        if let Ok(content) = std::fs::read_to_string(&p) {
+        if let Ok(content) = std::fs::read_to_string(&p)
+            && !content.trim().is_empty()
+        {
             return (content, p.display().to_string());
         }
     }

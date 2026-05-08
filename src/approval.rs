@@ -19,7 +19,16 @@ pub struct PendingApproval {
     pub session_id: String,
     pub cwd: PathBuf,
     pub tool_name: String,
+    /// One-line summary used by the UI (truncated to 200–400 chars depending
+    /// on tool type). NOT suitable for feeding the autonomous-mode auditor —
+    /// truncating the body of a `gh pr create` or a multi-paragraph Edit makes
+    /// it impossible to decide on safety. Use `tool_input_full` for that.
     pub tool_input_brief: String,
+    /// Full `tool_input` JSON serialization, untruncated. The autonomous-mode
+    /// auditor needs the whole command (especially for Bash heredocs and Edit
+    /// new_string content) to make a confident decision. Empty string if the
+    /// hook payload had no `tool_input` field.
+    pub tool_input_full: String,
     pub created_at: SystemTime,
     pub pending_path: PathBuf,
 }
@@ -37,8 +46,33 @@ pub fn decisions_dir() -> PathBuf {
     triage_dir().join("decisions")
 }
 
+/// Auto-mode handshake dir. When the autonomous-mode auditor starts processing
+/// a hook-captured request, triage writes `claims/<uuid>.json` here. The hook
+/// extends its short timeout when it sees its uuid claimed, so the auditor
+/// has time to reach a verdict (~10–25s on Sonnet) instead of the hook
+/// defaulting to Claude's native permission flow at 3s.
+pub fn claims_dir() -> PathBuf {
+    triage_dir().join("claims")
+}
+
 pub fn alive_file() -> PathBuf {
     triage_dir().join(".alive")
+}
+
+/// Best-effort claim write. The hook reads `claims/<uuid>.json` and extends
+/// its deadline when present; absence means triage isn't going to decide, so
+/// the hook can bail to Claude's native flow.
+pub fn write_claim(uuid: &str) {
+    let dir = claims_dir();
+    let _ = fs::create_dir_all(&dir);
+    let _ = fs::write(dir.join(format!("{uuid}.json")), b"{}");
+}
+
+/// Best-effort claim removal. Called after the auditor sends its verdict
+/// (so the hook reacts to claim absence as "WAIT — let Claude handle it",
+/// or to decision-file presence as "auditor decided, use this").
+pub fn remove_claim(uuid: &str) {
+    let _ = fs::remove_file(claims_dir().join(format!("{uuid}.json")));
 }
 
 /// Drop guard: writes our pid to `.alive` on construction, removes on drop.
@@ -116,12 +150,23 @@ pub fn read_pending() -> Vec<PendingApproval> {
             .unwrap_or("?")
             .to_string();
         let tool_input_brief = brief_tool_input(v.get("tool_input"));
+        let tool_input_full = v
+            .get("tool_input")
+            .map(|val| {
+                if let Some(s) = val.as_str() {
+                    s.to_string()
+                } else {
+                    val.to_string()
+                }
+            })
+            .unwrap_or_default();
         out.push(PendingApproval {
             uuid: uuid.to_string(),
             session_id,
             cwd,
             tool_name,
             tool_input_brief,
+            tool_input_full,
             created_at,
             pending_path: path,
         });

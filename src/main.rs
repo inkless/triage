@@ -421,9 +421,13 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         .collect();
     app.audit_decided.retain(|k| blocked_keys.contains(k));
 
-    // Drain returning verdicts. Action gated on app.autonomous so a toggle-off
-    // mid-flight discards the action (but still cleans up state + leaves a
-    // visible note in the detail pane).
+    // Drain returning verdicts. Routing happened in the worker thread (so the
+    // decision file lands before the claim is removed and the hook reacts).
+    // Here we just record state + emit a status message. Action gated on
+    // app.autonomous: if the user toggled off mid-flight, we still want the
+    // note for visibility, but the worker already routed — that's a known
+    // race, mitigated by the "session no longer Blocked" check the worker
+    // would skip on.
     while let Ok(v) = app.audit_rx.try_recv() {
         app.audit_in_flight.remove(&v.pid);
         let note = format!("{} — {}", v.decision, v.reason);
@@ -434,8 +438,6 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         let Some(s) = sessions.iter().find(|s| {
             s.pid == v.pid && s.state == models::AttentionState::Blocked && !s.muted
         }) else {
-            // Session moved on (user pressed a/d, session ended) or got muted.
-            // Drop the verdict — acting now would route to the wrong prompt.
             continue;
         };
         let key = persist::MuteKey {
@@ -443,12 +445,10 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
             started_at_ms: s.started_at_ms,
         };
         app.audit_decided.insert(key);
-        let msg = match v.decision.as_str() {
-            "APPROVE" => auto_route(s, app.approval_mode, true, &v.reason),
-            "DENY" => auto_route(s, app.approval_mode, false, &v.reason),
-            _ => format!("auditor WAIT: pid {} ({})", v.pid, v.tool_name),
-        };
-        app.status_msg = Some(msg);
+        app.status_msg = Some(format!(
+            "auditor {}: pid {} ({})",
+            v.decision, v.pid, v.tool_name
+        ));
     }
 
     if !app.autonomous {
@@ -471,9 +471,11 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         if app.audit_decided.contains(&key) {
             continue;
         }
-        // Prefer hook-captured (richer, structured); fall back to tmux capture.
+        // Prefer hook-captured (richer, structured, FULL untruncated input);
+        // fall back to tmux capture (UI-truncated; less reliable for the
+        // auditor, which can refuse to decide on truncated heredocs).
         let (tool_name, tool_input) = if let Some(a) = s.pending_approvals.first() {
-            (a.tool_name.clone(), a.tool_input_brief.clone())
+            (a.tool_name.clone(), a.tool_input_full.clone())
         } else if let Some((n, b)) = &s.last_tool_use {
             (n.clone(), b.clone())
         } else {
@@ -485,44 +487,69 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
             .unwrap_or_else(|| "(unknown)".to_string());
         let pid = s.pid;
         let cwd = s.cwd.clone();
+        // Capture everything the worker thread needs to route the decision
+        // synchronously (so the decision file lands BEFORE remove_claim
+        // signals the hook). The hook path needs the uuid; tmux fallback
+        // needs the pane target; we capture both and let the worker pick.
+        let uuid = s.pending_approvals.first().map(|a| a.uuid.clone());
+        let pane_target = s.pane.as_ref().map(|p| p.target.clone());
+        let approval_mode = app.approval_mode;
         let tx = app.audit_tx.clone();
+        // Stake the claim BEFORE spawning so the hook sees it on its next
+        // poll (within 500ms) and extends its deadline.
+        if let Some(ref uuid) = uuid {
+            approval::write_claim(uuid);
+        }
         app.audit_in_flight.insert(pid);
         std::thread::spawn(move || {
             let v = auditor::run_audit(pid, &cwd, &intent, &tool_name, &tool_input);
+            // Route APPROVE/DENY here so the decision file lands BEFORE
+            // remove_claim. WAIT writes nothing — the hook sees claim removal
+            // with no decision and bails to Claude's native flow.
+            match v.decision.as_str() {
+                "APPROVE" => {
+                    route_decision(approval_mode, uuid.as_deref(), pane_target.as_deref(), true, &v.reason);
+                }
+                "DENY" => {
+                    route_decision(approval_mode, uuid.as_deref(), pane_target.as_deref(), false, &v.reason);
+                }
+                _ => {} // WAIT: leave for human
+            }
             let _ = tx.send(v);
+            if let Some(uuid) = uuid {
+                approval::remove_claim(&uuid);
+            }
         });
     }
 }
 
-/// Route an auditor verdict through the same approve/deny machinery as `a`/`d`.
-/// `approve=true` selects "1+Enter" (tmux) or `approval::approve` (hook);
-/// `approve=false` selects "Escape" / `approval::deny`. Returns the status-bar
-/// string to surface.
-fn auto_route(
-    s: &models::Session,
+/// Route the auditor's APPROVE/DENY through the same machinery as manual
+/// `a`/`d`. Runs in the auditor's worker thread (not the main thread) so the
+/// decision file lands BEFORE `remove_claim` signals the hook — otherwise the
+/// hook would react to claim removal and bail to Claude's native flow before
+/// our decision had a chance to be picked up. Takes captured-by-value fields
+/// instead of `&Session` because the session list is local to the main
+/// thread's refresh and may be gone by the time the auditor returns.
+fn route_decision(
     mode: models::ApprovalMode,
+    uuid: Option<&str>,
+    pane_target: Option<&str>,
     approve: bool,
     reason: &str,
-) -> String {
-    let action = if approve { "APPROVE" } else { "DENY" };
+) {
     if mode == models::ApprovalMode::Hook
-        && let Some(a) = s.pending_approvals.first()
+        && let Some(uuid) = uuid
     {
         if approve {
-            approval::approve(&a.uuid);
+            approval::approve(uuid);
         } else {
-            approval::deny(&a.uuid, reason);
+            approval::deny(uuid, reason);
         }
-        return format!("auditor {action} (hook): pid {}", s.pid);
+        return;
     }
-    let Some(pane) = &s.pane else {
-        return format!("auditor {action} but no pane: pid {}", s.pid);
-    };
+    let Some(target) = pane_target else { return };
     let keys: &[&str] = if approve { &["1", "Enter"] } else { &["Escape"] };
-    match tmux::send_keys(&pane.target, keys) {
-        Ok(()) => format!("auditor {action} (tmux): pid {} → {}", s.pid, pane.target),
-        Err(e) => format!("auditor {action} failed: {e}"),
-    }
+    let _ = tmux::send_keys(target, keys);
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
