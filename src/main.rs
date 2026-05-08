@@ -183,6 +183,37 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         return true;
     }
 
+    // Audit-log overlay has its own input scheme: ↑↓ scrolls instead of
+    // moving the table selection, `H`/Esc closes. Forward to the regular
+    // handler for q/Ctrl-C only.
+    if app.audit_log_open {
+        match code {
+            KeyCode::Char('q') => return false,
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Char('H') | KeyCode::Esc => {
+                app.audit_log_open = false;
+                app.audit_log_offset = 0;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.audit_log_offset = app.audit_log_offset.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.audit_log_offset = app.audit_log_offset.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                app.audit_log_offset = app.audit_log_offset.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                app.audit_log_offset = app.audit_log_offset.saturating_add(10);
+            }
+            KeyCode::Home => {
+                app.audit_log_offset = 0;
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     match code {
         KeyCode::Char('q') => return false,
         KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
@@ -204,6 +235,16 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                 "autonomous mode: {}",
                 if app.autonomous { "ON" } else { "off" }
             ));
+        }
+        KeyCode::Char('H') => {
+            if app.toggle_audit_log() {
+                app.status_msg = Some(format!(
+                    "audit log {}",
+                    if app.audit_log_open { "open" } else { "closed" }
+                ));
+            } else {
+                app.status_msg = Some("audit log unavailable — auto mode is off".to_string());
+            }
         }
         KeyCode::Char('/') => {
             app.filter_active = true;

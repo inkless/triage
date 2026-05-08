@@ -55,6 +55,12 @@ pub struct AppState {
     /// Read once at startup; the only deterministic source of the variant tag
     /// since the transcript's per-message `model` field strips `[1m]`.
     pub default_model: Option<String>,
+    /// When true, the main area renders the audit-history overlay instead of
+    /// the session table. Toggle with `H` (only effective when autonomous
+    /// mode is on — there's no history to look at otherwise).
+    pub audit_log_open: bool,
+    /// Scroll offset into the audit log (0 = newest entry at top).
+    pub audit_log_offset: u16,
 }
 
 impl AppState {
@@ -82,7 +88,22 @@ impl AppState {
             audit_tx,
             audit_rx,
             default_model: crate::approval::read_default_model(),
+            audit_log_open: false,
+            audit_log_offset: 0,
         }
+    }
+
+    pub fn toggle_audit_log(&mut self) -> bool {
+        if !self.autonomous && !self.audit_log_open {
+            // Don't open the log when auto mode is off — there's nothing
+            // useful to look at, and the empty panel would be confusing.
+            return false;
+        }
+        self.audit_log_open = !self.audit_log_open;
+        if !self.audit_log_open {
+            self.audit_log_offset = 0;
+        }
+        true
     }
 
     pub fn toggle_approval_mode(&mut self) {
@@ -177,6 +198,16 @@ impl AppState {
 }
 
 pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
+    if app.audit_log_open {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)])
+            .split(f.area());
+        draw_header(f, chunks[0], app);
+        draw_audit_log(f, chunks[1], app, now);
+        draw_footer(f, chunks[2], app);
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -885,7 +916,150 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
+/// Read recent entries from `~/.config/triage/auto-decisions.jsonl`. Newest
+/// last in the file (append-only); we return them newest-first up to `limit`.
+/// On any error (file missing, bad JSON), returns an empty vec — the panel
+/// renders an empty-state message in that case.
+fn read_audit_log(limit: usize) -> Vec<serde_json::Value> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let path = std::path::PathBuf::from(home).join(".config/triage/auto-decisions.jsonl");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    let mut out: Vec<serde_json::Value> = content
+        .lines()
+        .rev()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .take(limit)
+        .collect();
+    // Already newest-first by virtue of `.lines().rev()`.
+    let _ = &mut out;
+    out
+}
+
+fn draw_audit_log(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
+    let dim = || Style::default().fg(Color::DarkGray);
+    let bold = || Style::default().add_modifier(Modifier::BOLD);
+
+    let entries = read_audit_log(200);
+    let total = entries.len();
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    if entries.is_empty() {
+        let msg = if app.autonomous {
+            "no audits yet — auto mode is on but hasn't fired against a Blocked session"
+        } else {
+            "auto mode is off — no audits to show"
+        };
+        lines.push(Line::from(Span::styled(msg, dim())));
+    }
+
+    for v in &entries {
+        let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+        let pid = v.get("pid").and_then(|p| p.as_u64()).unwrap_or(0);
+        let cwd = v.get("cwd").and_then(|c| c.as_str()).unwrap_or("");
+        let cwd_short = std::path::Path::new(cwd)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| cwd.to_string());
+        let tool = v.get("tool").and_then(|t| t.as_str()).unwrap_or("?");
+        let decision = v
+            .get("decision")
+            .and_then(|d| d.as_str())
+            .unwrap_or("?")
+            .to_string();
+        let reason = v.get("reason").and_then(|r| r.as_str()).unwrap_or("");
+        let cost = v.get("cost_usd").and_then(|c| c.as_f64());
+        let duration_ms = v.get("duration_ms").and_then(|d| d.as_u64());
+
+        let now_secs = now
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let ago = if now_secs > ts && ts > 0 {
+            let s = now_secs - ts;
+            if s < 60 {
+                format!("{s}s ago")
+            } else if s < 3600 {
+                format!("{}m ago", s / 60)
+            } else if s < 86400 {
+                format!("{}h ago", s / 3600)
+            } else {
+                format!("{}d ago", s / 86400)
+            }
+        } else {
+            "?".to_string()
+        };
+
+        let decision_color = match decision.as_str() {
+            "APPROVE" => Color::Green,
+            "DENY" => Color::Red,
+            "WAIT" => Color::Yellow,
+            _ => Color::DarkGray,
+        };
+
+        // Row 1: time · decision · tool · pid+cwd · cost/duration
+        let mut row1: Vec<Span> = vec![
+            Span::styled(format!("{:>10}", ago), dim()),
+            Span::raw("  "),
+            Span::styled(format!("{:<7}", decision), Style::default().fg(decision_color).add_modifier(Modifier::BOLD)),
+            Span::raw("  "),
+            Span::styled(format!("{:<6}", tool), bold()),
+            Span::raw("  "),
+            Span::styled(format!("pid {pid} {cwd_short}"), dim()),
+        ];
+        let perf = match (cost, duration_ms) {
+            (Some(c), Some(ms)) => Some(format!("{:.1}s · ${:.4}", ms as f64 / 1000.0, c)),
+            (Some(c), None) => Some(format!("${:.4}", c)),
+            (None, Some(ms)) => Some(format!("{:.1}s", ms as f64 / 1000.0)),
+            (None, None) => None,
+        };
+        if let Some(p) = perf {
+            row1.push(Span::styled("  ·  ", dim()));
+            row1.push(Span::styled(p, dim()));
+        }
+        lines.push(Line::from(row1));
+        // Row 2: reason, indented
+        if !reason.is_empty() {
+            lines.push(Line::from(vec![
+                Span::raw("            "),
+                Span::raw(reason.to_string()),
+            ]));
+        }
+        // Spacer
+        lines.push(Line::from(""));
+    }
+
+    let summary = if total > 0 {
+        format!(" auto-decisions  ·  {} entries  ·  newest first ", total)
+    } else {
+        " auto-decisions ".to_string()
+    };
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(Span::styled(summary, dim()));
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((app.audit_log_offset, 0));
+    f.render_widget(para, area);
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
+    if app.audit_log_open {
+        let hint = "  ↑↓ / j k scroll  ·  PgUp/PgDn page  ·  Home top  ·  H/Esc close  ·  q quit";
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
     let line = if app.filter_active {
         Line::from(Span::styled(
             "  [enter] apply  [esc] cancel",
@@ -907,7 +1081,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
                 " ⏎ jump  a/d  h [{mode}]  A [{auto}]  m mute  / filter  q"
             ),
             LayoutMode::Wide => format!(
-                "  ↑↓ select  ⏎ jump  / filter  space detail  a approve  d deny  h mode [{mode}]  A auto [{auto}]  m mute  r refresh  q quit"
+                "  ↑↓ select  ⏎ jump  / filter  space detail  a approve  d deny  h mode [{mode}]  A auto [{auto}]  H log  m mute  q quit"
             ),
         };
         let style = if app.autonomous {
