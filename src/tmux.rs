@@ -181,6 +181,41 @@ pub fn parse_pending_brief(pane: &str) -> Option<String> {
     Some(collected.join(" "))
 }
 
+/// Like `parse_pending_brief` but unbounded: no 20-line cap, joins with
+/// newlines instead of spaces. The autonomous-mode auditor needs the full
+/// command (Bash heredocs span tens of lines, Edit diffs likewise) to make
+/// a confident decision. Anchor and separator logic are identical to
+/// `parse_pending_brief`.
+pub fn parse_pending_full(pane: &str) -> Option<String> {
+    let lines: Vec<&str> = pane.lines().collect();
+    let opt_idx = lines.iter().rposition(|l| l.contains("1. Yes"))?;
+    let mut collected: Vec<&str> = Vec::new();
+    for line in lines[..opt_idx].iter().rev() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("Do you want") {
+            continue;
+        }
+        if is_outer_separator(trimmed) {
+            break;
+        }
+        if is_inner_separator(trimmed) {
+            continue;
+        }
+        collected.push(trimmed);
+    }
+    if collected.is_empty() {
+        return None;
+    }
+    collected.reverse();
+    if collected.first().is_some_and(|l| is_chip_header(l)) {
+        collected.remove(0);
+    }
+    Some(collected.join("\n"))
+}
+
 fn is_outer_separator(s: &str) -> bool {
     !s.is_empty() && s.chars().count() >= 20 && s.chars().all(|c| c == '─')
 }

@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::SystemTime;
 
+use serde_json::Value;
+
 use crate::{discovery, tmux, transcript};
 
 const DEFAULT_SYSTEM_PROMPT: &str = r#"You are a safety auditor for an autonomous coding agent.
@@ -49,6 +51,13 @@ pub struct Verdict {
     pub reason: String,
     /// Tool name we audited (echoed for logging / row annotation).
     pub tool_name: String,
+    /// USD cost of this audit call as reported by `claude -p --output-format
+    /// json` (`total_cost_usd`). None when the subprocess errored before
+    /// emitting a result envelope (so cost wasn't billed either).
+    pub cost_usd: Option<f64>,
+    /// Wall-clock duration of the audit subprocess as reported by claude
+    /// (`duration_ms`). Useful for spotting Sonnet rate-limit slowdowns.
+    pub duration_ms: Option<u64>,
 }
 
 /// Resolve the system prompt at call time so users can iterate on it without
@@ -109,7 +118,7 @@ pub fn run_audit(
         cwd = cwd.display(),
     );
 
-    let raw = match run_claude(&system_prompt, &user_prompt) {
+    let raw_envelope = match run_claude(&system_prompt, &user_prompt) {
         Ok(out) => out,
         Err(e) => {
             let v = Verdict {
@@ -117,20 +126,45 @@ pub fn run_audit(
                 decision: "WAIT".to_string(),
                 reason: format!("auditor subprocess failed: {e}"),
                 tool_name: tool_name.to_string(),
+                cost_usd: None,
+                duration_ms: None,
             };
             let _ = append_audit_log(&v, cwd, intent, tool_input, "");
             return v;
         }
     };
 
-    let (decision, reason) = parse_verdict(&raw);
+    // `--output-format json` returns a single JSON envelope:
+    //   {"type":"result","result":"DECISION: …\nREASON: …\n","total_cost_usd":0.024,"duration_ms":2072,...}
+    // We parse for the user-visible fields (result text → DECISION/REASON)
+    // and for cost/duration. If JSON parsing fails (e.g. claude printed an
+    // error to stdout), we fall back to treating the whole stdout as the
+    // text response so an out-of-band error message still surfaces.
+    let envelope: Option<Value> = serde_json::from_str::<Value>(&raw_envelope).ok();
+    let result_text = envelope
+        .as_ref()
+        .and_then(|v: &Value| v.get("result"))
+        .and_then(|r: &Value| r.as_str())
+        .map(|s: &str| s.to_string())
+        .unwrap_or_else(|| raw_envelope.clone());
+    let cost_usd = envelope
+        .as_ref()
+        .and_then(|v: &Value| v.get("total_cost_usd"))
+        .and_then(|c: &Value| c.as_f64());
+    let duration_ms = envelope
+        .as_ref()
+        .and_then(|v: &Value| v.get("duration_ms"))
+        .and_then(|d: &Value| d.as_u64());
+    let (decision, reason) = parse_verdict(&result_text);
     let v = Verdict {
         pid,
         decision,
         reason,
         tool_name: tool_name.to_string(),
+        cost_usd,
+        duration_ms,
     };
-    let _ = append_audit_log(&v, cwd, intent, tool_input, &raw);
+    let _ = append_audit_log(&v, cwd, intent, tool_input, &raw_envelope);
     v
 }
 
@@ -151,7 +185,7 @@ fn run_claude(system_prompt: &str, user_prompt: &str) -> io::Result<String> {
         "--max-budget-usd",
         "1.00",
         "--output-format",
-        "text",
+        "json",
         "--name",
         AUDITOR_NAME,
     ]);
@@ -232,6 +266,10 @@ fn append_audit_log(
         "tool_input": truncate(tool_input, 1000),
         "decision": v.decision,
         "reason": v.reason,
+        // `total_cost_usd` and `duration_ms` from claude's JSON envelope.
+        // Null on subprocess failures (no billing happened).
+        "cost_usd": v.cost_usd,
+        "duration_ms": v.duration_ms,
         "raw": truncate(raw, 1000),
     });
     let mut f = OpenOptions::new().create(true).append(true).open(&path)?;

@@ -623,6 +623,25 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
         lines.push(Line::from(spans));
     }
 
+    // Approximate session cost. Computed from per-message usage × per-model
+    // rates; cross-check against `/cost` slash command for the canonical
+    // figure. We show it here because in this view it's already focused —
+    // saves bouncing into the pane to ask Claude itself.
+    if s.total_cost_usd > 0.0 || s.total_tokens_in > 0 || s.total_tokens_out > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("cost: ", dim()),
+            Span::raw(format_cost(s.total_cost_usd)),
+            Span::styled("  ·  ", dim()),
+            Span::raw(format!(
+                "{} in / {} out / {} cache",
+                format_tokens(s.total_tokens_in),
+                format_tokens(s.total_tokens_out),
+                format_tokens(s.total_tokens_cache_write + s.total_tokens_cache_read),
+            )),
+            Span::styled("  (approx)", dim()),
+        ]));
+    }
+
     // Pending tool input. Two paths depending on capture source:
     //   - Hook (richer): full `tool_input_full` JSON, parsed into a per-tool
     //     pretty rendering (Bash command with real newlines, Edit path + diff).
@@ -689,6 +708,28 @@ fn format_age_opt(ts: Option<SystemTime>, now: SystemTime) -> String {
         format!("{}h", s / 3600)
     } else {
         format!("{}d", s / 86400)
+    }
+}
+
+fn format_cost(usd: f64) -> String {
+    if usd >= 1.0 {
+        format!("${:.2}", usd)
+    } else if usd >= 0.01 {
+        format!("${:.3}", usd)
+    } else if usd > 0.0 {
+        format!("${:.5}", usd)
+    } else {
+        "$0".to_string()
+    }
+}
+
+fn format_tokens(n: u64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
     }
 }
 

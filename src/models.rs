@@ -49,6 +49,15 @@ pub struct Session {
     /// specific tool call Claude is asking permission for.
     pub last_tool_use: Option<(String, String)>,
 
+    /// Approximate cumulative session cost in USD, summed from per-message
+    /// `usage` × per-model rates over the transcript. See
+    /// `TranscriptDigest::total_cost_usd` for caveats.
+    pub total_cost_usd: f64,
+    pub total_tokens_in: u64,
+    pub total_tokens_out: u64,
+    pub total_tokens_cache_write: u64,
+    pub total_tokens_cache_read: u64,
+
     pub state: AttentionState,
     /// True when the user has muted this session. Muted sessions still update
     /// in the background but render dimmed and sort to the bottom of the list.

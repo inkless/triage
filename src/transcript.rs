@@ -28,6 +28,59 @@ pub struct TranscriptDigest {
     pub user_prompt_count: u64,
     pub last_stop_had_errors: bool,
     pub last_tool_use: Option<(String, String)>,
+    /// Approximate cumulative session cost in USD, computed from per-message
+    /// `usage` × the rate table for the message's `model`. "Approximate"
+    /// because (a) rates can change without us updating, (b) we sum all
+    /// `cache_creation_input_tokens` at 5m rates even though some may be 1h
+    /// (~2× the cost). Cross-check against Claude Code's `/cost` slash
+    /// command for the canonical figure.
+    pub total_cost_usd: f64,
+    pub total_tokens_in: u64,
+    pub total_tokens_out: u64,
+    pub total_tokens_cache_write: u64,
+    pub total_tokens_cache_read: u64,
+}
+
+/// Per-million-token USD rates for each model family. Caller picks via
+/// `rates_for_model`; substring match on "opus" / "sonnet" / "haiku" so
+/// minor-version bumps don't need a code change. Rates as of 2026-Q2.
+struct Rates {
+    input: f64,
+    output: f64,
+    cache_write: f64, // ephemeral 5m
+    cache_read: f64,
+}
+
+const OPUS_RATES: Rates = Rates {
+    input: 15.0,
+    output: 75.0,
+    cache_write: 18.75,
+    cache_read: 1.50,
+};
+const SONNET_RATES: Rates = Rates {
+    input: 3.0,
+    output: 15.0,
+    cache_write: 3.75,
+    cache_read: 0.30,
+};
+const HAIKU_RATES: Rates = Rates {
+    input: 1.0,
+    output: 5.0,
+    cache_write: 1.25,
+    cache_read: 0.10,
+};
+
+fn rates_for_model(model: &str) -> &'static Rates {
+    let m = model.to_lowercase();
+    if m.contains("opus") {
+        &OPUS_RATES
+    } else if m.contains("haiku") {
+        &HAIKU_RATES
+    } else {
+        // Default to Sonnet rates: most common, and lower than Opus, so
+        // unknown models err on the cheap side rather than over-reporting.
+        &SONNET_RATES
+    }
 }
 
 /// (path → (mtime, digest)). Skip re-parsing JSONL when its mtime hasn't
@@ -195,6 +248,13 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
     // while still blocked on an earlier Bash.
     let mut tool_uses: Vec<(String, String, String)> = Vec::new();
     let mut completed_tool_ids: HashSet<String> = HashSet::new();
+    // Cost accumulators. We multiply per assistant message because the
+    // model can change mid-session (e.g. Opus → Sonnet on `/model`).
+    let mut total_cost_usd: f64 = 0.0;
+    let mut total_tokens_in: u64 = 0;
+    let mut total_tokens_out: u64 = 0;
+    let mut total_tokens_cache_write: u64 = 0;
+    let mut total_tokens_cache_read: u64 = 0;
 
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -261,6 +321,40 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
                         }
                     }
                 }
+                // Per-message cost. Each assistant message has its own
+                // `usage` object and `model` field; sum across the whole
+                // session using the per-model rate table. Cache_creation is
+                // billed at the 5m rate; we ignore the rare 1h split.
+                if let Some(msg) = v.get("message")
+                    && let Some(usage) = msg.get("usage")
+                {
+                    let model = msg.get("model").and_then(|m| m.as_str()).unwrap_or("");
+                    let r = rates_for_model(model);
+                    let in_tok =
+                        usage.get("input_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
+                    let out_tok = usage
+                        .get("output_tokens")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0);
+                    let cw_tok = usage
+                        .get("cache_creation_input_tokens")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0);
+                    let cr_tok = usage
+                        .get("cache_read_input_tokens")
+                        .and_then(|n| n.as_u64())
+                        .unwrap_or(0);
+                    let cost = (in_tok as f64 * r.input
+                        + out_tok as f64 * r.output
+                        + cw_tok as f64 * r.cache_write
+                        + cr_tok as f64 * r.cache_read)
+                        / 1_000_000.0;
+                    total_cost_usd += cost;
+                    total_tokens_in += in_tok;
+                    total_tokens_out += out_tok;
+                    total_tokens_cache_write += cw_tok;
+                    total_tokens_cache_read += cr_tok;
+                }
             }
             "system" => {
                 let sub = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
@@ -325,6 +419,11 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
         user_prompt_count,
         last_stop_had_errors,
         last_tool_use,
+        total_cost_usd,
+        total_tokens_in,
+        total_tokens_out,
+        total_tokens_cache_write,
+        total_tokens_cache_read,
     })
 }
 
@@ -370,6 +469,11 @@ pub fn enrich(session: &mut Session, now: SystemTime, cache: &mut DigestCache) {
     session.user_prompt_count = d.user_prompt_count;
     session.last_stop_had_errors = d.last_stop_had_errors;
     session.last_tool_use = d.last_tool_use;
+    session.total_cost_usd = d.total_cost_usd;
+    session.total_tokens_in = d.total_tokens_in;
+    session.total_tokens_out = d.total_tokens_out;
+    session.total_tokens_cache_write = d.total_tokens_cache_write;
+    session.total_tokens_cache_read = d.total_tokens_cache_read;
 }
 
 /// Extract user-typed text from a message.content value.

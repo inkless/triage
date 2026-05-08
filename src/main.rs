@@ -430,7 +430,18 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
     // would skip on.
     while let Ok(v) = app.audit_rx.try_recv() {
         app.audit_in_flight.remove(&v.pid);
-        let note = format!("{} — {}", v.decision, v.reason);
+        // Include cost + duration alongside the decision so the user can see
+        // what each audit ran them ($) and how long Sonnet took (rate-limit
+        // diagnosis). Both fields are None on subprocess failures.
+        let perf = match (v.cost_usd, v.duration_ms) {
+            (Some(c), Some(ms)) => {
+                format!(" ({:.1}s, ${:.4})", ms as f64 / 1000.0, c)
+            }
+            (Some(c), None) => format!(" (${:.4})", c),
+            (None, Some(ms)) => format!(" ({:.1}s)", ms as f64 / 1000.0),
+            (None, None) => String::new(),
+        };
+        let note = format!("{}{} — {}", v.decision, perf, v.reason);
         app.audit_notes.insert(v.pid, (SystemTime::now(), note));
         if !app.autonomous {
             continue;
@@ -471,12 +482,35 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         if app.audit_decided.contains(&key) {
             continue;
         }
-        // Prefer hook-captured (richer, structured, FULL untruncated input);
-        // fall back to tmux capture (UI-truncated; less reliable for the
-        // auditor, which can refuse to decide on truncated heredocs).
+        // Prefer hook-captured (richer, structured, FULL untruncated input).
+        // When the hook didn't fire (timed out for a stale Blocked, or the
+        // session is in `permission_mode=auto` so the hook bailed), do a
+        // fresh pane capture and parse the full pending command — NOT the
+        // UI brief in `last_tool_use.1`, which is line-capped to 20 and
+        // joined with spaces (auditor was refusing on "truncated heredoc"
+        // for legitimate Bash commands).
         let (tool_name, tool_input) = if let Some(a) = s.pending_approvals.first() {
             (a.tool_name.clone(), a.tool_input_full.clone())
+        } else if let Some(pane) = &s.pane
+            && let Some(content) = tmux::capture_pane(&pane.target)
+            && let Some(full_input) = tmux::parse_pending_full(&content)
+        {
+            let tool_name = s
+                .last_tool_use
+                .as_ref()
+                .map(|(n, _)| n.clone())
+                .or_else(|| {
+                    s.waiting_for
+                        .as_deref()
+                        .and_then(|w| w.strip_prefix("approve "))
+                        .map(String::from)
+                })
+                .unwrap_or_else(|| "?".to_string());
+            (tool_name, full_input)
         } else if let Some((n, b)) = &s.last_tool_use {
+            // Last-resort: the row already had a tool_use from transcript +
+            // brief from earlier capture, but the pane scrape just failed
+            // (process gone, etc.). Use the brief — better than nothing.
             (n.clone(), b.clone())
         } else {
             continue;
