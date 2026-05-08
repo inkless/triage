@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::io;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
@@ -340,13 +341,37 @@ pub fn attach_to_sessions(approvals: Vec<PendingApproval>, sessions: &mut [crate
     }
 }
 
-/// Print the `~/.claude/settings.json` snippet the user needs to add.
-pub fn print_install_hint() {
-    let path = std::env::current_exe()
+/// Path to `~/.claude/settings.json`. None when HOME is unset.
+fn settings_json_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude/settings.json"))
+}
+
+/// Resolved absolute path to `triage-preuse.sh`. Walks up two levels from the
+/// running binary to find the repo's `scripts/hooks/` dir; falls back to the
+/// relative source path string when the binary lives outside the repo (e.g.
+/// `cargo install`-ed to ~/.cargo/bin) — in that case the user must point
+/// the hook at a checkout of the repo.
+fn hook_script_path() -> Option<PathBuf> {
+    std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|d| d.to_path_buf()))
         .map(|d| d.join("../../scripts/hooks/triage-preuse.sh"))
         .and_then(|p| p.canonicalize().ok())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallOutcome {
+    Installed,
+    AlreadyInstalled,
+    Removed,
+    NotFound,
+}
+
+/// Print the `~/.claude/settings.json` snippet the user needs to add.
+/// Kept for backward compatibility — `--install-hooks` is the preferred path
+/// because it merges idempotently into an existing settings file.
+pub fn print_install_hint() {
+    let path = hook_script_path()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "<repo>/scripts/hooks/triage-preuse.sh".to_string());
     println!("Add the following to ~/.claude/settings.json (merge with any existing hooks):");
@@ -363,4 +388,256 @@ pub fn print_install_hint() {
     println!("    ]");
     println!("  }}");
     println!("}}");
+    println!();
+    println!("Or merge automatically: `triage --install-hooks` (add `--dry-run` to preview).");
+}
+
+/// Idempotently install the triage PreToolUse hook into ~/.claude/settings.json.
+/// Existing entries pointing at our script are left alone (returns
+/// `AlreadyInstalled`); otherwise we append our matcher group, leaving any
+/// other PreToolUse entries (Navi, etc.) untouched. Always writes a `.bak`
+/// next to the original before overwriting.
+pub fn install_hooks(dry_run: bool) -> io::Result<InstallOutcome> {
+    let script = hook_script_path().ok_or_else(|| {
+        io::Error::other(
+            "could not resolve triage-preuse.sh — run from inside the triage source tree, or use --install-hooks-hint",
+        )
+    })?;
+    let script_str = script.display().to_string();
+    let path = settings_json_path()
+        .ok_or_else(|| io::Error::other("HOME is unset; cannot locate settings.json"))?;
+    let original = read_settings_json(&path)?;
+    let (modified, outcome) = apply_install(&original, &script_str);
+
+    match outcome {
+        InstallOutcome::AlreadyInstalled => {
+            println!(
+                "triage hook already installed at {} (no changes)",
+                script_str
+            );
+        }
+        InstallOutcome::Installed if dry_run => {
+            println!("DRY RUN — would update {}:", path.display());
+            println!();
+            println!("{}", serde_json::to_string_pretty(&modified)?);
+        }
+        InstallOutcome::Installed => {
+            write_settings_json(&path, &modified)?;
+            println!("Installed triage hook in {}", path.display());
+            println!("  hook script: {}", script_str);
+            println!("  backup:      {}.bak", path.display());
+        }
+        _ => {}
+    }
+    Ok(outcome)
+}
+
+/// Inverse of `install_hooks`: removes any PreToolUse entries pointing at our
+/// script. Empty matcher groups are pruned, and empty `PreToolUse` /  `hooks`
+/// keys are removed. Other tools' hook entries are untouched.
+pub fn uninstall_hooks(dry_run: bool) -> io::Result<InstallOutcome> {
+    let script = hook_script_path().ok_or_else(|| {
+        io::Error::other("could not resolve triage-preuse.sh — nothing to remove")
+    })?;
+    let script_str = script.display().to_string();
+    let path = settings_json_path()
+        .ok_or_else(|| io::Error::other("HOME is unset; cannot locate settings.json"))?;
+    let original = read_settings_json(&path)?;
+    let (modified, outcome) = apply_uninstall(&original, &script_str);
+
+    match outcome {
+        InstallOutcome::NotFound => {
+            println!("triage hook not present in {} (no changes)", path.display());
+        }
+        InstallOutcome::Removed if dry_run => {
+            println!("DRY RUN — would update {}:", path.display());
+            println!();
+            println!("{}", serde_json::to_string_pretty(&modified)?);
+        }
+        InstallOutcome::Removed => {
+            write_settings_json(&path, &modified)?;
+            println!("Removed triage hook from {}", path.display());
+            println!("  backup: {}.bak", path.display());
+        }
+        _ => {}
+    }
+    Ok(outcome)
+}
+
+fn read_settings_json(path: &Path) -> io::Result<Value> {
+    if !path.exists() {
+        // Fresh file — start from an empty object so install can populate.
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
+    let bytes = fs::read(path)?;
+    if bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return Ok(Value::Object(serde_json::Map::new()));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::other(format!("failed to parse {}: {e}", path.display())))
+}
+
+fn write_settings_json(path: &Path, v: &Value) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if path.exists() {
+        let backup = path.with_extension("json.bak");
+        fs::copy(path, &backup)?;
+    }
+    let mut body = serde_json::to_string_pretty(v)?;
+    body.push('\n');
+    fs::write(path, body)?;
+    Ok(())
+}
+
+fn apply_install(input: &Value, script_path: &str) -> (Value, InstallOutcome) {
+    if hook_present(input, script_path) {
+        return (input.clone(), InstallOutcome::AlreadyInstalled);
+    }
+    let mut root = input.clone();
+    // Replace a non-object root with the fresh shape rather than corrupt it.
+    if !root.is_object() {
+        return (make_fresh_settings(script_path), InstallOutcome::Installed);
+    }
+    let root_obj = root.as_object_mut().unwrap();
+    let hooks = root_obj
+        .entry("hooks".to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !hooks.is_object() {
+        // Existing non-object `hooks` value is malformed; replace whole settings
+        // with our fresh shape rather than guess at intent.
+        return (make_fresh_settings(script_path), InstallOutcome::Installed);
+    }
+    let hooks_obj = hooks.as_object_mut().unwrap();
+    let pre = hooks_obj
+        .entry("PreToolUse".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if !pre.is_array() {
+        return (make_fresh_settings(script_path), InstallOutcome::Installed);
+    }
+    let pre_arr = pre.as_array_mut().unwrap();
+    pre_arr.push(serde_json::json!({
+        "matcher": ".*",
+        "hooks": [
+            { "type": "command", "command": script_path }
+        ]
+    }));
+    (root, InstallOutcome::Installed)
+}
+
+fn apply_uninstall(input: &Value, script_path: &str) -> (Value, InstallOutcome) {
+    if !hook_present(input, script_path) {
+        return (input.clone(), InstallOutcome::NotFound);
+    }
+    let mut root = input.clone();
+    let mut removed = false;
+    if let Some(root_obj) = root.as_object_mut()
+        && let Some(hooks) = root_obj.get_mut("hooks").and_then(|h| h.as_object_mut())
+    {
+        if let Some(pre) = hooks.get_mut("PreToolUse").and_then(|p| p.as_array_mut()) {
+            for group in pre.iter_mut() {
+                if let Some(group_hooks) =
+                    group.get_mut("hooks").and_then(|h| h.as_array_mut())
+                {
+                    let before = group_hooks.len();
+                    group_hooks.retain(|h| {
+                        h.get("command")
+                            .and_then(|c| c.as_str())
+                            .map(|c| !paths_equivalent(c, script_path))
+                            .unwrap_or(true)
+                    });
+                    if group_hooks.len() != before {
+                        removed = true;
+                    }
+                }
+            }
+            // Drop matcher groups that now have no hooks left.
+            pre.retain(|group| {
+                group
+                    .get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|a| !a.is_empty())
+                    .unwrap_or(true)
+            });
+            if pre.is_empty() {
+                hooks.remove("PreToolUse");
+            }
+        }
+        if hooks.is_empty() {
+            root_obj.remove("hooks");
+        }
+    }
+    if removed {
+        (root, InstallOutcome::Removed)
+    } else {
+        (input.clone(), InstallOutcome::NotFound)
+    }
+}
+
+fn hook_present(v: &Value, script_path: &str) -> bool {
+    v.get("hooks")
+        .and_then(|h| h.get("PreToolUse"))
+        .and_then(|p| p.as_array())
+        .map(|groups| {
+            groups.iter().any(|g| {
+                g.get("hooks")
+                    .and_then(|h| h.as_array())
+                    .map(|hs| {
+                        hs.iter().any(|h| {
+                            h.get("command")
+                                .and_then(|c| c.as_str())
+                                .map(|c| paths_equivalent(c, script_path))
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Compare two path strings semantically: tilde-expand, then try to
+/// canonicalize each (resolves symlinks + relative components). Falls back
+/// to literal string equality. Necessary because settings.json may store
+/// the hook command as `~/workspace/.../triage-preuse.sh` (tilde form) while
+/// our generator emits the canonical absolute path — naive eq would
+/// double-install.
+fn paths_equivalent(a: &str, b: &str) -> bool {
+    let a_exp = expand_tilde(a);
+    let b_exp = expand_tilde(b);
+    if a_exp == b_exp {
+        return true;
+    }
+    if let (Ok(a_can), Ok(b_can)) = (
+        Path::new(&a_exp).canonicalize(),
+        Path::new(&b_exp).canonicalize(),
+    ) {
+        return a_can == b_can;
+    }
+    false
+}
+
+fn expand_tilde(p: &str) -> String {
+    if let Some(rest) = p.strip_prefix("~/")
+        && let Some(home) = std::env::var_os("HOME")
+    {
+        return PathBuf::from(home).join(rest).display().to_string();
+    }
+    p.to_string()
+}
+
+fn make_fresh_settings(script: &str) -> Value {
+    serde_json::json!({
+        "hooks": {
+            "PreToolUse": [
+                {
+                    "matcher": ".*",
+                    "hooks": [
+                        { "type": "command", "command": script }
+                    ]
+                }
+            ]
+        }
+    })
 }

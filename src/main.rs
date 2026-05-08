@@ -41,6 +41,16 @@ fn main() -> io::Result<()> {
         approval::print_install_hint();
         return Ok(());
     }
+    if args.iter().any(|a| a == "--install-hooks") {
+        let dry = args.iter().any(|a| a == "--dry-run");
+        approval::install_hooks(dry)?;
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--uninstall-hooks") {
+        let dry = args.iter().any(|a| a == "--dry-run");
+        approval::uninstall_hooks(dry)?;
+        return Ok(());
+    }
     // T-56 spike: feed the selected session's pending tool_use to a
     // separate `claude -p` and print the auditor's verdict. No actual
     // approve/deny — just exercising the prompt + parse path.
