@@ -61,6 +61,17 @@ pub struct AppState {
     pub audit_log_open: bool,
     /// Scroll offset into the audit log (0 = newest entry at top).
     pub audit_log_offset: u16,
+    /// Total content-line count of the audit overlay (set by `draw_audit_log`
+    /// each draw). Used to clamp scroll on `j`/`Ctrl-D` and to compute the
+    /// `G`/bottom target.
+    pub audit_log_total_lines: u16,
+    /// Vim chord state: `g` waits for a follow-up `g` to mean "top". Reset
+    /// by any other key. Inside the audit-log overlay only.
+    pub pending_g: bool,
+    /// Cached parse of the audit log, keyed on file (mtime, size). Avoids
+    /// re-parsing the whole JSONL on every draw — most draws happen with
+    /// no new audit, so the cache hit rate is high.
+    pub audit_log_cache: Option<(SystemTime, u64, Vec<serde_json::Value>)>,
 }
 
 impl AppState {
@@ -90,6 +101,9 @@ impl AppState {
             default_model: crate::approval::read_default_model(),
             audit_log_open: false,
             audit_log_offset: 0,
+            audit_log_total_lines: 0,
+            pending_g: false,
+            audit_log_cache: None,
         }
     }
 
@@ -102,6 +116,7 @@ impl AppState {
         self.audit_log_open = !self.audit_log_open;
         if !self.audit_log_open {
             self.audit_log_offset = 0;
+            self.pending_g = false;
         }
         true
     }
@@ -205,6 +220,8 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
             .split(f.area());
         draw_header(f, chunks[0], app);
         draw_audit_log(f, chunks[1], app, now);
+        // draw_footer borrows app immutably — clone the small bits we need
+        // and let it run after draw_audit_log writes back its line count.
         draw_footer(f, chunks[2], app);
         return;
     }
@@ -916,34 +933,47 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// Read recent entries from `~/.config/triage/auto-decisions.jsonl`. Newest
-/// last in the file (append-only); we return them newest-first up to `limit`.
-/// On any error (file missing, bad JSON), returns an empty vec — the panel
-/// renders an empty-state message in that case.
-fn read_audit_log(limit: usize) -> Vec<serde_json::Value> {
+/// Read recent entries from `~/.config/triage/auto-decisions.jsonl`, with a
+/// cache keyed on (mtime, size). Most draws happen with no new audit, so we
+/// return the cached parse instead of re-reading the whole file. Newest-first.
+/// On any I/O or parse error, returns an empty vec.
+fn read_audit_log_cached(app: &mut AppState, limit: usize) -> Vec<serde_json::Value> {
     let Some(home) = std::env::var_os("HOME") else {
         return Vec::new();
     };
     let path = std::path::PathBuf::from(home).join(".config/triage/auto-decisions.jsonl");
+    let meta = std::fs::metadata(&path).ok();
+    let key = meta.as_ref().and_then(|m| {
+        let mtime = m.modified().ok()?;
+        Some((mtime, m.len()))
+    });
+    if let (Some((mt, sz)), Some((cmt, csz, entries))) = (key, app.audit_log_cache.as_ref())
+        && mt == *cmt
+        && sz == *csz
+    {
+        return entries.iter().take(limit).cloned().collect();
+    }
     let Ok(content) = std::fs::read_to_string(&path) else {
+        app.audit_log_cache = None;
         return Vec::new();
     };
-    let mut out: Vec<serde_json::Value> = content
+    let entries: Vec<serde_json::Value> = content
         .lines()
         .rev()
         .filter_map(|l| serde_json::from_str(l).ok())
-        .take(limit)
         .collect();
-    // Already newest-first by virtue of `.lines().rev()`.
-    let _ = &mut out;
+    let out = entries.iter().take(limit).cloned().collect();
+    if let Some((mt, sz)) = key {
+        app.audit_log_cache = Some((mt, sz, entries));
+    }
     out
 }
 
-fn draw_audit_log(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
+fn draw_audit_log(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
     let dim = || Style::default().fg(Color::DarkGray);
     let bold = || Style::default().add_modifier(Modifier::BOLD);
 
-    let entries = read_audit_log(200);
+    let entries = read_audit_log_cached(app, 200);
     let total = entries.len();
 
     let mut lines: Vec<Line> = Vec::new();
@@ -1033,6 +1063,17 @@ fn draw_audit_log(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
         lines.push(Line::from(""));
     }
 
+    // Save total content lines so the key handler can clamp scroll on j/G.
+    app.audit_log_total_lines = lines.len() as u16;
+    // Clamp current offset against fresh content (e.g. user pressed `j` past
+    // the end before this draw, or content shrank somehow).
+    let max_offset = app
+        .audit_log_total_lines
+        .saturating_sub(area.height.saturating_sub(2)); // 2 for top border + breathing room
+    if app.audit_log_offset > max_offset {
+        app.audit_log_offset = max_offset;
+    }
+
     let summary = if total > 0 {
         format!(" auto-decisions  ·  {} entries  ·  newest first ", total)
     } else {
@@ -1050,7 +1091,12 @@ fn draw_audit_log(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
     if app.audit_log_open {
-        let hint = "  ↑↓ / j k scroll  ·  PgUp/PgDn page  ·  Home top  ·  H/Esc close  ·  q quit";
+        let hint = if app.pending_g {
+            "  g … press g again to jump to top, any other key cancels".to_string()
+        } else {
+            "  j/k scroll  ·  ^d/^u half-page  ·  gg top  ·  G bottom  ·  H/Esc close  ·  q quit"
+                .to_string()
+        };
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint,

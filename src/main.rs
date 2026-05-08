@@ -183,16 +183,24 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         return true;
     }
 
-    // Audit-log overlay has its own input scheme: ↑↓ scrolls instead of
-    // moving the table selection, `H`/Esc closes. Forward to the regular
-    // handler for q/Ctrl-C only.
+    // Audit-log overlay has its own input scheme: ↑↓/jk scrolls instead of
+    // moving the table selection. Vim chords + half-page motion supported.
     if app.audit_log_open {
+        // `g` is special — it might be the first half of a `gg` chord, OR a
+        // standalone half-page-down (`Ctrl-d` shape) on its own. We use `gg`
+        // for top, `G` for bottom, `Ctrl-d`/`Ctrl-u` for half-page.
+        let was_pending_g = app.pending_g;
+        // Default: any key that isn't `g` clears the pending chord.
+        if !matches!(code, KeyCode::Char('g')) {
+            app.pending_g = false;
+        }
         match code {
             KeyCode::Char('q') => return false,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
             KeyCode::Char('H') | KeyCode::Esc => {
                 app.audit_log_open = false;
                 app.audit_log_offset = 0;
+                app.pending_g = false;
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.audit_log_offset = app.audit_log_offset.saturating_sub(1);
@@ -206,8 +214,34 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             KeyCode::PageDown => {
                 app.audit_log_offset = app.audit_log_offset.saturating_add(10);
             }
+            KeyCode::Char('d') if mods.contains(KeyModifiers::CONTROL) => {
+                // Ctrl-D: half-page down (~10 lines).
+                app.audit_log_offset = app.audit_log_offset.saturating_add(10);
+            }
+            KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+                // Ctrl-U: half-page up (~10 lines).
+                app.audit_log_offset = app.audit_log_offset.saturating_sub(10);
+            }
+            KeyCode::Char('g') => {
+                if was_pending_g {
+                    // gg: jump to top.
+                    app.audit_log_offset = 0;
+                    app.pending_g = false;
+                } else {
+                    app.pending_g = true;
+                }
+            }
+            KeyCode::Char('G') => {
+                // Jump to bottom. The next draw's clamp will pull this back
+                // to (total_lines - visible_height); using u16::MAX here is
+                // a "snap to end" sentinel.
+                app.audit_log_offset = u16::MAX;
+            }
             KeyCode::Home => {
                 app.audit_log_offset = 0;
+            }
+            KeyCode::End => {
+                app.audit_log_offset = u16::MAX;
             }
             _ => {}
         }
