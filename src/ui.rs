@@ -544,156 +544,61 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
     let mag = || Style::default().fg(Color::Magenta);
     let yellow = || Style::default().fg(Color::Yellow);
 
-    let mut lines = Vec::new();
+    let mut lines: Vec<Line> = Vec::new();
 
-    // Row 1: pane / pid / status / state. Hardest-to-derive identity first.
+    // ── HEADER ────────────────────────────────────────────────────
+    // Single line, no labels. State (colored) · pane · uptime · mode.
+    // Drop pid / session_id / status — all debug-tier; can be recovered by
+    // grepping transcripts. State is the canonical "what's this row doing"
+    // signal; status is redundant.
+    let (state_str, state_color) = state_glyph(s.state);
     let pane_target = s
         .pane
         .as_ref()
         .map(|p| p.target.clone())
-        .unwrap_or_else(|| "(none)".to_string());
-    lines.push(Line::from(vec![
-        Span::styled("pane: ", dim()),
-        Span::raw(pane_target),
-        Span::styled("  pid: ", dim()),
-        Span::raw(s.pid.to_string()),
-        Span::styled("  status: ", dim()),
-        Span::raw(s.status.clone()),
-        Span::styled("  state: ", dim()),
-        Span::raw(s.state.label().to_string()),
-    ]));
-
-    // Row 2: short session id, uptime, approve mode, mute flag.
-    let short_id: String = s.session_id.chars().take(8).collect();
+        .unwrap_or_else(|| "(no pane)".to_string());
     let uptime = format_uptime(s.started_at_ms, now);
-    let mut row2 = vec![
-        Span::styled("session: ", dim()),
-        Span::raw(short_id),
-        Span::styled("  uptime: ", dim()),
-        Span::raw(uptime),
-        Span::styled("  mode: ", dim()),
-        Span::raw(app.approval_mode.label().to_string()),
+    let sep = || Span::styled("  ·  ", dim());
+    let mut header = vec![
+        Span::styled(
+            state_str,
+            Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+        ),
+        sep(),
+        Span::styled(pane_target, bold()),
+        sep(),
+        Span::styled(uptime, dim()),
+        sep(),
+        Span::styled(format!("{} mode", app.approval_mode.label()), dim()),
     ];
     if s.muted {
-        row2.push(Span::styled("  [muted]", yellow()));
+        header.push(sep());
+        header.push(Span::styled("[muted]", yellow()));
     }
-    lines.push(Line::from(row2));
+    lines.push(Line::from(header));
 
-    // Auditor: in-flight indicator OR the most recent decision.
-    if let Some(start) = app.audit_in_flight.get(&s.pid) {
-        let secs = now.duration_since(*start).map(|d| d.as_secs()).unwrap_or(0);
-        lines.push(Line::from(vec![
-            Span::styled("auditor: ", mag()),
-            Span::styled("running…", mag().add_modifier(Modifier::BOLD)),
-            Span::styled(format!("  ({}s)", secs), dim()),
-        ]));
-    } else if let Some((ts, note)) = app.audit_notes.get(&s.pid) {
-        let ago = now.duration_since(*ts).map(|d| d.as_secs()).unwrap_or(0);
-        lines.push(Line::from(vec![
-            Span::styled("auditor: ", mag()),
-            Span::raw(note.clone()),
-            Span::styled(format!("  ({}s ago)", ago), dim()),
-        ]));
-    }
+    // ── BODY ──────────────────────────────────────────────────────
+    // Most actionable content first: what the agent is doing/saying and
+    // what tool it's asking permission for. Blank line separates header
+    // from body so the eye can land on it.
+    let body_start_idx = lines.len();
 
-    // Event timing — useful to tell "actively progressing" from "stuck".
-    let events_line = format!(
-        "last {} · prompt {} · stop {}",
-        format_age_opt(s.last_event_at, now),
-        format_age_opt(s.last_prompt_at, now),
-        format_age_opt(s.last_stop_at, now),
-    );
-    lines.push(Line::from(vec![
-        Span::styled("events: ", dim()),
-        Span::raw(events_line),
-    ]));
-
-    // Last turn timing (when both fields are populated).
-    if let (Some(d), Some(c)) = (s.last_turn_duration_ms, s.last_turn_msg_count) {
-        let mut spans = vec![
-            Span::styled("last turn: ", dim()),
-            Span::raw(format!("{}.{}s · {} msgs", d / 1000, (d % 1000) / 100, c)),
-        ];
-        if s.user_prompt_count > 0 {
-            spans.push(Span::styled(
-                format!("  ·  {} prompts total", s.user_prompt_count),
-                dim(),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-
-    // Approximate session cost. Computed from per-message usage × per-model
-    // rates; cross-check against `/cost` slash command for the canonical
-    // figure. We show it here because in this view it's already focused —
-    // saves bouncing into the pane to ask Claude itself.
-    if s.total_cost_usd > 0.0 || s.total_tokens_in > 0 || s.total_tokens_out > 0 {
-        lines.push(Line::from(vec![
-            Span::styled("cost: ", dim()),
-            Span::raw(format_cost(s.total_cost_usd)),
-            Span::styled("  ·  ", dim()),
-            Span::raw(format!(
-                "{} in / {} out / {} cache",
-                format_tokens(s.total_tokens_in),
-                format_tokens(s.total_tokens_out),
-                format_tokens(s.total_tokens_cache_write + s.total_tokens_cache_read),
-            )),
-            Span::styled("  (approx)", dim()),
-        ]));
-    }
-
-    // Context-window occupancy. Detection in priority order:
-    //   1. TRIAGE_CONTEXT_WINDOW env var (explicit user override)
-    //   2. Model name carries a `[1m]` tag → 1M
-    //   3. Peak observed input tokens for this session > 200k → 1M
-    //      (a >200k input is hard evidence the model isn't 200k-capped)
-    //   4. Default 200k
-    if s.latest_context_tokens > 0 {
-        let window = context_window_for_session(s);
-        let pct = (s.latest_context_tokens as f64 / window as f64) * 100.0;
-        let pct_color = if pct >= 95.0 {
-            Color::Red
-        } else if pct >= 80.0 {
-            Color::Yellow
-        } else {
-            Color::DarkGray
-        };
-        lines.push(Line::from(vec![
-            Span::styled("context: ", dim()),
-            Span::raw(format!(
-                "{} / {}",
-                format_tokens(s.latest_context_tokens),
-                format_tokens(window),
-            )),
-            Span::styled("  ", dim()),
-            Span::styled(format!("({:.0}%)", pct), Style::default().fg(pct_color)),
-        ]));
-    }
-
-    // Most recent assistant text (Claude's explanation, often immediately
-    // before the pending tool_use). Show before "pending:" so the reader
-    // gets the *why* before the *what*. Skip when it duplicates the recap
-    // (rare but possible if the headline is the same text).
     if let Some(t) = &s.latest_assistant_text
         && s.headline.as_ref().is_none_or(|h| h.trim() != t.trim())
     {
         lines.push(Line::from(vec![
-            Span::styled("agent: ", dim()),
+            Span::styled("agent  ", dim()),
             Span::raw(truncate(t, 300)),
         ]));
     }
 
-    // Pending tool input. Two paths depending on capture source:
-    //   - Hook (richer): full `tool_input_full` JSON, parsed into a per-tool
-    //     pretty rendering (Bash command with real newlines, Edit path + diff).
-    //   - Tmux scrape (truncated): show the brief verbatim with a "(tmux
-    //     scrape, may be truncated)" tag so the user knows why the auditor
-    //     might WAIT on this row.
     if s.status == "waiting" {
         if let Some(a) = s.pending_approvals.first() {
             lines.push(Line::from(vec![
-                Span::styled("pending: ", yellow()),
-                Span::styled(a.tool_name.clone(), bold()),
+                Span::styled(
+                    a.tool_name.clone(),
+                    yellow().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("  (hook)", dim()),
             ]));
             for line in a.tool_input_detail().lines().take(6) {
@@ -704,8 +609,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
             }
         } else if let Some((name, brief)) = &s.last_tool_use {
             lines.push(Line::from(vec![
-                Span::styled("pending: ", yellow()),
-                Span::styled(name.clone(), bold()),
+                Span::styled(name.clone(), yellow().add_modifier(Modifier::BOLD)),
                 Span::styled("  (tmux scrape, may be truncated)", dim()),
             ]));
             lines.push(Line::from(vec![
@@ -715,22 +619,124 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
         }
     }
 
-    if let Some(p) = &s.last_prompt {
-        lines.push(Line::from(vec![
-            Span::styled("last prompt: ", dim()),
-            Span::raw(truncate(p, 200)),
-        ]));
-    }
     if let Some(h) = &s.headline {
         lines.push(Line::from(vec![
-            Span::styled("recap: ", dim()),
+            Span::styled("recap  ", dim()),
             Span::raw(truncate(h, 400)),
         ]));
     }
+    if let Some(p) = &s.last_prompt {
+        lines.push(Line::from(vec![
+            Span::styled("prompt ", dim()),
+            Span::raw(truncate(p, 200)),
+        ]));
+    }
 
-    let block = Block::default()
-        .borders(Borders::TOP)
-        .title(Span::styled(" detail ", dim()));
+    // Insert a spacer between header and body if body has content. Doing
+    // it after construction (rather than always pushing) keeps the layout
+    // tight when a session has nothing actionable to show.
+    if lines.len() > body_start_idx {
+        lines.insert(body_start_idx, Line::from(""));
+    }
+
+    // ── FOOTER ────────────────────────────────────────────────────
+    // Auditor decision + numeric stats consolidated at the bottom. All
+    // dim by default so the eye reads them as metadata, not content.
+
+    let footer_start_idx = lines.len();
+
+    if let Some(start) = app.audit_in_flight.get(&s.pid) {
+        let secs = now.duration_since(*start).map(|d| d.as_secs()).unwrap_or(0);
+        lines.push(Line::from(vec![
+            Span::styled("audit  ", dim()),
+            Span::styled(format!("running ({}s)", secs), mag()),
+        ]));
+    } else if let Some((ts, note)) = app.audit_notes.get(&s.pid) {
+        let ago = now.duration_since(*ts).map(|d| d.as_secs()).unwrap_or(0);
+        lines.push(Line::from(vec![
+            Span::styled("audit  ", dim()),
+            Span::styled(note.clone(), mag()),
+            Span::styled(format!("  ({}s ago)", ago), dim()),
+        ]));
+    }
+
+    // Cost + context + tokens — all on one line so cost data scans as a
+    // single unit. Skip when there's nothing to show (fresh session).
+    if s.total_cost_usd > 0.0 || s.total_tokens_in > 0 {
+        let mut stats: Vec<Span> = vec![
+            Span::styled("cost   ", dim()),
+            Span::raw(format_cost(s.total_cost_usd)),
+        ];
+        if s.latest_context_tokens > 0 {
+            let window = context_window_for_session(s);
+            let pct = (s.latest_context_tokens as f64 / window as f64) * 100.0;
+            let pct_color = if pct >= 95.0 {
+                Color::Red
+            } else if pct >= 80.0 {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            };
+            stats.push(sep());
+            stats.push(Span::raw(format!(
+                "{}/{}",
+                format_tokens(s.latest_context_tokens),
+                format_tokens(window),
+            )));
+            stats.push(Span::styled(
+                format!(" ({:.0}%)", pct),
+                Style::default().fg(pct_color),
+            ));
+            stats.push(Span::styled(" ctx", dim()));
+        }
+        stats.push(sep());
+        stats.push(Span::styled(
+            format!(
+                "{} in · {} out · {} cache",
+                format_tokens(s.total_tokens_in),
+                format_tokens(s.total_tokens_out),
+                format_tokens(s.total_tokens_cache_write + s.total_tokens_cache_read),
+            ),
+            dim(),
+        ));
+        stats.push(Span::styled("  (approx)", dim()));
+        lines.push(Line::from(stats));
+    }
+
+    // Events line: timing + last-turn shape + lifetime prompt count, all
+    // on one line. Replaces the prior 2 separate `events:` and `last
+    // turn:` rows.
+    let mut events: Vec<Span> = vec![
+        Span::styled("events ", dim()),
+        Span::raw(format!(
+            "last {} · prompt {} · stop {}",
+            format_age_opt(s.last_event_at, now),
+            format_age_opt(s.last_prompt_at, now),
+            format_age_opt(s.last_stop_at, now),
+        )),
+    ];
+    if let (Some(d), Some(c)) = (s.last_turn_duration_ms, s.last_turn_msg_count) {
+        events.push(sep());
+        events.push(Span::styled(
+            format!("turn {}.{}s/{} msgs", d / 1000, (d % 1000) / 100, c),
+            dim(),
+        ));
+    }
+    if s.user_prompt_count > 0 {
+        events.push(sep());
+        events.push(Span::styled(
+            format!("{} prompts", s.user_prompt_count),
+            dim(),
+        ));
+    }
+    lines.push(Line::from(events));
+
+    // Spacer between body and footer, mirroring the body spacer logic.
+    if lines.len() > footer_start_idx {
+        lines.insert(footer_start_idx, Line::from(""));
+    }
+
+    let block = Block::default().borders(Borders::TOP);
     let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
