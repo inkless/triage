@@ -134,8 +134,13 @@ fn run_claude(system_prompt: &str, user_prompt: &str) -> io::Result<String> {
         "claude-sonnet-4-6",
         "--tools",
         "",
+        // Per-call budget cap. $0.05 was exhausted on routine calls because
+        // Sonnet's first turn pays for the (~2KB) system prompt + tool_input
+        // before generating any output. $1.00 is comfortable headroom for one
+        // call; the auditor only fires once per Blocked spell so total daily
+        // cost is bounded by Blocked-event count, not by this cap.
         "--max-budget-usd",
-        "0.05",
+        "1.00",
         "--output-format",
         "text",
         "--name",
@@ -146,10 +151,19 @@ fn run_claude(system_prompt: &str, user_prompt: &str) -> io::Result<String> {
     cmd.stdin(Stdio::null());
     let output = cmd.output()?;
     if !output.status.success() {
+        // Budget-exceeded and similar errors print to stdout, not stderr, and
+        // the exit message is empty. Include both streams so audit-log entries
+        // are diagnosable.
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = match (stderr.trim(), stdout.trim()) {
+            (s, "") => s.to_string(),
+            ("", o) => o.to_string(),
+            (s, o) => format!("stderr={s}; stdout={o}"),
+        };
         return Err(io::Error::other(format!(
             "claude exited {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            output.status, detail
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
