@@ -250,11 +250,18 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
     let mut completed_tool_ids: HashSet<String> = HashSet::new();
     // Cost accumulators. We multiply per assistant message because the
     // model can change mid-session (e.g. Opus → Sonnet on `/model`).
+    //
+    // Dedupe by `message.id`: one Anthropic API call emits multiple JSONL
+    // events (one per content block — text, tool_use, etc.), all sharing the
+    // same `message.id` and the same `usage` payload. Counting usage on each
+    // event triple- or quadruple-counts every turn's cost. We sum once per
+    // unique msg_id.
     let mut total_cost_usd: f64 = 0.0;
     let mut total_tokens_in: u64 = 0;
     let mut total_tokens_out: u64 = 0;
     let mut total_tokens_cache_write: u64 = 0;
     let mut total_tokens_cache_read: u64 = 0;
+    let mut counted_msg_ids: HashSet<String> = HashSet::new();
 
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -321,39 +328,57 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
                         }
                     }
                 }
-                // Per-message cost. Each assistant message has its own
+                // Per-message cost. Each assistant API call has its own
                 // `usage` object and `model` field; sum across the whole
-                // session using the per-model rate table. Cache_creation is
-                // billed at the 5m rate; we ignore the rare 1h split.
+                // session using the per-model rate table. Dedupe by
+                // `message.id` (see counted_msg_ids comment above) — one
+                // API call typically appears as several JSONL events all
+                // sharing the same id, and each carries the same usage.
+                // Cache_creation is billed at the 5m rate; we ignore the
+                // rare 1h split.
                 if let Some(msg) = v.get("message")
                     && let Some(usage) = msg.get("usage")
                 {
-                    let model = msg.get("model").and_then(|m| m.as_str()).unwrap_or("");
-                    let r = rates_for_model(model);
-                    let in_tok =
-                        usage.get("input_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
-                    let out_tok = usage
-                        .get("output_tokens")
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0);
-                    let cw_tok = usage
-                        .get("cache_creation_input_tokens")
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0);
-                    let cr_tok = usage
-                        .get("cache_read_input_tokens")
-                        .and_then(|n| n.as_u64())
-                        .unwrap_or(0);
-                    let cost = (in_tok as f64 * r.input
-                        + out_tok as f64 * r.output
-                        + cw_tok as f64 * r.cache_write
-                        + cr_tok as f64 * r.cache_read)
-                        / 1_000_000.0;
-                    total_cost_usd += cost;
-                    total_tokens_in += in_tok;
-                    total_tokens_out += out_tok;
-                    total_tokens_cache_write += cw_tok;
-                    total_tokens_cache_read += cr_tok;
+                    let msg_id = msg
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    // Empty id (older transcript schemas) → can't dedupe;
+                    // count it. Real msg_ids → only count first occurrence.
+                    let should_count =
+                        msg_id.is_empty() || counted_msg_ids.insert(msg_id);
+                    if should_count {
+                        let model =
+                            msg.get("model").and_then(|m| m.as_str()).unwrap_or("");
+                        let r = rates_for_model(model);
+                        let in_tok = usage
+                            .get("input_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0);
+                        let out_tok = usage
+                            .get("output_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0);
+                        let cw_tok = usage
+                            .get("cache_creation_input_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0);
+                        let cr_tok = usage
+                            .get("cache_read_input_tokens")
+                            .and_then(|n| n.as_u64())
+                            .unwrap_or(0);
+                        let cost = (in_tok as f64 * r.input
+                            + out_tok as f64 * r.output
+                            + cw_tok as f64 * r.cache_write
+                            + cr_tok as f64 * r.cache_read)
+                            / 1_000_000.0;
+                        total_cost_usd += cost;
+                        total_tokens_in += in_tok;
+                        total_tokens_out += out_tok;
+                        total_tokens_cache_write += cw_tok;
+                        total_tokens_cache_read += cr_tok;
+                    }
                 }
             }
             "system" => {
