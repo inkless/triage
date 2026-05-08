@@ -177,7 +177,7 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
         .constraints([
             Constraint::Length(1),                                    // header
             Constraint::Min(5),                                       // table
-            Constraint::Length(if app.detail_open { 14 } else { 0 }), // detail
+            Constraint::Length(if app.detail_open { 18 } else { 0 }), // detail
             Constraint::Length(1),                                    // footer
         ])
         .split(f.area());
@@ -642,6 +642,44 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
         ]));
     }
 
+    // Context-window occupancy. Most claude models cap at 200k; we hardcode
+    // that for the percentage display since the variant tag (e.g. 1M Sonnet)
+    // isn't in the transcript message's `model` field.
+    if s.latest_context_tokens > 0 {
+        let window = context_window_for(s.latest_model.as_deref());
+        let pct = (s.latest_context_tokens as f64 / window as f64) * 100.0;
+        let pct_color = if pct >= 95.0 {
+            Color::Red
+        } else if pct >= 80.0 {
+            Color::Yellow
+        } else {
+            Color::DarkGray
+        };
+        lines.push(Line::from(vec![
+            Span::styled("context: ", dim()),
+            Span::raw(format!(
+                "{} / {}",
+                format_tokens(s.latest_context_tokens),
+                format_tokens(window),
+            )),
+            Span::styled("  ", dim()),
+            Span::styled(format!("({:.0}%)", pct), Style::default().fg(pct_color)),
+        ]));
+    }
+
+    // Most recent assistant text (Claude's explanation, often immediately
+    // before the pending tool_use). Show before "pending:" so the reader
+    // gets the *why* before the *what*. Skip when it duplicates the recap
+    // (rare but possible if the headline is the same text).
+    if let Some(t) = &s.latest_assistant_text
+        && s.headline.as_ref().is_none_or(|h| h.trim() != t.trim())
+    {
+        lines.push(Line::from(vec![
+            Span::styled("agent: ", dim()),
+            Span::raw(truncate(t, 300)),
+        ]));
+    }
+
     // Pending tool input. Two paths depending on capture source:
     //   - Hook (richer): full `tool_input_full` JSON, parsed into a per-tool
     //     pretty rendering (Bash command with real newlines, Edit path + diff).
@@ -731,6 +769,15 @@ fn format_tokens(n: u64) -> String {
     } else {
         n.to_string()
     }
+}
+
+/// Context-window size by model family. All current 4.x models (Opus, Sonnet,
+/// Haiku) ship with a 200k default. Long-context Sonnet (1M) is gated behind
+/// a beta header that doesn't show up in the transcript's `model` field, so
+/// we'd just under-report on those — accept the imprecision; the percentage
+/// would simply read >100% to flag "you have more headroom than this shows."
+fn context_window_for(_model: Option<&str>) -> u64 {
+    200_000
 }
 
 fn format_uptime(started_at_ms: u64, now: SystemTime) -> String {

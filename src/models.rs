@@ -57,6 +57,14 @@ pub struct Session {
     pub total_tokens_out: u64,
     pub total_tokens_cache_write: u64,
     pub total_tokens_cache_read: u64,
+    /// Total input tokens for the latest assistant API call. Approximates
+    /// current context-window occupancy. Pair with `latest_model` (and the
+    /// model's documented context size) to get a percentage.
+    pub latest_context_tokens: u64,
+    pub latest_model: Option<String>,
+    /// Most recent assistant text response. For Blocked sessions this is
+    /// usually Claude's *explanation* of the pending tool call.
+    pub latest_assistant_text: Option<String>,
 
     pub state: AttentionState,
     /// True when the user has muted this session. Muted sessions still update

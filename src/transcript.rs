@@ -39,6 +39,18 @@ pub struct TranscriptDigest {
     pub total_tokens_out: u64,
     pub total_tokens_cache_write: u64,
     pub total_tokens_cache_read: u64,
+    /// Tokens-in for the most recent assistant API call:
+    /// `input_tokens + cache_creation_input_tokens + cache_read_input_tokens`.
+    /// Approximates the current context-window occupancy. 0 if no usage seen.
+    pub latest_context_tokens: u64,
+    /// Model name from the most recent assistant message. Used to look up the
+    /// context-window size for the percentage display.
+    pub latest_model: Option<String>,
+    /// Most recent assistant text response (joined across content blocks).
+    /// For Blocked sessions, this is typically Claude's explanation of *why*
+    /// it wants to run the pending tool — usually more useful than the raw
+    /// tool input alone.
+    pub latest_assistant_text: Option<String>,
 }
 
 /// Per-million-token USD rates for each model family. Caller picks via
@@ -262,6 +274,12 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
     let mut total_tokens_cache_write: u64 = 0;
     let mut total_tokens_cache_read: u64 = 0;
     let mut counted_msg_ids: HashSet<String> = HashSet::new();
+    let mut latest_context_tokens: u64 = 0;
+    let mut latest_model: Option<String> = None;
+    // Track the latest assistant text alongside its event timestamp so a
+    // late-arriving older event (rare but possible) doesn't overwrite a
+    // newer one. None until we see an assistant message with text content.
+    let mut latest_assistant_text: Option<(SystemTime, String)> = None;
 
     for line in text.lines() {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
@@ -310,8 +328,10 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
                 if let Some(content) = v.get("message").and_then(|m| m.get("content"))
                     && let Some(arr) = content.as_array()
                 {
+                    let mut text_parts: Vec<String> = Vec::new();
                     for block in arr {
-                        if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                        let block_type = block.get("type").and_then(|t| t.as_str());
+                        if block_type == Some("tool_use") {
                             let id = block
                                 .get("id")
                                 .and_then(|i| i.as_str())
@@ -325,7 +345,20 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
                             let brief =
                                 crate::approval::brief_tool_input(block.get("input"));
                             tool_uses.push((id, name, brief));
+                        } else if block_type == Some("text")
+                            && let Some(t) = block.get("text").and_then(|t| t.as_str())
+                            && !t.trim().is_empty()
+                        {
+                            text_parts.push(t.to_string());
                         }
+                    }
+                    if !text_parts.is_empty()
+                        && let Some(t) = ts
+                        && latest_assistant_text
+                            .as_ref()
+                            .is_none_or(|(prev, _)| t >= *prev)
+                    {
+                        latest_assistant_text = Some((t, text_parts.join("\n\n")));
                     }
                 }
                 // Per-message cost. Each assistant API call has its own
@@ -378,6 +411,14 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
                         total_tokens_out += out_tok;
                         total_tokens_cache_write += cw_tok;
                         total_tokens_cache_read += cr_tok;
+                        // Track the latest call's input total for the
+                        // context-window indicator. Always update with the
+                        // most recent observation; transcripts are append-
+                        // only, so the last counted message wins.
+                        latest_context_tokens = in_tok + cw_tok + cr_tok;
+                        if !model.is_empty() {
+                            latest_model = Some(model.to_string());
+                        }
                     }
                 }
             }
@@ -449,6 +490,9 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
         total_tokens_out,
         total_tokens_cache_write,
         total_tokens_cache_read,
+        latest_context_tokens,
+        latest_model,
+        latest_assistant_text: latest_assistant_text.map(|(_, t)| t),
     })
 }
 
@@ -499,6 +543,9 @@ pub fn enrich(session: &mut Session, now: SystemTime, cache: &mut DigestCache) {
     session.total_tokens_out = d.total_tokens_out;
     session.total_tokens_cache_write = d.total_tokens_cache_write;
     session.total_tokens_cache_read = d.total_tokens_cache_read;
+    session.latest_context_tokens = d.latest_context_tokens;
+    session.latest_model = d.latest_model;
+    session.latest_assistant_text = d.latest_assistant_text;
 }
 
 /// Extract user-typed text from a message.content value.
