@@ -75,8 +75,15 @@ pub struct AppState {
     /// popup closes when triage exits, so a single keypress (`Enter`) both
     /// jumps to the target pane AND dismisses the overlay. Without this,
     /// the popup would stay open showing triage and the user would have to
-    /// press `q` afterwards.
+    /// press `q` afterwards. Implies `zoom_on_jump` (popup is small, you
+    /// always want the target zoomed).
     pub exit_on_jump: bool,
+    /// When true, triage runs `tmux resize-pane -Z` on the target after a
+    /// successful `Enter` jump. Set by `--zoom-on-jump` (orthogonal to
+    /// `exit_on_jump` so a long-lived triage pane on mobile can zoom-on-jump
+    /// without exiting). Designed for "everything is one zoomed pane at a
+    /// time, swap with the binding" mobile workflow — see README.
+    pub zoom_on_jump: bool,
 }
 
 impl AppState {
@@ -108,6 +115,7 @@ impl AppState {
             pending_g: false,
             audit_log_cache: None,
             exit_on_jump: false,
+            zoom_on_jump: false,
         }
     }
 
@@ -302,6 +310,7 @@ impl LayoutMode {
 
 fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
     let visible = app.visible();
+    let selected_idx = app.selected.selected();
     let layout = LayoutMode::from_width(area.width);
 
     // Fixed = sum of non-headline column widths + per-column gap (1) + highlight indent (2).
@@ -348,26 +357,24 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
     let headline_width = (area.width as usize).saturating_sub(fixed).max(1);
     let rows: Vec<Row> = visible
         .iter()
-        .map(|s| build_row(s, now, headline_width, layout))
+        .enumerate()
+        .map(|(i, s)| build_row(s, now, headline_width, layout, Some(i) == selected_idx))
         .collect();
 
     let header = Row::new(header_cells)
         .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
-    // REVERSED rather than bg(DarkGray): the bg approach paints the row's
-    // entire allocated rect (height + bottom_margin), including empty cells
-    // beneath single-line columns when the row's height is taller (driven
-    // by the multi-line headline). The result on certain themes is a tall
-    // highlighted band that looks disconnected from the row content.
-    // REVERSED inverts each cell's fg/bg per-cell, so the highlight tracks
-    // the actual rendered glyphs and stops at empty space.
+    // Selected row gets uniform REVERSED on top of cells that have already
+    // been rendered with neutralized colors (see `build_row` `is_selected`
+    // path). REVERSED flips fg/bg per-cell — when each cell starts from the
+    // same default fg, the result is a single uniform band rather than the
+    // multicolor ribbon we got when each cell had its own color (green
+    // state / DarkGray age / bold-white session / DarkGray cwd / default
+    // headline). REVERSED was picked over a literal bg() to avoid painting
+    // the bottom_margin gap.
     let table = Table::new(rows, widths)
         .header(header)
-        .row_highlight_style(
-            Style::default()
-                .add_modifier(Modifier::REVERSED)
-                .add_modifier(Modifier::BOLD),
-        )
+        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol("▌ ")
         .block(Block::default().borders(Borders::TOP));
 
@@ -379,6 +386,7 @@ fn build_row(
     now: SystemTime,
     headline_width: usize,
     layout: LayoutMode,
+    is_selected: bool,
 ) -> Row<'static> {
     let (state_str, color) = state_glyph(s.state);
     let age = idle_age(s, now)
@@ -462,26 +470,42 @@ fn build_row(
         Style::default()
     };
 
+    // Selected rows neutralize per-cell fg so the table-level REVERSED
+    // applies as one uniform band instead of flipping each cell's color
+    // (green state → green band, DarkGray cwd → gray band, etc.). Muted
+    // rows still keep their DarkGray dimming even when selected so the
+    // "I've seen this, skip it" visual contract holds across selection.
+    let state_cell_style = if is_selected && !s.muted {
+        Style::default()
+    } else {
+        Style::default().fg(state_color)
+    };
     let session_style = if s.muted {
         Style::default().fg(Color::DarkGray)
+    } else if is_selected {
+        Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
     };
-    let cwd_style = Style::default().fg(Color::DarkGray);
+    let cwd_style = if is_selected && !s.muted {
+        Style::default()
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
 
     let cells: Vec<Cell> = match layout {
         LayoutMode::Narrow => vec![
-            Cell::from(state_label).style(Style::default().fg(state_color)),
+            Cell::from(state_label).style(state_cell_style),
             Cell::from(Text::from(headline_lines)),
         ],
         LayoutMode::Medium => vec![
-            Cell::from(state_label).style(Style::default().fg(state_color)),
+            Cell::from(state_label).style(state_cell_style),
             Cell::from(age).style(cwd_style),
             Cell::from(session_label).style(session_style),
             Cell::from(Text::from(headline_lines)),
         ],
         LayoutMode::Wide => vec![
-            Cell::from(state_label).style(Style::default().fg(state_color)),
+            Cell::from(state_label).style(state_cell_style),
             Cell::from(age).style(cwd_style),
             Cell::from(session_label).style(session_style),
             Cell::from(cwd_short).style(cwd_style),

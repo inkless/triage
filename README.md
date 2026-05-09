@@ -29,17 +29,20 @@ Requires Xcode CLI tools (`xcode-select --install`) for `swiftc`. The `.app` is 
 ## tmux bindings (recommended split)
 
 ```
-# Desktop: long-lived triage pane. Instant switch, fires notifications.
+# Desktop: switch to the long-lived triage pane (preserves multi-pane layout).
 bind-key -n M-t run-shell "triage --jump-to-self"
 
-# Mobile / SSH on phone: overlay triage as a popup. Enter jumps and closes the
-# overlay in one keypress; the target pane is auto-zoomed so it fills the screen.
-bind-key -n M-p display-popup -E -w 90% -h 90% 'triage --exit-on-jump'
+# Mobile / SSH on phone: switch to the long-lived triage pane AND zoom it.
+bind-key -n M-/ run-shell "triage --jump-to-self --zoom"
 ```
 
-The desktop binding keeps a real pane running triage continuously — that's what fires desktop notifications on Blocked / Error transitions and means `M-t` is just a focus switch (no cold start). The mobile binding spawns a fresh popup process; `--exit-on-jump` makes triage quit after a successful `Enter` so the popup closes, and zooms the destination pane so you don't land on a 30-column slice of a multi-pane layout. Hit `Ctrl-b z` to un-zoom.
+**Desktop (`M-t`)**: jumps to the triage pane in your existing layout. Inside triage, `Enter` does a normal `switch-client + select-pane` to the target — no zoom, your multi-pane layout stays intact.
 
-Requires tmux 3.2+ (`tmux -V`).
+**Mobile (`M-/`)**: jumps to the triage pane *and* `tmux resize-pane -Z`s it so triage fills the phone screen. Inside triage, `Enter` jumps to the target pane *and* zooms that. Net effect: every M-/ leaves you on a full-screen pane; the gesture toggles between "triage zoomed" and "current session zoomed." Ctrl-b z to un-zoom and see the multi-pane layout.
+
+The mobile-zoom-on-Enter behavior comes from running triage with `--zoom-on-jump`. The M-/ binding's spawn fallback (when no triage pane exists) launches `triage --zoom-on-jump` so a fresh-spawned instance has it set. If you have a long-lived triage pane that was launched without the flag, kill it and re-trigger M-/ to spawn one with the flag.
+
+`--exit-on-jump` is also still available (implies `--zoom-on-jump`), wired for the alternative tmux-popup launch pattern if you want triage to exit after each Enter.
 
 ## Optional: PreToolUse hook
 

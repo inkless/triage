@@ -68,11 +68,19 @@ fn main() -> io::Result<()> {
     // Tmux-binding entrypoint: focus an existing triage pane or spawn one.
     // Skips all discovery / transcript / watcher init so the focus switch
     // is essentially just tmux subprocess overhead (<30ms cold).
+    // `--zoom` additionally `resize-pane -Z`s the triage pane so it fills
+    // the screen — designed for the mobile binding (M-/) where pane
+    // multitasking on a phone is unworkable.
     if args.iter().any(|a| a == "--jump-to-self") {
-        return tmux::jump_to_self();
+        let zoom = args.iter().any(|a| a == "--zoom");
+        return tmux::jump_to_self(zoom);
     }
 
     let exit_on_jump = args.iter().any(|a| a == "--exit-on-jump");
+    // Orthogonal to exit_on_jump so the long-lived triage pane on mobile
+    // can zoom on Enter without exiting. `--exit-on-jump` implies it (popup
+    // is small, you always want the target zoomed).
+    let zoom_on_jump = exit_on_jump || args.iter().any(|a| a == "--zoom-on-jump");
 
     // Aliveness guard sticks around for the whole interactive session. The
     // hook checks for ~/.claude/triage/.alive; without this it bails out and
@@ -80,7 +88,7 @@ fn main() -> io::Result<()> {
     let _alive = approval::AliveGuard::install();
 
     let mut terminal = setup_terminal()?;
-    let result = run(&mut terminal, exit_on_jump);
+    let result = run(&mut terminal, exit_on_jump, zoom_on_jump);
     restore_terminal()?;
     result
 }
@@ -144,9 +152,14 @@ fn probe() -> io::Result<()> {
     Ok(())
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, exit_on_jump: bool) -> io::Result<()> {
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    exit_on_jump: bool,
+    zoom_on_jump: bool,
+) -> io::Result<()> {
     let mut app = AppState::new();
     app.exit_on_jump = exit_on_jump;
+    app.zoom_on_jump = zoom_on_jump;
     let watcher = FsWatcher::spawn().ok();
 
     refresh(&mut app);
@@ -294,7 +307,7 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             if let Some(s) = app.selected_session() {
                 if let Some(pane) = &s.pane {
                     let target = pane.target.clone();
-                    match tmux::jump_to(&target, app.exit_on_jump) {
+                    match tmux::jump_to(&target, app.zoom_on_jump) {
                         Ok(()) => {
                             app.status_msg = Some(format!("jumped → {target}"));
                             // Popup-launch mode: exit so the overlay closes

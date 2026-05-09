@@ -94,10 +94,15 @@ pub fn find_owning_pane(
 /// or spawn one in a new window of the current tmux session if none exist.
 /// Designed to be wired to a tmux key binding (e.g. `M-t`); deliberately
 /// skips discovery / transcript-parsing / watcher init so the focus switch
-/// stays under ~30ms cold. Returns Ok even when no triage pane existed —
-/// the new-window call covers that case and from the user's POV the result
-/// is identical: their tmux client is now attached to a triage instance.
-pub fn jump_to_self() -> std::io::Result<()> {
+/// stays under ~30ms cold.
+///
+/// `zoom` is the mobile flow: after focusing the triage pane, `resize-pane
+/// -Z` it so triage fills the screen. The `window_zoomed_flag` pre-check
+/// avoids un-zooming an already-zoomed pane (since `-Z` toggles). When a
+/// triage pane doesn't exist and we have to spawn one, the spawned process
+/// is launched with `--zoom-on-jump` so its in-process Enter behavior
+/// matches the binding's intent (target pane gets zoomed too).
+pub fn jump_to_self(zoom: bool) -> std::io::Result<()> {
     let panes = list_panes();
     let target = panes.values().find(|p| p.current_command == "triage");
     if let Some(pane) = target {
@@ -107,10 +112,27 @@ pub fn jump_to_self() -> std::io::Result<()> {
         Command::new("tmux")
             .args(["select-pane", "-t", &pane.target])
             .status()?;
+        if zoom {
+            let already_zoomed = Command::new("tmux")
+                .args(["display-message", "-p", "-t", &pane.target, "#{window_zoomed_flag}"])
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+                .unwrap_or(false);
+            if !already_zoomed {
+                Command::new("tmux")
+                    .args(["resize-pane", "-Z", "-t", &pane.target])
+                    .status()?;
+            }
+        }
         return Ok(());
     }
+    // Spawn fallback: propagate --zoom-on-jump so the new triage's Enter
+    // behavior matches the binding's intent (target pane gets zoomed too).
+    // The new window's pane is full-window already, no resize needed.
+    let cmd = if zoom { "triage --zoom-on-jump" } else { "triage" };
     Command::new("tmux")
-        .args(["new-window", "-n", "triage", "triage"])
+        .args(["new-window", "-n", "triage", cmd])
         .status()?;
     Ok(())
 }
