@@ -77,9 +77,9 @@ fn main() -> io::Result<()> {
     }
 
     let exit_on_jump = args.iter().any(|a| a == "--exit-on-jump");
-    // Orthogonal to exit_on_jump so the long-lived triage pane on mobile
-    // can zoom on Enter without exiting. `--exit-on-jump` implies it (popup
-    // is small, you always want the target zoomed).
+    // Per-launch only — not persisted. Mobile users either launch their
+    // long-lived triage with this flag (and accept that desktop also
+    // zooms on Enter), or rely on the auto-detect path inside Enter.
     let zoom_on_jump = exit_on_jump || args.iter().any(|a| a == "--zoom-on-jump");
 
     // Aliveness guard sticks around for the whole interactive session. The
@@ -307,7 +307,7 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             if let Some(s) = app.selected_session() {
                 if let Some(pane) = &s.pane {
                     let target = pane.target.clone();
-                    match tmux::jump_to(&target, app.zoom_on_jump) {
+                    match tmux::jump_to(&target, app.should_zoom_on_jump()) {
                         Ok(()) => {
                             app.status_msg = Some(format!("jumped → {target}"));
                             // Popup-launch mode: exit so the overlay closes

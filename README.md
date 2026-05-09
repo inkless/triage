@@ -38,11 +38,9 @@ bind-key -n M-p run-shell "triage --jump-to-self --zoom"
 
 **Desktop (`M-t`)**: jumps to the triage pane in your existing layout. Inside triage, `Enter` does a normal `switch-client + select-pane` to the target — no zoom, your multi-pane layout stays intact.
 
-**Mobile (`M-p`)**: jumps to the triage pane *and* `tmux resize-pane -Z`s it so triage fills the phone screen. Inside triage, `Enter` jumps to the target pane *and* zooms that. Net effect: every M-p leaves you on a full-screen pane; the gesture toggles between "triage zoomed" and "current session zoomed." Ctrl-b z to un-zoom and see the multi-pane layout. (Letters pass Alt cleanly across mobile terminals; symbols like `/` often don't on iOS, hence M-p over M-/.)
+**Mobile (`M-p`)**: jumps to the triage pane *and* `tmux resize-pane -Z`s it so triage fills the phone screen. Inside triage, `Enter` jumps to the target pane *and* zooms it (auto-detected — see below). Net effect: every M-p leaves you on a full-screen pane; the gesture toggles between "triage zoomed" and "current session zoomed." Ctrl-b z to un-zoom and see the multi-pane layout. (Letters pass Alt cleanly across mobile terminals; symbols like `/` often don't on iOS, hence M-p over M-/.)
 
-The mobile-zoom-on-Enter behavior comes from running triage with `--zoom-on-jump`. The M-/ binding's spawn fallback (when no triage pane exists) launches `triage --zoom-on-jump` so a fresh-spawned instance has it set. If you have a long-lived triage pane that was launched without the flag, kill it and re-trigger M-/ to spawn one with the flag.
-
-`--exit-on-jump` is also still available (implies `--zoom-on-jump`), wired for the alternative tmux-popup launch pattern if you want triage to exit after each Enter.
+**Zoom-on-Enter is auto-detected** by triage's current pane width. Tmux resizes panes to the smallest attached client, so when you're on a phone the pane is narrow (<100 cols) → Enter zooms; when on desktop it's wide → Enter doesn't zoom. No flag needed, no per-device launch dance. If you want to force zoom on a wider pane, pass `--zoom-on-jump`. `--exit-on-jump` (popup pattern, exits triage after Enter) implies zoom too.
 
 ## Optional: PreToolUse hook
 

@@ -78,12 +78,18 @@ pub struct AppState {
     /// press `q` afterwards. Implies `zoom_on_jump` (popup is small, you
     /// always want the target zoomed).
     pub exit_on_jump: bool,
-    /// When true, triage runs `tmux resize-pane -Z` on the target after a
-    /// successful `Enter` jump. Set by `--zoom-on-jump` (orthogonal to
-    /// `exit_on_jump` so a long-lived triage pane on mobile can zoom-on-jump
-    /// without exiting). Designed for "everything is one zoomed pane at a
-    /// time, swap with the binding" mobile workflow — see README.
+    /// Force zoom-on-jump regardless of pane width. Set by `--zoom-on-jump`.
+    /// Most users don't need this — Enter auto-zooms when `last_pane_width <
+    /// MOBILE_WIDTH_THRESHOLD`, so mobile clients (which resize tmux panes
+    /// to phone-narrow) get the right behavior automatically. The flag is
+    /// for "I want zoom even on a wide pane" overrides.
     pub zoom_on_jump: bool,
+    /// Most recent table-area width from ratatui's draw cycle. Auto-detect
+    /// signal for "the user is currently on a narrow client (mobile)" —
+    /// tmux panes resize to the smallest attached client, so the rendering
+    /// width reflects the device that's actively viewing this pane. Read
+    /// at Enter time to decide whether to zoom.
+    pub last_pane_width: u16,
 }
 
 impl AppState {
@@ -116,6 +122,7 @@ impl AppState {
             audit_log_cache: None,
             exit_on_jump: false,
             zoom_on_jump: false,
+            last_pane_width: 0,
         }
     }
 
@@ -168,6 +175,17 @@ impl AppState {
 
     pub fn persist_state(&self) {
         persist::save_state(self.muted.iter(), self.approval_mode, self.autonomous);
+    }
+
+    /// Decide whether `Enter` should zoom the destination pane. Three sources:
+    /// `--exit-on-jump` (popup mode, always wants zoom), `--zoom-on-jump`
+    /// (explicit force-on), and auto-detect by current pane width. Auto-
+    /// detect is the path most users hit — running triage with no flag still
+    /// "does the right thing" on a phone-narrow client.
+    pub fn should_zoom_on_jump(&self) -> bool {
+        self.exit_on_jump
+            || self.zoom_on_jump
+            || (self.last_pane_width > 0 && self.last_pane_width < MOBILE_WIDTH_THRESHOLD)
     }
 
     pub fn visible(&self) -> Vec<&Session> {
@@ -308,7 +326,14 @@ impl LayoutMode {
     }
 }
 
+/// Pane widths below this trigger auto-zoom-on-jump. Phone-attached tmux
+/// clients are typically 30–80 cols; desktop is 100+. 100 is the safe split.
+pub const MOBILE_WIDTH_THRESHOLD: u16 = 100;
+
 fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
+    // Stash for the Enter handler's auto-zoom decision (see `should_zoom_on_jump`).
+    // Set before borrowing `visible` from app to avoid an aliasing conflict.
+    app.last_pane_width = area.width;
     let visible = app.visible();
     let selected_idx = app.selected.selected();
     let layout = LayoutMode::from_width(area.width);
