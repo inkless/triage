@@ -46,13 +46,22 @@ pub fn alert(session: &Session) {
 }
 
 fn send_via_triage_notify(
-    notifier: &str,
+    bundle_path: &str,
     title: &str,
     label: &str,
     preview: &str,
     pane: Option<&crate::models::Pane>,
 ) {
-    let mut cmd = Command::new(notifier);
+    // Launch via LaunchServices (`open -na <bundle> --args …`) instead of
+    // exec'ing the binary directly. Without this, macOS 14+ never registers
+    // the bundle with the notification system and `requestAuthorization`
+    // fails silently with "Notifications are not allowed for this
+    // application." `-n` forces a new instance per notification (so two
+    // simultaneous Blocked transitions don't collide); `-a` passes the
+    // .app path; `--args` forwards everything after to the helper.
+    let mut cmd = Command::new("open");
+    cmd.args(["-na", bundle_path]);
+    cmd.arg("--args");
     cmd.args(["--title", "triage"]);
     cmd.args(["--subtitle", &format!("{label} — {title}")]);
     cmd.args(["--message", preview]);
@@ -227,10 +236,11 @@ fn command_of(pid: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// Locate the `triage-notify` helper binary inside its `.app` bundle.
-/// Searches a few candidate paths relative to the running triage binary:
-/// the workspace `scripts/` dir (cargo build context), a sibling `scripts/`
-/// (cargo install with --root .), and a sibling `.app` (manual install).
+/// Locate the `triage-notify.app` bundle. Returns the `.app` directory
+/// (not the binary inside) — we hand this to `open -na` for proper
+/// LaunchServices registration. Searches relative to the running triage
+/// binary: workspace `scripts/` (cargo build context), sibling `scripts/`
+/// (`cargo install --root .`), or a sibling `.app` (manual install).
 fn triage_notify_path() -> Option<&'static str> {
     static CACHED: OnceLock<Option<String>> = OnceLock::new();
     CACHED
@@ -239,17 +249,15 @@ fn triage_notify_path() -> Option<&'static str> {
             let exe_dir = exe.parent()?;
             let candidates = [
                 // Workspace layout: target/release/triage → ../../scripts/...
-                exe_dir
-                    .join("../../scripts/triage-notify/triage-notify.app/Contents/MacOS/triage-notify"),
+                exe_dir.join("../../scripts/triage-notify/triage-notify.app"),
                 // Sibling layout: <prefix>/bin/triage → <prefix>/scripts/...
-                exe_dir
-                    .join("../scripts/triage-notify/triage-notify.app/Contents/MacOS/triage-notify"),
-                // Same-dir layout: triage-notify.app next to triage binary
-                exe_dir.join("triage-notify.app/Contents/MacOS/triage-notify"),
+                exe_dir.join("../scripts/triage-notify/triage-notify.app"),
+                // Same-dir layout
+                exe_dir.join("triage-notify.app"),
             ];
             for c in &candidates {
                 if let Ok(p) = c.canonicalize()
-                    && p.exists()
+                    && p.is_dir()
                 {
                     return Some(p.display().to_string());
                 }
