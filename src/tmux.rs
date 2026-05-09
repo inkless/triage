@@ -90,11 +90,47 @@ pub fn find_owning_pane(
     None
 }
 
+/// Locate the tmux pane that contains the running triage process by reading
+/// its pid from `~/.claude/triage/.alive` and walking the process tree up
+/// to find an ancestor that's a pane_pid. Returns None if `.alive` is
+/// missing, the pid is dead, or the process tree doesn't lead to any
+/// known pane (shouldn't happen in normal use but is defensible). Falls
+/// back to the legacy command-name match as a defense-in-depth — handles
+/// "I just spawned triage, .alive isn't written yet" race in either
+/// direction (jump finds it via name now, or via .alive on next press).
+fn find_alive_triage_pane(panes: &HashMap<u32, Pane>) -> Option<Pane> {
+    if let Some(pid) = read_alive_pid()
+        && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
+    {
+        let ppid_map = build_ppid_map();
+        if let Some(p) = find_owning_pane(pid, panes, &ppid_map, 8) {
+            return Some(p);
+        }
+    }
+    panes.values().find(|p| p.current_command == "triage").cloned()
+}
+
+fn read_alive_pid() -> Option<u32> {
+    let home = std::env::var_os("HOME")?;
+    let path = std::path::PathBuf::from(home).join(".claude/triage/.alive");
+    let content = std::fs::read_to_string(path).ok()?;
+    content.trim().parse().ok()
+}
+
 /// Find an existing pane whose foreground command is `triage` and focus it,
 /// or spawn one in a new window of the current tmux session if none exist.
 /// Designed to be wired to a tmux key binding (e.g. `M-t`); deliberately
 /// skips discovery / transcript-parsing / watcher init so the focus switch
 /// stays under ~30ms cold.
+///
+/// Detection is **PID-based, not command-name-based**: triage writes its pid
+/// to `~/.claude/triage/.alive` on startup (`AliveGuard`), and we walk the
+/// process tree to find the pane that contains that pid. The earlier
+/// `pane_current_command == "triage"` exact match was brittle — the user
+/// hit a regression where every M-t press spawned a new window because the
+/// running triage's pane_current_command didn't match (likely because the
+/// pane's wrapper shell hadn't yet ceded foreground, or tmux reported a
+/// path-prefixed name). PID matching is robust against all of those.
 ///
 /// `zoom` is the mobile flow: after focusing the triage pane, `resize-pane
 /// -Z` it so triage fills the screen. The `window_zoomed_flag` pre-check
@@ -104,7 +140,7 @@ pub fn find_owning_pane(
 /// matches the binding's intent (target pane gets zoomed too).
 pub fn jump_to_self(zoom: bool) -> std::io::Result<()> {
     let panes = list_panes();
-    let target = panes.values().find(|p| p.current_command == "triage");
+    let target = find_alive_triage_pane(&panes);
     if let Some(pane) = target {
         Command::new("tmux")
             .args(["switch-client", "-t", &pane.tmux_session])
