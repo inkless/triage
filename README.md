@@ -33,12 +33,12 @@ Requires Xcode CLI tools (`xcode-select --install`) for `swiftc`. The `.app` is 
 bind-key -n M-t run-shell "triage --jump-to-self"
 
 # Mobile / SSH on phone: switch to the long-lived triage pane AND zoom it.
-bind-key -n M-/ run-shell "triage --jump-to-self --zoom"
+bind-key -n M-p run-shell "triage --jump-to-self --zoom"
 ```
 
 **Desktop (`M-t`)**: jumps to the triage pane in your existing layout. Inside triage, `Enter` does a normal `switch-client + select-pane` to the target — no zoom, your multi-pane layout stays intact.
 
-**Mobile (`M-/`)**: jumps to the triage pane *and* `tmux resize-pane -Z`s it so triage fills the phone screen. Inside triage, `Enter` jumps to the target pane *and* zooms that. Net effect: every M-/ leaves you on a full-screen pane; the gesture toggles between "triage zoomed" and "current session zoomed." Ctrl-b z to un-zoom and see the multi-pane layout.
+**Mobile (`M-p`)**: jumps to the triage pane *and* `tmux resize-pane -Z`s it so triage fills the phone screen. Inside triage, `Enter` jumps to the target pane *and* zooms that. Net effect: every M-p leaves you on a full-screen pane; the gesture toggles between "triage zoomed" and "current session zoomed." Ctrl-b z to un-zoom and see the multi-pane layout. (Letters pass Alt cleanly across mobile terminals; symbols like `/` often don't on iOS, hence M-p over M-/.)
 
 The mobile-zoom-on-Enter behavior comes from running triage with `--zoom-on-jump`. The M-/ binding's spawn fallback (when no triage pane exists) launches `triage --zoom-on-jump` so a fresh-spawned instance has it set. If you have a long-lived triage pane that was launched without the flag, kill it and re-trigger M-/ to spawn one with the flag.
 
