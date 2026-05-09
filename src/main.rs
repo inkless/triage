@@ -65,6 +65,12 @@ fn main() -> io::Result<()> {
         auditor::print_prompt();
         return Ok(());
     }
+    // Tmux-binding entrypoint: focus an existing triage pane or spawn one.
+    // Skips all discovery / transcript / watcher init so the focus switch
+    // is essentially just tmux subprocess overhead (<30ms cold).
+    if args.iter().any(|a| a == "--jump-to-self") {
+        return tmux::jump_to_self();
+    }
 
     let exit_on_jump = args.iter().any(|a| a == "--exit-on-jump");
 

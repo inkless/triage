@@ -30,7 +30,7 @@ Requires Xcode CLI tools (`xcode-select --install`) for `swiftc`. The `.app` is 
 
 ```
 # Desktop: long-lived triage pane. Instant switch, fires notifications.
-bind-key -n M-t run-shell "~/workspace/triage/scripts/triage-jump.sh"
+bind-key -n M-t run-shell "triage --jump-to-self"
 
 # Mobile / SSH on phone: overlay triage as a popup. Enter jumps and closes the
 # overlay in one keypress; the target pane is auto-zoomed so it fills the screen.
@@ -119,13 +119,15 @@ Per-call budget is `--max-budget-usd 1.00`. Typical Sonnet round-trip: 10–25s 
 
 ## Hook setup (optional)
 
-`a`/`d` in `hook` mode and auto mode both deliver decisions through a PreToolUse hook. To install:
+`a`/`d` in `hook` mode and auto mode both deliver decisions through a PreToolUse hook. The hook is a small bash script embedded in the binary; `--install-hooks` writes it to `~/.config/triage/hooks/triage-preuse.sh` and merges the path into `~/.claude/settings.json`. No source-repo dependency — `cargo install triage` users can delete their checkout and the hook keeps working.
 
 ```bash
-triage --install-hooks-hint
+triage --install-hooks         # idempotent install (also re-installs an updated hook on triage upgrade)
+triage --install-hooks --dry-run   # preview both the file write and the JSON merge
+triage --uninstall-hooks       # remove from settings.json + delete the script file
 ```
 
-This prints a JSON snippet to merge into `~/.claude/settings.json`. The hook (`scripts/hooks/triage-preuse.sh`) is zero-cost when triage isn't running. With auto mode on, the hook waits up to 60s (vs the default 3s) for the auditor's verdict via a claim-file handshake.
+The hook is zero-cost when triage isn't running (single file-existence check + `kill -0`, ~3ms). With auto mode on, it waits up to 60s (vs the default 3s) for the auditor's verdict via a claim-file handshake. Re-running `--install-hooks` after a triage upgrade refreshes the on-disk script if its content changed.
 
 Without the hook installed, `h` falls back to `tmux` mode which sends keystrokes to the pane — works regardless of managed-policy settings.
 

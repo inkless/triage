@@ -90,6 +90,31 @@ pub fn find_owning_pane(
     None
 }
 
+/// Find an existing pane whose foreground command is `triage` and focus it,
+/// or spawn one in a new window of the current tmux session if none exist.
+/// Designed to be wired to a tmux key binding (e.g. `M-t`); deliberately
+/// skips discovery / transcript-parsing / watcher init so the focus switch
+/// stays under ~30ms cold. Returns Ok even when no triage pane existed —
+/// the new-window call covers that case and from the user's POV the result
+/// is identical: their tmux client is now attached to a triage instance.
+pub fn jump_to_self() -> std::io::Result<()> {
+    let panes = list_panes();
+    let target = panes.values().find(|p| p.current_command == "triage");
+    if let Some(pane) = target {
+        Command::new("tmux")
+            .args(["switch-client", "-t", &pane.tmux_session])
+            .status()?;
+        Command::new("tmux")
+            .args(["select-pane", "-t", &pane.target])
+            .status()?;
+        return Ok(());
+    }
+    Command::new("tmux")
+        .args(["new-window", "-n", "triage", "triage"])
+        .status()?;
+    Ok(())
+}
+
 /// Switch tmux focus to the given pane target (`session:window.pane`). When
 /// `zoom` is true, also `resize-pane -Z` so the target fills the screen —
 /// designed for the popup-launch flow on mobile, where the user is jumping

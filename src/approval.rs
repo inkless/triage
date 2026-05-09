@@ -346,18 +346,74 @@ fn settings_json_path() -> Option<PathBuf> {
     std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude/settings.json"))
 }
 
-/// Resolved absolute path to `triage-preuse.sh`. Walks up two levels from the
-/// running binary to find the repo's `scripts/hooks/` dir; falls back to the
-/// relative source path string when the binary lives outside the repo (e.g.
-/// `cargo install`-ed to ~/.cargo/bin) — in that case the user must point
-/// the hook at a checkout of the repo.
-fn hook_script_path() -> Option<PathBuf> {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .map(|d| d.join("../../scripts/hooks/triage-preuse.sh"))
-        .and_then(|p| p.canonicalize().ok())
+/// Bash hook content, embedded at compile time. `--install-hooks` writes this
+/// to `hook_install_path()` so the hook is decoupled from the source-repo
+/// location — `cargo install triage` users no longer need a checkout.
+const HOOK_SCRIPT: &str = include_str!("../scripts/hooks/triage-preuse.sh");
+
+/// Canonical install location for the bash hook. Stable across triage
+/// upgrades; settings.json points here, not at the source repo.
+fn hook_install_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(|h| PathBuf::from(h).join(".config/triage/hooks/triage-preuse.sh"))
 }
+
+/// True when `cmd` looks like a triage PreToolUse hook entry — basename
+/// match. Lets us detect (and migrate) entries that point at older locations
+/// like `~/workspace/triage/scripts/hooks/triage-preuse.sh` before we
+/// started installing into `~/.config/triage/hooks/`.
+fn is_triage_hook_command(cmd: &str) -> bool {
+    Path::new(cmd)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n == "triage-preuse.sh")
+        .unwrap_or(false)
+}
+
+/// Write the embedded bash hook to `hook_install_path()` with mode 0755.
+/// Idempotent — returns Ok(false) when on-disk content already matches and
+/// the file has the executable bit set; returns Ok(true) when something
+/// was written. Honors `dry_run` (prints intent, doesn't modify).
+fn write_hook_script(path: &Path, dry_run: bool) -> io::Result<bool> {
+    let need_write = match fs::read_to_string(path) {
+        Ok(existing) => existing != HOOK_SCRIPT,
+        Err(_) => true,
+    };
+    if !need_write && is_executable(path) {
+        return Ok(false);
+    }
+    if dry_run {
+        println!("DRY RUN — would write {} ({} bytes)", path.display(), HOOK_SCRIPT.len());
+        return Ok(true);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, HOOK_SCRIPT)?;
+    set_executable(path)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .map(|m| m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(unix)]
+fn set_executable(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mut perms = fs::metadata(path)?.permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(path, perms)
+}
+
+#[cfg(not(unix))]
+fn is_executable(_path: &Path) -> bool { true }
+#[cfg(not(unix))]
+fn set_executable(_path: &Path) -> io::Result<()> { Ok(()) }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallOutcome {
@@ -371,10 +427,11 @@ pub enum InstallOutcome {
 /// Kept for backward compatibility — `--install-hooks` is the preferred path
 /// because it merges idempotently into an existing settings file.
 pub fn print_install_hint() {
-    let path = hook_script_path()
+    let path = hook_install_path()
         .map(|p| p.display().to_string())
-        .unwrap_or_else(|| "<repo>/scripts/hooks/triage-preuse.sh".to_string());
-    println!("Add the following to ~/.claude/settings.json (merge with any existing hooks):");
+        .unwrap_or_else(|| "~/.config/triage/hooks/triage-preuse.sh".to_string());
+    println!("Run `triage --install-hooks` to install. Or, to merge by hand,");
+    println!("first write the bash hook to {} and then add the following to ~/.claude/settings.json:", path);
     println!();
     println!("{{");
     println!("  \"hooks\": {{");
@@ -398,23 +455,28 @@ pub fn print_install_hint() {
 /// other PreToolUse entries (Navi, etc.) untouched. Always writes a `.bak`
 /// next to the original before overwriting.
 pub fn install_hooks(dry_run: bool) -> io::Result<InstallOutcome> {
-    let script = hook_script_path().ok_or_else(|| {
-        io::Error::other(
-            "could not resolve triage-preuse.sh — run from inside the triage source tree, or use --install-hooks-hint",
-        )
-    })?;
+    let script = hook_install_path()
+        .ok_or_else(|| io::Error::other("HOME is unset; cannot locate install path"))?;
     let script_str = script.display().to_string();
     let path = settings_json_path()
         .ok_or_else(|| io::Error::other("HOME is unset; cannot locate settings.json"))?;
     let original = read_settings_json(&path)?;
     let (modified, outcome) = apply_install(&original, &script_str);
 
+    // Always sync the on-disk script to the embedded copy. Done even on
+    // AlreadyInstalled so a triage upgrade with hook-script changes refreshes
+    // the bash file even when settings.json itself didn't need changes.
+    let script_changed = write_hook_script(&script, dry_run)?;
+
     match outcome {
-        InstallOutcome::AlreadyInstalled => {
+        InstallOutcome::AlreadyInstalled if !script_changed => {
             println!(
                 "triage hook already installed at {} (no changes)",
                 script_str
             );
+        }
+        InstallOutcome::AlreadyInstalled => {
+            println!("Refreshed hook script at {} (settings.json unchanged)", script_str);
         }
         InstallOutcome::Installed if dry_run => {
             println!("DRY RUN — would update {}:", path.display());
@@ -436,28 +498,43 @@ pub fn install_hooks(dry_run: bool) -> io::Result<InstallOutcome> {
 /// script. Empty matcher groups are pruned, and empty `PreToolUse` /  `hooks`
 /// keys are removed. Other tools' hook entries are untouched.
 pub fn uninstall_hooks(dry_run: bool) -> io::Result<InstallOutcome> {
-    let script = hook_script_path().ok_or_else(|| {
-        io::Error::other("could not resolve triage-preuse.sh — nothing to remove")
-    })?;
-    let script_str = script.display().to_string();
+    let script = hook_install_path()
+        .ok_or_else(|| io::Error::other("HOME is unset; cannot locate install path"))?;
     let path = settings_json_path()
         .ok_or_else(|| io::Error::other("HOME is unset; cannot locate settings.json"))?;
     let original = read_settings_json(&path)?;
-    let (modified, outcome) = apply_uninstall(&original, &script_str);
+    let (modified, outcome) = apply_uninstall(&original);
+
+    let script_present = script.exists();
 
     match outcome {
-        InstallOutcome::NotFound => {
+        InstallOutcome::NotFound if !script_present => {
             println!("triage hook not present in {} (no changes)", path.display());
+        }
+        InstallOutcome::NotFound if dry_run => {
+            println!("DRY RUN — would remove hook script {}", script.display());
+        }
+        InstallOutcome::NotFound => {
+            fs::remove_file(&script)?;
+            println!("Removed orphan hook script {}", script.display());
         }
         InstallOutcome::Removed if dry_run => {
             println!("DRY RUN — would update {}:", path.display());
             println!();
             println!("{}", serde_json::to_string_pretty(&modified)?);
+            if script_present {
+                println!();
+                println!("DRY RUN — would remove hook script {}", script.display());
+            }
         }
         InstallOutcome::Removed => {
             write_settings_json(&path, &modified)?;
             println!("Removed triage hook from {}", path.display());
             println!("  backup: {}.bak", path.display());
+            if script_present {
+                fs::remove_file(&script)?;
+                println!("Removed hook script {}", script.display());
+            }
         }
         _ => {}
     }
@@ -491,43 +568,56 @@ fn write_settings_json(path: &Path, v: &Value) -> io::Result<()> {
     Ok(())
 }
 
-fn apply_install(input: &Value, script_path: &str) -> (Value, InstallOutcome) {
-    if hook_present(input, script_path) {
+fn apply_install(input: &Value, canonical_path: &str) -> (Value, InstallOutcome) {
+    // Triage hooks identified by basename so a re-install migrates old
+    // `~/workspace/triage/scripts/...` entries to the new canonical path.
+    let stale_present = stale_triage_entries(input, canonical_path);
+    let canonical_present = canonical_hook_present(input, canonical_path);
+
+    if canonical_present && !stale_present {
         return (input.clone(), InstallOutcome::AlreadyInstalled);
     }
-    let mut root = input.clone();
-    // Replace a non-object root with the fresh shape rather than corrupt it.
-    if !root.is_object() {
-        return (make_fresh_settings(script_path), InstallOutcome::Installed);
+
+    let mut root = if input.is_object() {
+        input.clone()
+    } else {
+        return (make_fresh_settings(canonical_path), InstallOutcome::Installed);
+    };
+
+    // Migrate: drop any triage-named entries (any path) before adding the
+    // canonical one. Reuses `apply_uninstall` since the basename matcher is
+    // what we want here too.
+    if stale_present || canonical_present {
+        let (purged, _) = apply_uninstall(&root);
+        root = purged;
     }
+
     let root_obj = root.as_object_mut().unwrap();
     let hooks = root_obj
         .entry("hooks".to_string())
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
     if !hooks.is_object() {
-        // Existing non-object `hooks` value is malformed; replace whole settings
-        // with our fresh shape rather than guess at intent.
-        return (make_fresh_settings(script_path), InstallOutcome::Installed);
+        return (make_fresh_settings(canonical_path), InstallOutcome::Installed);
     }
     let hooks_obj = hooks.as_object_mut().unwrap();
     let pre = hooks_obj
         .entry("PreToolUse".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
     if !pre.is_array() {
-        return (make_fresh_settings(script_path), InstallOutcome::Installed);
+        return (make_fresh_settings(canonical_path), InstallOutcome::Installed);
     }
     let pre_arr = pre.as_array_mut().unwrap();
     pre_arr.push(serde_json::json!({
         "matcher": ".*",
         "hooks": [
-            { "type": "command", "command": script_path }
+            { "type": "command", "command": canonical_path }
         ]
     }));
     (root, InstallOutcome::Installed)
 }
 
-fn apply_uninstall(input: &Value, script_path: &str) -> (Value, InstallOutcome) {
-    if !hook_present(input, script_path) {
+fn apply_uninstall(input: &Value) -> (Value, InstallOutcome) {
+    if !any_triage_hook_present(input) {
         return (input.clone(), InstallOutcome::NotFound);
     }
     let mut root = input.clone();
@@ -544,7 +634,7 @@ fn apply_uninstall(input: &Value, script_path: &str) -> (Value, InstallOutcome) 
                     group_hooks.retain(|h| {
                         h.get("command")
                             .and_then(|c| c.as_str())
-                            .map(|c| !paths_equivalent(c, script_path))
+                            .map(|c| !is_triage_hook_command(c))
                             .unwrap_or(true)
                     });
                     if group_hooks.len() != before {
@@ -552,7 +642,6 @@ fn apply_uninstall(input: &Value, script_path: &str) -> (Value, InstallOutcome) 
                     }
                 }
             }
-            // Drop matcher groups that now have no hooks left.
             pre.retain(|group| {
                 group
                     .get("hooks")
@@ -575,26 +664,28 @@ fn apply_uninstall(input: &Value, script_path: &str) -> (Value, InstallOutcome) 
     }
 }
 
-fn hook_present(v: &Value, script_path: &str) -> bool {
+fn any_triage_hook_present(v: &Value) -> bool {
+    triage_hook_commands(v).next().is_some()
+}
+
+fn canonical_hook_present(v: &Value, canonical: &str) -> bool {
+    triage_hook_commands(v).any(|c| paths_equivalent(c, canonical))
+}
+
+fn stale_triage_entries(v: &Value, canonical: &str) -> bool {
+    triage_hook_commands(v).any(|c| !paths_equivalent(c, canonical))
+}
+
+fn triage_hook_commands(v: &Value) -> impl Iterator<Item = &str> {
     v.get("hooks")
         .and_then(|h| h.get("PreToolUse"))
         .and_then(|p| p.as_array())
-        .map(|groups| {
-            groups.iter().any(|g| {
-                g.get("hooks")
-                    .and_then(|h| h.as_array())
-                    .map(|hs| {
-                        hs.iter().any(|h| {
-                            h.get("command")
-                                .and_then(|c| c.as_str())
-                                .map(|c| paths_equivalent(c, script_path))
-                                .unwrap_or(false)
-                        })
-                    })
-                    .unwrap_or(false)
-            })
-        })
-        .unwrap_or(false)
+        .into_iter()
+        .flat_map(|groups| groups.iter())
+        .filter_map(|g| g.get("hooks").and_then(|h| h.as_array()))
+        .flat_map(|hs| hs.iter())
+        .filter_map(|h| h.get("command").and_then(|c| c.as_str()))
+        .filter(|c| is_triage_hook_command(c))
 }
 
 /// Compare two path strings semantically: tilde-expand, then try to
