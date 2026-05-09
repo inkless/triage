@@ -344,9 +344,20 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
     let header = Row::new(header_cells)
         .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
 
+    // REVERSED rather than bg(DarkGray): the bg approach paints the row's
+    // entire allocated rect (height + bottom_margin), including empty cells
+    // beneath single-line columns when the row's height is taller (driven
+    // by the multi-line headline). The result on certain themes is a tall
+    // highlighted band that looks disconnected from the row content.
+    // REVERSED inverts each cell's fg/bg per-cell, so the highlight tracks
+    // the actual rendered glyphs and stops at empty space.
     let table = Table::new(rows, widths)
         .header(header)
-        .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .row_highlight_style(
+            Style::default()
+                .add_modifier(Modifier::REVERSED)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("▌ ")
         .block(Block::default().borders(Borders::TOP));
 
