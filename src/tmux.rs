@@ -90,8 +90,11 @@ pub fn find_owning_pane(
     None
 }
 
-/// Switch tmux focus to the given pane target (`session:window.pane`).
-pub fn jump_to(target: &str) -> std::io::Result<()> {
+/// Switch tmux focus to the given pane target (`session:window.pane`). When
+/// `zoom` is true, also `resize-pane -Z` so the target fills the screen —
+/// designed for the popup-launch flow on mobile, where the user is jumping
+/// onto a tiny phone screen and probably wants the destination pane maximized.
+pub fn jump_to(target: &str, zoom: bool) -> std::io::Result<()> {
     // `select-pane -t session:window.pane` handles session + window + pane,
     // but `switch-client` is required to actually focus the session if the
     // user is currently attached to a different one.
@@ -104,6 +107,21 @@ pub fn jump_to(target: &str) -> std::io::Result<()> {
     Command::new("tmux")
         .args(["select-pane", "-t", target])
         .status()?;
+    if zoom {
+        // `-Z` toggles, so check `window_zoomed_flag` first — without this,
+        // jumping to an already-zoomed pane would un-zoom it.
+        let already_zoomed = Command::new("tmux")
+            .args(["display-message", "-p", "-t", target, "#{window_zoomed_flag}"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+            .unwrap_or(false);
+        if !already_zoomed {
+            Command::new("tmux")
+                .args(["resize-pane", "-Z", "-t", target])
+                .status()?;
+        }
+    }
     Ok(())
 }
 

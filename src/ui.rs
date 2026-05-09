@@ -18,8 +18,6 @@ use crate::transcript::DigestCache;
 pub struct AppState {
     pub sessions: Vec<Session>,
     pub selected: TableState,
-    pub filter: String,
-    pub filter_active: bool,
     pub detail_open: bool,
     pub status_msg: Option<String>,
     pub digest_cache: DigestCache,
@@ -72,6 +70,13 @@ pub struct AppState {
     /// re-parsing the whole JSONL on every draw — most draws happen with
     /// no new audit, so the cache hit rate is high.
     pub audit_log_cache: Option<(SystemTime, u64, Vec<serde_json::Value>)>,
+    /// When true, triage exits cleanly after a successful `Enter` jump. Set
+    /// by `--exit-on-jump`. Designed for the tmux popup launch pattern: the
+    /// popup closes when triage exits, so a single keypress (`Enter`) both
+    /// jumps to the target pane AND dismisses the overlay. Without this,
+    /// the popup would stay open showing triage and the user would have to
+    /// press `q` afterwards.
+    pub exit_on_jump: bool,
 }
 
 impl AppState {
@@ -84,8 +89,6 @@ impl AppState {
         Self {
             sessions: Vec::new(),
             selected: state,
-            filter: String::new(),
-            filter_active: false,
             detail_open: false,
             status_msg: None,
             digest_cache: DigestCache::new(),
@@ -104,6 +107,7 @@ impl AppState {
             audit_log_total_lines: 0,
             pending_g: false,
             audit_log_cache: None,
+            exit_on_jump: false,
         }
     }
 
@@ -159,28 +163,48 @@ impl AppState {
     }
 
     pub fn visible(&self) -> Vec<&Session> {
-        if self.filter.is_empty() {
-            return self.sessions.iter().collect();
-        }
-        let q = self.filter.to_lowercase();
-        self.sessions
+        self.sessions.iter().collect()
+    }
+
+    /// `n`/`N` priority-hop target list: indices into `visible()` for sessions
+    /// whose state is in the top attention bucket (error / block / done). The
+    /// table is already sorted by priority so these will be a contiguous prefix
+    /// in practice, but we collect by predicate so a future re-sort can't break
+    /// the hop.
+    pub fn priority_indices(&self) -> Vec<usize> {
+        self.visible()
             .iter()
-            .filter(|s| {
-                s.cwd.to_string_lossy().to_lowercase().contains(&q)
-                    || s.name
-                        .as_deref()
-                        .map(|n| n.to_lowercase().contains(&q))
-                        .unwrap_or(false)
-                    || s.headline
-                        .as_deref()
-                        .map(|h| h.to_lowercase().contains(&q))
-                        .unwrap_or(false)
-                    || s.pane
-                        .as_ref()
-                        .map(|p| p.target.to_lowercase().contains(&q))
-                        .unwrap_or(false)
+            .enumerate()
+            .filter(|(_, s)| {
+                matches!(
+                    s.state,
+                    AttentionState::Error
+                        | AttentionState::Blocked
+                        | AttentionState::JustFinished
+                )
             })
+            .map(|(i, _)| i)
             .collect()
+    }
+
+    /// Move selection to the next/prev priority row, wrapping around. Returns
+    /// `false` when there are no priority rows so the caller can surface a
+    /// status-bar message instead of a silent no-op.
+    pub fn hop_priority(&mut self, forward: bool) -> bool {
+        let targets = self.priority_indices();
+        if targets.is_empty() {
+            return false;
+        }
+        let cur = self.selected.selected().unwrap_or(0);
+        let next = if forward {
+            // First target strictly greater than cur, else wrap to first.
+            targets.iter().copied().find(|&i| i > cur).unwrap_or(targets[0])
+        } else {
+            // Last target strictly less than cur, else wrap to last.
+            targets.iter().copied().rev().find(|&i| i < cur).unwrap_or(*targets.last().unwrap())
+        };
+        self.selected.select(Some(next));
+        true
     }
 
     pub fn selected_session(&self) -> Option<&Session> {
@@ -244,27 +268,13 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
-    let line = if app.filter_active {
-        Line::from(vec![
-            Span::styled("triage", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("   filter: "),
-            Span::styled(&app.filter, Style::default().fg(Color::Yellow)),
-            Span::styled("_", Style::default().fg(Color::Yellow).add_modifier(Modifier::SLOW_BLINK)),
-        ])
-    } else {
-        let count = app.visible().len();
-        let total = app.sessions.len();
-        let counts = if app.filter.is_empty() {
-            format!("{total} session{}", if total == 1 { "" } else { "s" })
-        } else {
-            format!("{count}/{total} sessions  (filter: {})", app.filter)
-        };
-        Line::from(vec![
-            Span::styled("triage", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw("   "),
-            Span::styled(counts, Style::default().fg(Color::DarkGray)),
-        ])
-    };
+    let total = app.sessions.len();
+    let counts = format!("{total} session{}", if total == 1 { "" } else { "s" });
+    let line = Line::from(vec![
+        Span::styled("triage", Style::default().add_modifier(Modifier::BOLD)),
+        Span::raw("   "),
+        Span::styled(counts, Style::default().fg(Color::DarkGray)),
+    ]);
     f.render_widget(Paragraph::new(line), area);
 }
 
@@ -1117,12 +1127,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         );
         return;
     }
-    let line = if app.filter_active {
-        Line::from(Span::styled(
-            "  [enter] apply  [esc] cancel",
-            Style::default().fg(Color::DarkGray),
-        ))
-    } else if let Some(msg) = &app.status_msg {
+    let line = if let Some(msg) = &app.status_msg {
         Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Yellow)))
     } else {
         let mode = app.approval_mode.label();
@@ -1133,12 +1138,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
             "auto:off".to_string()
         };
         let hint = match LayoutMode::from_width(area.width) {
-            LayoutMode::Narrow => format!(" ⏎ a d h:{mode} A:{auto} / q"),
+            LayoutMode::Narrow => format!(" ⏎ a d n h:{mode} A:{auto} q"),
             LayoutMode::Medium => format!(
-                " ⏎ jump  a/d  h [{mode}]  A [{auto}]  m mute  / filter  q"
+                " ⏎ jump  n/N hop  a/d  h [{mode}]  A [{auto}]  q"
             ),
             LayoutMode::Wide => format!(
-                "  ↑↓ select  ⏎ jump  / filter  space detail  a approve  d deny  h mode [{mode}]  A auto [{auto}]  H log  m mute  q quit"
+                "  ⏎ jump  n/N priority  a/d approve/deny  h [{mode}]  A [{auto}]  m mute  H log  q quit"
             ),
         };
         let style = if app.autonomous {

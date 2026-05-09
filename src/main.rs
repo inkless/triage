@@ -66,13 +66,15 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    let exit_on_jump = args.iter().any(|a| a == "--exit-on-jump");
+
     // Aliveness guard sticks around for the whole interactive session. The
     // hook checks for ~/.claude/triage/.alive; without this it bails out and
     // Claude's normal permission prompt takes over.
     let _alive = approval::AliveGuard::install();
 
     let mut terminal = setup_terminal()?;
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, exit_on_jump);
     restore_terminal()?;
     result
 }
@@ -136,8 +138,9 @@ fn probe() -> io::Result<()> {
     Ok(())
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, exit_on_jump: bool) -> io::Result<()> {
     let mut app = AppState::new();
+    app.exit_on_jump = exit_on_jump;
     let watcher = FsWatcher::spawn().ok();
 
     refresh(&mut app);
@@ -153,9 +156,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     if !handle_key(&mut app, k.code, k.modifiers) {
                         return Ok(());
                     }
-                    if !app.filter_active {
-                        app.clamp_selection();
-                    }
+                    app.clamp_selection();
                 }
                 Event::Resize(_, _) => {}
                 _ => {}
@@ -173,26 +174,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
 }
 
 fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
-    if app.filter_active {
-        match code {
-            KeyCode::Esc => {
-                app.filter.clear();
-                app.filter_active = false;
-            }
-            KeyCode::Enter => {
-                app.filter_active = false;
-            }
-            KeyCode::Backspace => {
-                app.filter.pop();
-            }
-            KeyCode::Char(c) => {
-                app.filter.push(c);
-            }
-            _ => {}
-        }
-        return true;
-    }
-
     // Audit-log overlay has its own input scheme: ↑↓/jk scrolls instead of
     // moving the table selection. Vim chords + half-page motion supported.
     if app.audit_log_open {
@@ -290,9 +271,15 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                 app.status_msg = Some("audit log unavailable — auto mode is off".to_string());
             }
         }
-        KeyCode::Char('/') => {
-            app.filter_active = true;
-            app.filter.clear();
+        KeyCode::Char('n') => {
+            if !app.hop_priority(true) {
+                app.status_msg = Some("no priority rows".to_string());
+            }
+        }
+        KeyCode::Char('N') => {
+            if !app.hop_priority(false) {
+                app.status_msg = Some("no priority rows".to_string());
+            }
         }
         KeyCode::Char('r') => {
             app.status_msg = Some("refreshing…".to_string());
@@ -301,8 +288,16 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             if let Some(s) = app.selected_session() {
                 if let Some(pane) = &s.pane {
                     let target = pane.target.clone();
-                    match tmux::jump_to(&target) {
-                        Ok(()) => app.status_msg = Some(format!("jumped → {target}")),
+                    match tmux::jump_to(&target, app.exit_on_jump) {
+                        Ok(()) => {
+                            app.status_msg = Some(format!("jumped → {target}"));
+                            // Popup-launch mode: exit so the overlay closes
+                            // and the user lands on the target pane in one
+                            // keypress. Without this they'd press q after.
+                            if app.exit_on_jump {
+                                return false;
+                            }
+                        }
                         Err(e) => app.status_msg = Some(format!("jump failed: {e}")),
                     }
                 } else {

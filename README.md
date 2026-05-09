@@ -26,7 +26,24 @@ bash scripts/triage-notify/build.sh
 
 Requires Xcode CLI tools (`xcode-select --install`) for `swiftc`. The `.app` is intentionally not committed; it's regenerated locally.
 
-Optional: install the PreToolUse hook so manual `a`/`d` and auto-mode verdicts route through Claude's clean approval channel instead of tmux send-keys:
+## tmux bindings (recommended split)
+
+```
+# Desktop: long-lived triage pane. Instant switch, fires notifications.
+bind-key -n M-t run-shell "~/workspace/triage/scripts/triage-jump.sh"
+
+# Mobile / SSH on phone: overlay triage as a popup. Enter jumps and closes the
+# overlay in one keypress; the target pane is auto-zoomed so it fills the screen.
+bind-key -n M-p display-popup -E -w 90% -h 90% 'triage --exit-on-jump'
+```
+
+The desktop binding keeps a real pane running triage continuously — that's what fires desktop notifications on Blocked / Error transitions and means `M-t` is just a focus switch (no cold start). The mobile binding spawns a fresh popup process; `--exit-on-jump` makes triage quit after a successful `Enter` so the popup closes, and zooms the destination pane so you don't land on a 30-column slice of a multi-pane layout. Hit `Ctrl-b z` to un-zoom.
+
+Requires tmux 3.2+ (`tmux -V`).
+
+## Optional: PreToolUse hook
+
+Install the PreToolUse hook so manual `a`/`d` and auto-mode verdicts route through Claude's clean approval channel instead of tmux send-keys:
 
 ```bash
 triage --install-hooks         # idempotent merge into ~/.claude/settings.json
@@ -39,9 +56,9 @@ triage --uninstall-hooks       # remove
 ```
 General:
   ↑↓ / j k         move selection
+  n / N            hop to next / prev priority row (error / block / done)
   ⏎                jump to selected session's tmux pane
   space            toggle detail panel
-  /  (then text)   filter (substring across name/cwd/headline/pane)
   r                request manual refresh
   q / Ctrl-C       quit
 
