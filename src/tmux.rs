@@ -112,6 +112,27 @@ pub fn find_owning_pane(
 /// triage pane doesn't exist and we have to spawn one, the spawned process
 /// is launched with `--zoom-on-jump` so its in-process Enter behavior
 /// matches the binding's intent (target pane gets zoomed too).
+/// Silent-attach probe used by plain `triage` invocations: if a live
+/// triage instance is recorded, switch the user's tmux client to its
+/// pane (with optional zoom) and return Ok(true). Returns Ok(false) when
+/// nothing live was found — caller falls through to running the TUI in
+/// the current pane.
+///
+/// This is the "single-instance with attach-on-second-start" behavior:
+/// typing `triage` from a shell when one's already running auto-jumps
+/// to it instead of starting a duplicate. PaneStale (process dead, pane
+/// still around) is intentionally NOT attached here — that case means
+/// the previous triage exited, so falling through to fresh-launch is
+/// what the user wants.
+pub fn attach_if_alive(zoom: bool) -> std::io::Result<bool> {
+    let panes = list_panes();
+    if let Some(LocatedTriage::Live(pane)) = locate_triage(&panes) {
+        focus_and_maybe_zoom(&pane, zoom)?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 pub fn jump_to_self(zoom: bool) -> std::io::Result<()> {
     let panes = list_panes();
     let cmd = if zoom { "triage --zoom-on-jump" } else { "triage" };

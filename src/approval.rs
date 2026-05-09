@@ -131,36 +131,34 @@ pub fn remove_claim(uuid: &str) {
     let _ = fs::remove_file(claims_dir().join(format!("{uuid}.json")));
 }
 
-/// On-disk shape of `.alive`. Pid lets the hook + jump_to_self check
-/// liveness via `kill(pid, 0)`. Pane id lets jump_to_self locate the pane
-/// to focus or respawn-pane in. Pane id (tmux's `%N`) is immutable across
-/// `renumber-windows` / `move-window`; the older `session:window.pane`
-/// target wasn't, which surfaced as "M-t doesn't find triage anymore"
-/// after window indices shuffled.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+/// In-memory record of "triage is currently running here." Composed from
+/// two on-disk sources kept separate for orthogonal reasons:
+/// - `pid` from `~/.claude/triage/.alive` — bare integer for back-compat
+///   with the bash PreToolUse hook (`triage-preuse.sh`), which `kill -0`s
+///   the file's contents directly. Removed by `AliveGuard` on clean exit.
+/// - `pane_id` from `~/.config/triage/state.json` `last_pane_id` —
+///   tombstoned. Survives clean exits, kills, panics. Lets `--jump-to-self`
+///   relocate the pane and `respawn-pane` in place even when the previous
+///   triage's process is gone, which is the key to never spawning duplicate
+///   windows.
+#[derive(Debug)]
 pub struct AliveRecord {
     pub pid: u32,
-    /// `None` when triage is launched outside tmux (e.g. plain terminal,
-    /// CI, --probe).
-    #[serde(default)]
     pub pane_id: Option<String>,
 }
 
-/// Drop guard: writes pid + pane id to `.alive` on construction, removes
-/// on drop. The hook + `--jump-to-self` read this to decide whether triage
-/// is up and where it lives.
+/// Drop guard: writes pid to `.alive` and pane id to state.json on
+/// construction, removes `.alive` on drop. The pane id stays in
+/// state.json (tombstone) — see `AliveRecord` doc.
 pub struct AliveGuard;
 
 impl AliveGuard {
     pub fn install() -> Self {
         let dir = triage_dir();
         let _ = fs::create_dir_all(&dir);
-        let record = AliveRecord {
-            pid: std::process::id(),
-            pane_id: current_pane_id(),
-        };
-        if let Ok(json) = serde_json::to_string(&record) {
-            let _ = fs::write(alive_file(), json);
+        let _ = fs::write(alive_file(), std::process::id().to_string());
+        if let Some(pane) = current_pane_id() {
+            crate::persist::save_last_pane_id(&pane);
         }
         AliveGuard
     }
@@ -168,21 +166,23 @@ impl AliveGuard {
 
 impl Drop for AliveGuard {
     fn drop(&mut self) {
+        // Only `.alive` is removed on clean exit — the hook treats
+        // file-absence as "triage isn't intercepting." pane_id stays in
+        // state.json so the next `--jump-to-self` can `respawn-pane`
+        // in the previous location.
         let _ = fs::remove_file(alive_file());
     }
 }
 
-/// Read the alive file. Handles both the new JSON shape and the legacy
-/// bare-pid format (the hook script + older triage builds wrote just a
-/// number) — useful during the transition.
+/// Read pid from `.alive` and pane_id from state.json. Returns None when
+/// `.alive` is absent or unparseable (treated as "no triage running").
 pub fn read_alive_record() -> Option<AliveRecord> {
     let content = fs::read_to_string(alive_file()).ok()?;
-    let trimmed = content.trim();
-    if let Ok(rec) = serde_json::from_str::<AliveRecord>(trimmed) {
-        return Some(rec);
-    }
-    let pid = trimmed.parse().ok()?;
-    Some(AliveRecord { pid, pane_id: None })
+    let pid = content.trim().parse().ok()?;
+    Some(AliveRecord {
+        pid,
+        pane_id: crate::persist::read_last_pane_id(),
+    })
 }
 
 fn current_pane_id() -> Option<String> {
@@ -191,8 +191,7 @@ fn current_pane_id() -> Option<String> {
     // directly. Falling back to a no-target display-message would resolve
     // "current client" which is ambiguous when triage is launched from a
     // detached run-shell context (e.g. via the M-t binding's spawn path).
-    let pane = std::env::var("TMUX_PANE").ok()?;
-    Some(pane)
+    std::env::var("TMUX_PANE").ok()
 }
 
 /// Read every pending file. Returns one PendingApproval per file. Files we

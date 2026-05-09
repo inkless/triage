@@ -81,6 +81,21 @@ fn main() -> io::Result<()> {
     // long-lived triage with this flag (and accept that desktop also
     // zooms on Enter), or rely on the auto-detect path inside Enter.
     let zoom_on_jump = exit_on_jump || args.iter().any(|a| a == "--zoom-on-jump");
+    let force_new = args.iter().any(|a| a == "--force-new");
+
+    // Silent attach: typing `triage` (no special flags) when one's already
+    // running just switches the user to it and exits 0. Skipped when:
+    //   - --force-new (explicit "I want a second instance, e.g. for debug")
+    //   - --exit-on-jump (popup-launch context — caller is already
+    //     handling lifecycle)
+    //   - we're not inside tmux (no pane to switch to)
+    if !force_new
+        && !exit_on_jump
+        && std::env::var_os("TMUX").is_some()
+        && tmux::attach_if_alive(zoom_on_jump).unwrap_or(false)
+    {
+        return Ok(());
+    }
 
     // Aliveness guard sticks around for the whole interactive session. The
     // hook checks for ~/.claude/triage/.alive; without this it bails out and

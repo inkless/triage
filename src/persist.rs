@@ -35,6 +35,13 @@ struct PersistedState {
     /// Autonomous-mode toggle (T-56). Off by default; explicit opt-in only.
     #[serde(default)]
     autonomous: bool,
+    /// Tmux pane id (`%N`) of the last-running triage instance. Tombstone
+    /// — kept across triage exits so `--jump-to-self` and plain `triage`
+    /// can locate the previous pane and `respawn-pane` there instead of
+    /// creating a duplicate window. Only overwritten when a fresh triage
+    /// records its own pane on startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_pane_id: Option<String>,
 }
 
 fn state_path() -> PathBuf {
@@ -85,6 +92,36 @@ pub fn load_state() -> LoadedState {
     }
 }
 
+/// Read just `last_pane_id` without loading the rest of the state. Used
+/// by the silent-attach path on a plain `triage` invocation — we want to
+/// know where the previous instance was without paying the full
+/// `load_state` cost (which constructs MuteKey hashmaps etc.).
+pub fn read_last_pane_id() -> Option<String> {
+    let bytes = fs::read(state_path()).ok()?;
+    let state: PersistedState = serde_json::from_slice(&bytes).ok()?;
+    state.last_pane_id
+}
+
+/// Write just `last_pane_id`, preserving all other fields of state.json.
+/// Called by AliveGuard on triage startup to record the pane it's running
+/// in. Tombstone — never cleared by triage itself; only overwritten by a
+/// future startup, or manually edited.
+pub fn save_last_pane_id(pane_id: &str) {
+    let path = state_path();
+    let mut state: PersistedState = fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    state.last_pane_id = Some(pane_id.to_string());
+    let Ok(json) = serde_json::to_vec_pretty(&state) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(path, json);
+}
+
 /// Best-effort save. Failures are ignored — losing prefs is annoying
 /// but not catastrophic, and we don't want IO errors to surface in the TUI.
 pub fn save_state<'a, I>(entries: I, approval_mode: ApprovalMode, autonomous: bool)
@@ -102,10 +139,18 @@ where
             })
         })
         .collect();
+    // Read existing pane_id and preserve. The full save path is for mutes /
+    // approval-mode / autonomous; pane_id is owned by AliveGuard and we
+    // shouldn't accidentally overwrite it from this code path.
+    let existing_pane_id = fs::read(state_path())
+        .ok()
+        .and_then(|b| serde_json::from_slice::<PersistedState>(&b).ok())
+        .and_then(|s| s.last_pane_id);
     let state = PersistedState {
         mutes,
         approval_mode: Some(approval_mode),
         autonomous,
+        last_pane_id: existing_pane_id,
     };
     let Ok(json) = serde_json::to_vec_pretty(&state) else {
         return;
