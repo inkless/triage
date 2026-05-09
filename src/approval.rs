@@ -131,15 +131,37 @@ pub fn remove_claim(uuid: &str) {
     let _ = fs::remove_file(claims_dir().join(format!("{uuid}.json")));
 }
 
-/// Drop guard: writes our pid to `.alive` on construction, removes on drop.
-/// The hook reads this to decide whether triage is intercepting tool calls.
+/// On-disk shape of `.alive`. Pid lets the hook + jump_to_self check
+/// liveness via `kill(pid, 0)`. Pane id lets jump_to_self locate the pane
+/// to focus or respawn-pane in. Pane id (tmux's `%N`) is immutable across
+/// `renumber-windows` / `move-window`; the older `session:window.pane`
+/// target wasn't, which surfaced as "M-t doesn't find triage anymore"
+/// after window indices shuffled.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub struct AliveRecord {
+    pub pid: u32,
+    /// `None` when triage is launched outside tmux (e.g. plain terminal,
+    /// CI, --probe).
+    #[serde(default)]
+    pub pane_id: Option<String>,
+}
+
+/// Drop guard: writes pid + pane id to `.alive` on construction, removes
+/// on drop. The hook + `--jump-to-self` read this to decide whether triage
+/// is up and where it lives.
 pub struct AliveGuard;
 
 impl AliveGuard {
     pub fn install() -> Self {
         let dir = triage_dir();
         let _ = fs::create_dir_all(&dir);
-        let _ = fs::write(alive_file(), std::process::id().to_string());
+        let record = AliveRecord {
+            pid: std::process::id(),
+            pane_id: current_pane_id(),
+        };
+        if let Ok(json) = serde_json::to_string(&record) {
+            let _ = fs::write(alive_file(), json);
+        }
         AliveGuard
     }
 }
@@ -148,6 +170,29 @@ impl Drop for AliveGuard {
     fn drop(&mut self) {
         let _ = fs::remove_file(alive_file());
     }
+}
+
+/// Read the alive file. Handles both the new JSON shape and the legacy
+/// bare-pid format (the hook script + older triage builds wrote just a
+/// number) — useful during the transition.
+pub fn read_alive_record() -> Option<AliveRecord> {
+    let content = fs::read_to_string(alive_file()).ok()?;
+    let trimmed = content.trim();
+    if let Ok(rec) = serde_json::from_str::<AliveRecord>(trimmed) {
+        return Some(rec);
+    }
+    let pid = trimmed.parse().ok()?;
+    Some(AliveRecord { pid, pane_id: None })
+}
+
+fn current_pane_id() -> Option<String> {
+    // TMUX_PANE is the most reliable handle: tmux sets it for every
+    // process inside a pane, and `display-message -t %N` accepts it
+    // directly. Falling back to a no-target display-message would resolve
+    // "current client" which is ambiguous when triage is launched from a
+    // detached run-shell context (e.g. via the M-t binding's spawn path).
+    let pane = std::env::var("TMUX_PANE").ok()?;
+    Some(pane)
 }
 
 /// Read every pending file. Returns one PendingApproval per file. Files we

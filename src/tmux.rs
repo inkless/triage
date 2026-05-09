@@ -12,7 +12,7 @@ pub fn list_panes() -> HashMap<u32, Pane> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}|#{window_index}.#{pane_index}|#{pane_pid}|#{pane_tty}|#{pane_current_command}|#{pane_current_path}|#{?pane_active,1,0}",
+            "#{session_name}|#{window_index}.#{pane_index}|#{pane_pid}|#{pane_tty}|#{pane_current_command}|#{pane_current_path}|#{?pane_active,1,0}|#{pane_id}",
         ])
         .output();
     let Ok(out) = out else { return map };
@@ -21,8 +21,8 @@ pub fn list_panes() -> HashMap<u32, Pane> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
-        let parts: Vec<&str> = line.splitn(7, '|').collect();
-        if parts.len() < 7 {
+        let parts: Vec<&str> = line.splitn(8, '|').collect();
+        if parts.len() < 8 {
             continue;
         }
         let Ok(pid) = parts[2].parse::<u32>() else {
@@ -38,6 +38,7 @@ pub fn list_panes() -> HashMap<u32, Pane> {
             Pane {
                 target: format!("{}:{}", parts[0], parts[1]),
                 tmux_session: parts[0].to_string(),
+                pane_id: parts[7].to_string(),
                 pid,
                 tty: parts[3].to_string(),
                 current_command: parts[4].to_string(),
@@ -90,33 +91,6 @@ pub fn find_owning_pane(
     None
 }
 
-/// Locate the tmux pane that contains the running triage process by reading
-/// its pid from `~/.claude/triage/.alive` and walking the process tree up
-/// to find an ancestor that's a pane_pid. Returns None if `.alive` is
-/// missing, the pid is dead, or the process tree doesn't lead to any
-/// known pane (shouldn't happen in normal use but is defensible). Falls
-/// back to the legacy command-name match as a defense-in-depth — handles
-/// "I just spawned triage, .alive isn't written yet" race in either
-/// direction (jump finds it via name now, or via .alive on next press).
-fn find_alive_triage_pane(panes: &HashMap<u32, Pane>) -> Option<Pane> {
-    if let Some(pid) = read_alive_pid()
-        && unsafe { libc::kill(pid as libc::pid_t, 0) } == 0
-    {
-        let ppid_map = build_ppid_map();
-        if let Some(p) = find_owning_pane(pid, panes, &ppid_map, 8) {
-            return Some(p);
-        }
-    }
-    panes.values().find(|p| p.current_command == "triage").cloned()
-}
-
-fn read_alive_pid() -> Option<u32> {
-    let home = std::env::var_os("HOME")?;
-    let path = std::path::PathBuf::from(home).join(".claude/triage/.alive");
-    let content = std::fs::read_to_string(path).ok()?;
-    content.trim().parse().ok()
-}
-
 /// Find an existing pane whose foreground command is `triage` and focus it,
 /// or spawn one in a new window of the current tmux session if none exist.
 /// Designed to be wired to a tmux key binding (e.g. `M-t`); deliberately
@@ -140,37 +114,89 @@ fn read_alive_pid() -> Option<u32> {
 /// matches the binding's intent (target pane gets zoomed too).
 pub fn jump_to_self(zoom: bool) -> std::io::Result<()> {
     let panes = list_panes();
-    let target = find_alive_triage_pane(&panes);
-    if let Some(pane) = target {
-        Command::new("tmux")
-            .args(["switch-client", "-t", &pane.tmux_session])
-            .status()?;
-        Command::new("tmux")
-            .args(["select-pane", "-t", &pane.target])
-            .status()?;
-        if zoom {
-            let already_zoomed = Command::new("tmux")
-                .args(["display-message", "-p", "-t", &pane.target, "#{window_zoomed_flag}"])
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
-                .unwrap_or(false);
-            if !already_zoomed {
-                Command::new("tmux")
-                    .args(["resize-pane", "-Z", "-t", &pane.target])
-                    .status()?;
-            }
-        }
-        return Ok(());
-    }
-    // Spawn fallback: propagate --zoom-on-jump so the new triage's Enter
-    // behavior matches the binding's intent (target pane gets zoomed too).
-    // The new window's pane is full-window already, no resize needed.
     let cmd = if zoom { "triage --zoom-on-jump" } else { "triage" };
+
+    match locate_triage(&panes) {
+        Some(LocatedTriage::Live(pane)) => {
+            focus_and_maybe_zoom(&pane, zoom)?;
+            Ok(())
+        }
+        // Triage's pane is still alive but the process inside isn't —
+        // user force-killed triage with SIGKILL, or the pane is stuck on a
+        // shell after a panic. Respawn in place rather than spawning a
+        // duplicate window. Prevents the runaway-window bug seen when M-t
+        // keeps creating new triage tabs.
+        Some(LocatedTriage::PaneStale(pane)) => {
+            Command::new("tmux")
+                .args(["respawn-pane", "-k", "-t", &pane.target, cmd])
+                .status()?;
+            focus_and_maybe_zoom(&pane, zoom)?;
+            Ok(())
+        }
+        None => {
+            Command::new("tmux")
+                .args(["new-window", "-n", "triage", cmd])
+                .status()?;
+            Ok(())
+        }
+    }
+}
+
+fn focus_and_maybe_zoom(pane: &Pane, zoom: bool) -> std::io::Result<()> {
     Command::new("tmux")
-        .args(["new-window", "-n", "triage", cmd])
+        .args(["switch-client", "-t", &pane.tmux_session])
         .status()?;
+    Command::new("tmux")
+        .args(["select-pane", "-t", &pane.target])
+        .status()?;
+    if zoom {
+        let already_zoomed = Command::new("tmux")
+            .args(["display-message", "-p", "-t", &pane.target, "#{window_zoomed_flag}"])
+            .output()
+            .ok()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
+            .unwrap_or(false);
+        if !already_zoomed {
+            Command::new("tmux")
+                .args(["resize-pane", "-Z", "-t", &pane.target])
+                .status()?;
+        }
+    }
     Ok(())
+}
+
+enum LocatedTriage {
+    /// Triage process is alive AND owns the recorded pane.
+    Live(Pane),
+    /// Triage's recorded pane still exists in tmux, but the process inside
+    /// is dead. Reuse via respawn-pane.
+    PaneStale(Pane),
+}
+
+fn locate_triage(panes: &HashMap<u32, Pane>) -> Option<LocatedTriage> {
+    let record = crate::approval::read_alive_record()?;
+    let alive = unsafe { libc::kill(record.pid as i32, 0) } == 0;
+
+    if let Some(pane_id) = &record.pane_id
+        && let Some(pane) = panes.values().find(|p| &p.pane_id == pane_id).cloned()
+    {
+        return Some(if alive {
+            LocatedTriage::Live(pane)
+        } else {
+            LocatedTriage::PaneStale(pane)
+        });
+    }
+
+    // No recorded pane id (legacy `.alive`, or non-tmux launch), or the
+    // pane is gone. If the process is alive, fall back to ppid walk to
+    // locate its pane via the process tree.
+    if alive {
+        let ppid_map = build_ppid_map();
+        if let Some(pane) = find_owning_pane(record.pid, panes, &ppid_map, 8) {
+            return Some(LocatedTriage::Live(pane));
+        }
+    }
+    None
 }
 
 /// Switch tmux focus to the given pane target (`session:window.pane`). When

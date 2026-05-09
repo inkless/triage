@@ -10,6 +10,11 @@ pub struct Pane {
     /// `#{session_name}` portion of `target`. Split out here so consumers
     /// (UI, notify, jump) don't all re-parse the same colon-separated string.
     pub tmux_session: String,
+    /// Tmux's permanent unique ID for this pane (e.g. `%42`). Unlike
+    /// `target`, this is immutable for the pane's lifetime — survives
+    /// `renumber-windows`, `move-window`, etc. Used as the stable handle
+    /// for `.alive` so an opened-then-renumbered pane is still findable.
+    pub pane_id: String,
     pub pid: u32,
     pub tty: String,
     pub current_command: String,
