@@ -172,15 +172,7 @@ context_window = 1000000   # bypass auto-detect (use the 1M window)
 
 **Security**: `chmod 600 ~/.config/triage/config.toml`. Triage refuses to load and warns if perms allow group/other read — the `[ntfy].token` field would otherwise be leakable.
 
-**Precedence**: env var > config file > built-in default. Existing env-var users (and one-off `TRIAGE_FOO=bar triage` overrides) keep working.
-
-## Environment variables
-
-| Variable | Purpose |
-| --- | --- |
-| `TRIAGE_CONTEXT_WINDOW` | Override context-window size. Bypasses detection. Same as `[model].context_window`. |
-| `TRIAGE_AUDITOR_PROMPT_FILE` | Custom auditor system prompt path (legacy; not in config). |
-| `TRIAGE_TERMINAL_BUNDLE` | macOS terminal bundle ID for notification sender. Same as `[notifications].terminal_bundle`. Auto-detected for kitty / ghostty / iTerm2 / Alacritty / WezTerm. |
+The auditor system prompt lives separately at `~/.config/triage/auditor-prompt.md` (markdown, easier to hand-edit than embedded TOML strings). Empty/missing falls through to the compiled-in default.
 
 ## Design notes
 

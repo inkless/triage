@@ -1,12 +1,9 @@
 //! Hand-editable user config at `~/.config/triage/config.toml`.
 //!
-//! Precedence chain for any field that can also be set via env:
-//!
-//!   env var > config file > built-in default
-//!
-//! All sections + fields are optional; an empty file (or no file at all) is
-//! valid and means "use defaults / fall through to env vars." Loaded once at
-//! startup; no hot reload — restart triage to pick up changes.
+//! Single source of truth — no env-var overrides on top. All sections +
+//! fields are optional; an empty file (or no file at all) is valid and
+//! means "use built-in defaults." Loaded once at startup; no hot reload —
+//! restart triage to pick up changes.
 
 use std::fs;
 use std::path::PathBuf;
@@ -96,13 +93,12 @@ struct DiskModel {
 }
 
 impl Config {
-    /// Read `~/.config/triage/config.toml` if present, then layer env-var
-    /// overrides on top. Missing file is fine — returns built-in defaults.
-    /// Parse errors print a warning to stderr and fall back to defaults; we
-    /// don't crash on a bad config because triage is a TUI that wants to
-    /// keep running.
+    /// Read `~/.config/triage/config.toml` if present. Missing file is fine
+    /// — returns built-in defaults. Parse errors print a warning to stderr
+    /// and fall back to defaults; we don't crash on a bad config because
+    /// triage is a TUI that wants to keep running.
     pub fn load() -> Self {
-        let mut cfg = match read_disk() {
+        match read_disk() {
             Ok(disk) => disk.into(),
             Err(e) => {
                 if !is_missing(&e) {
@@ -110,9 +106,7 @@ impl Config {
                 }
                 Config::default()
             }
-        };
-        apply_env_overrides(&mut cfg);
-        cfg
+        }
     }
 }
 
@@ -178,15 +172,3 @@ impl From<DiskConfig> for Config {
     }
 }
 
-fn apply_env_overrides(cfg: &mut Config) {
-    if let Ok(v) = std::env::var("TRIAGE_CONTEXT_WINDOW")
-        && let Ok(n) = v.parse::<u64>()
-    {
-        cfg.model.context_window = Some(n);
-    }
-    if let Ok(v) = std::env::var("TRIAGE_TERMINAL_BUNDLE")
-        && !v.is_empty()
-    {
-        cfg.notifications.terminal_bundle = Some(v);
-    }
-}
