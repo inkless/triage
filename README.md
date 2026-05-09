@@ -18,6 +18,22 @@ triage              # launch the TUI
 triage --probe      # print the joined session table once (no TUI)
 ```
 
+`cargo build` auto-builds the macOS notification helper (`triage-notify.app`) under `scripts/triage-notify/` via `build.rs`. Without it, desktop notifications still appear (via `osascript` fallback) but the click-to-jump action is lost — clicking does nothing. Build manually if needed:
+
+```bash
+bash scripts/triage-notify/build.sh
+```
+
+Requires Xcode CLI tools (`xcode-select --install`) for `swiftc`. The `.app` is intentionally not committed; it's regenerated locally.
+
+Optional: install the PreToolUse hook so manual `a`/`d` and auto-mode verdicts route through Claude's clean approval channel instead of tmux send-keys:
+
+```bash
+triage --install-hooks         # idempotent merge into ~/.claude/settings.json
+triage --install-hooks --dry-run   # preview
+triage --uninstall-hooks       # remove
+```
+
 ## Keys
 
 ```
