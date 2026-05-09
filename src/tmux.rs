@@ -143,8 +143,21 @@ pub fn jump_to_self(zoom: bool) -> std::io::Result<()> {
 }
 
 fn focus_and_maybe_zoom(pane: &Pane, zoom: bool) -> std::io::Result<()> {
+    // Same three-step pin as jump_to: session via switch-client, window
+    // via select-window, pane via select-pane. select-pane alone updates
+    // the session's active pane but doesn't always make that window the
+    // calling client's current window — symptom seen as "M-t did nothing
+    // until I manually navigated to triage's window once."
+    let window = pane
+        .target
+        .rsplit_once('.')
+        .map(|(w, _)| w)
+        .unwrap_or(&pane.target);
     Command::new("tmux")
         .args(["switch-client", "-t", &pane.tmux_session])
+        .status()?;
+    Command::new("tmux")
+        .args(["select-window", "-t", window])
         .status()?;
     Command::new("tmux")
         .args(["select-pane", "-t", &pane.target])
