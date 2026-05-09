@@ -147,13 +147,40 @@ Context-window detection precedence:
 
 Cost figures are approximate; cross-check against `/cost` for the canonical per-session total.
 
+## Configuration
+
+Hand-editable TOML at `~/.config/triage/config.toml`. All sections + fields are optional — an empty file (or no file) is valid. Loaded once at startup; restart triage to pick up changes.
+
+```toml
+# Phone push notifications via self-hosted ntfy. See
+# memory-bank/projects/triage/specs/notify-self-host.md for the homelab setup.
+[ntfy]
+url   = "https://ntfy.guangda.me/triage-alerts"
+user  = "triage"
+token = "..."
+
+[thresholds]
+mobile_width    = 140    # cols — auto-zoom-on-jump fires below this
+refresh_seconds = 2      # polling fallback when fs events are quiet
+
+[notifications]
+terminal_bundle = "net.kovidgoyal.kitty"   # override click-to-jump sender
+
+[model]
+context_window = 1000000   # bypass auto-detect (use the 1M window)
+```
+
+**Security**: `chmod 600 ~/.config/triage/config.toml`. Triage refuses to load and warns if perms allow group/other read — the `[ntfy].token` field would otherwise be leakable.
+
+**Precedence**: env var > config file > built-in default. Existing env-var users (and one-off `TRIAGE_FOO=bar triage` overrides) keep working.
+
 ## Environment variables
 
 | Variable | Purpose |
 | --- | --- |
-| `TRIAGE_CONTEXT_WINDOW` | Override context-window size. Bypasses detection. |
-| `TRIAGE_AUDITOR_PROMPT_FILE` | Custom auditor system prompt path. |
-| `TRIAGE_TERMINAL_BUNDLE` | macOS terminal bundle ID for notification sender (auto-detected for kitty / ghostty / iTerm2 / Alacritty / WezTerm). |
+| `TRIAGE_CONTEXT_WINDOW` | Override context-window size. Bypasses detection. Same as `[model].context_window`. |
+| `TRIAGE_AUDITOR_PROMPT_FILE` | Custom auditor system prompt path (legacy; not in config). |
+| `TRIAGE_TERMINAL_BUNDLE` | macOS terminal bundle ID for notification sender. Same as `[notifications].terminal_bundle`. Auto-detected for kitty / ghostty / iTerm2 / Alacritty / WezTerm. |
 
 ## Design notes
 

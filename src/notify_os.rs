@@ -2,6 +2,7 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::thread;
 
+use crate::config::{Config, NtfyConfig};
 use crate::models::{AttentionState, Session};
 
 /// Fire a macOS desktop notification for a session that just became actionable
@@ -14,7 +15,7 @@ use crate::models::{AttentionState, Session};
 /// macOS 14+. Falls back to `osascript display notification` (display-only,
 /// no click action). `terminal-notifier` was tried earlier but its
 /// `-execute` callback was silently broken on recent macOS.
-pub fn alert(session: &Session) {
+pub fn alert(session: &Session, cfg: &Config) {
     let title = match session.state {
         AttentionState::Blocked => "needs your input",
         AttentionState::Error => "error",
@@ -38,11 +39,37 @@ pub fn alert(session: &Session) {
         .map(|s| s.chars().take(140).collect::<String>())
         .unwrap_or_default();
 
+    // Phone push (ntfy). Body deliberately minimal — `<label> · <state>` —
+    // so the publish target (whoever can read the topic) doesn't see prompt
+    // contents. See specs/notify-self-host.md.
+    if let Some(ntfy) = cfg.ntfy.as_ref() {
+        ntfy_push(ntfy, &label, title);
+    }
+
     if let Some(notifier) = triage_notify_path() {
-        send_via_triage_notify(notifier, title, &label, &preview, session.pane.as_ref());
+        send_via_triage_notify(notifier, title, &label, &preview, session.pane.as_ref(), cfg);
         return;
     }
     send_via_osascript(title, &label, &preview);
+}
+
+fn ntfy_push(ntfy: &NtfyConfig, label: &str, state: &str) {
+    let body = format!("{label} · {state}");
+    let mut cmd = Command::new("curl");
+    // -fsSL: fail on HTTP errors silently (no stderr unless -v), follow
+    //   redirects, no progress bar.
+    // -m 5: total time budget. We do not block on this — spawn_detached
+    //   reaps the child — but bounding the request keeps zombie-thread
+    //   accumulation minimal if ntfy's edge ever stalls.
+    cmd.args(["-fsSL", "-m", "5", "-X", "POST"]);
+    if let (Some(user), Some(token)) = (ntfy.user.as_deref(), ntfy.token.as_deref()) {
+        cmd.arg("-u").arg(format!("{user}:{token}"));
+    }
+    cmd.args(["-H", "Title: triage"]);
+    cmd.args(["-H", "Tags: warning"]);
+    cmd.args(["-d", &body]);
+    cmd.arg(&ntfy.url);
+    spawn_detached(cmd);
 }
 
 fn send_via_triage_notify(
@@ -51,6 +78,7 @@ fn send_via_triage_notify(
     label: &str,
     preview: &str,
     pane: Option<&crate::models::Pane>,
+    cfg: &Config,
 ) {
     // Launch via LaunchServices (`open -na <bundle> --args …`) instead of
     // exec'ing the binary directly. Without this, macOS 14+ never registers
@@ -72,7 +100,7 @@ fn send_via_triage_notify(
     // internal focus changes but the terminal window stays hidden.
     if let (Some(pane), Some(tmux)) = (pane, tmux_path()) {
         let session_name = pane.tmux_session.as_str();
-        let activate_cmd = detected_terminal_bundle()
+        let activate_cmd = detected_terminal_bundle(cfg)
             .map(|bundle| {
                 // AppleScript needs DOUBLE quotes around the bundle ID
                 // (string literal); the entire AppleScript expression then
@@ -132,13 +160,14 @@ fn spawn_detached(mut cmd: Command) {
 }
 
 /// Detect which terminal app triage is running under, for the click-action
-/// activate path only. Checks `TRIAGE_TERMINAL_BUNDLE` first, then env vars,
-/// then walks the process tree (handles tmux-inside-terminal, since tmux
-/// strips most env).
-fn detected_terminal_bundle() -> Option<&'static str> {
+/// activate path only. Checks the config-provided override (which itself
+/// folds in the legacy `TRIAGE_TERMINAL_BUNDLE` env var), then env-based
+/// per-terminal sentinels, then walks the process tree (handles tmux-
+/// inside-terminal, since tmux strips most env).
+fn detected_terminal_bundle(cfg: &Config) -> Option<&'static str> {
     static CACHED: OnceLock<Option<&'static str>> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        if let Some(forced) = forced_terminal_bundle_id() {
+        if let Some(forced) = forced_terminal_bundle_id(cfg) {
             return Some(forced);
         }
         if let Some(b) = bundle_from_env() {
@@ -148,18 +177,15 @@ fn detected_terminal_bundle() -> Option<&'static str> {
     })
 }
 
-fn forced_terminal_bundle_id() -> Option<&'static str> {
-    static CACHED: OnceLock<Option<&'static str>> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        let forced = std::env::var("TRIAGE_TERMINAL_BUNDLE").ok()?;
-        let trimmed = forced.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        // Leak the override so we can hand out &'static str. Once-per-process,
-        // negligible memory cost.
-        Some(Box::leak(trimmed.to_string().into_boxed_str()) as &'static str)
-    })
+fn forced_terminal_bundle_id(cfg: &Config) -> Option<&'static str> {
+    let forced = cfg.notifications.terminal_bundle.as_deref()?;
+    let trimmed = forced.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Leak the override so we can hand out &'static str. Once-per-process,
+    // negligible memory cost.
+    Some(Box::leak(trimmed.to_string().into_boxed_str()) as &'static str)
 }
 
 fn bundle_from_env() -> Option<&'static str> {

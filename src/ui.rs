@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::auditor::Verdict;
 use crate::classifier::idle_age;
+use crate::config::Config;
 use crate::models::{ApprovalMode, AttentionState, Session};
 use crate::persist::{self, MuteKey};
 use crate::transcript::DigestCache;
@@ -90,6 +91,9 @@ pub struct AppState {
     /// width reflects the device that's actively viewing this pane. Read
     /// at Enter time to decide whether to zoom.
     pub last_pane_width: u16,
+    /// Loaded once at startup (config file + env overrides). Read-only
+    /// after this point.
+    pub config: Config,
 }
 
 impl AppState {
@@ -123,6 +127,7 @@ impl AppState {
             exit_on_jump: false,
             zoom_on_jump: false,
             last_pane_width: 0,
+            config: Config::default(),
         }
     }
 
@@ -185,7 +190,8 @@ impl AppState {
     pub fn should_zoom_on_jump(&self) -> bool {
         self.exit_on_jump
             || self.zoom_on_jump
-            || (self.last_pane_width > 0 && self.last_pane_width < MOBILE_WIDTH_THRESHOLD)
+            || (self.last_pane_width > 0
+                && self.last_pane_width < self.config.thresholds.mobile_width)
     }
 
     pub fn visible(&self) -> Vec<&Session> {
@@ -331,12 +337,6 @@ impl LayoutMode {
         }
     }
 }
-
-/// Pane widths below this trigger auto-zoom-on-jump. Calibrated against
-/// real devices: iPhone ~30–80, iPad portrait ~120, iPad landscape ~200,
-/// desktop ~200+. 140 catches iPad portrait without false-positive on a
-/// narrow desktop split-screen layout (which is typically 100–130).
-pub const MOBILE_WIDTH_THRESHOLD: u16 = 140;
 
 fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
     // Stash for the Enter handler's auto-zoom decision (see `should_zoom_on_jump`).
@@ -698,7 +698,12 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
         .map(|s| s.peak_context_tokens)
         .max()
         .unwrap_or(0);
-    let window = context_window_for_session(s, app_peak, app.default_model.as_deref());
+    let window = context_window_for_session(
+        s,
+        app_peak,
+        app.default_model.as_deref(),
+        app.config.model.context_window,
+    );
     let is_1m = window >= 1_000_000;
 
     let mut header = vec![
@@ -944,7 +949,8 @@ fn format_tokens(n: u64) -> String {
 /// Context-window size for a session. Five signals in priority order before
 /// falling back to 200k:
 ///
-/// 1. `TRIAGE_CONTEXT_WINDOW` env var — explicit override.
+/// 1. `config.model.context_window` (also `TRIAGE_CONTEXT_WINDOW` env via the
+///    config's env-override layer) — explicit override.
 /// 2. The session's own model name carries a `[1m]` tag (future-proof; today
 ///    the transcript strips it).
 /// 3. `~/.claude/settings.json` default model has a `[1m]` tag — this is the
@@ -956,9 +962,9 @@ fn context_window_for_session(
     s: &Session,
     app_peak: u64,
     default_model: Option<&str>,
+    override_window: Option<u64>,
 ) -> u64 {
-    if let Ok(v) = std::env::var("TRIAGE_CONTEXT_WINDOW")
-        && let Ok(n) = v.parse::<u64>()
+    if let Some(n) = override_window
         && n > 0
     {
         return n;

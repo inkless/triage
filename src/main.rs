@@ -1,6 +1,7 @@
 mod approval;
 mod auditor;
 mod classifier;
+mod config;
 mod discovery;
 mod models;
 mod notify_os;
@@ -24,12 +25,11 @@ use ratatui::backend::CrosstermBackend;
 use crate::ui::{AppState, draw};
 use crate::watcher::FsWatcher;
 
-const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// Minimum gap between watcher-triggered refreshes. Without this, an actively
 /// writing jsonl can fire fs events fast enough that refresh runs every loop
-/// iteration, blocking key handling. The 2s REFRESH_INTERVAL still applies as
-/// the upper bound when nothing is changing.
+/// iteration, blocking key handling. The configured refresh-interval still
+/// applies as the upper bound when nothing is changing.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
 
 fn main() -> io::Result<()> {
@@ -173,8 +173,10 @@ fn run(
     zoom_on_jump: bool,
 ) -> io::Result<()> {
     let mut app = AppState::new();
+    app.config = config::Config::load();
     app.exit_on_jump = exit_on_jump;
     app.zoom_on_jump = zoom_on_jump;
+    let refresh_interval = Duration::from_secs(app.config.thresholds.refresh_seconds.max(1));
     let watcher = FsWatcher::spawn().ok();
 
     refresh(&mut app);
@@ -198,7 +200,7 @@ fn run(
         }
 
         let elapsed = last_refresh.elapsed();
-        let due = elapsed >= REFRESH_INTERVAL;
+        let due = elapsed >= refresh_interval;
         let triggered = watcher.as_ref().map(|w| w.drain()).unwrap_or(false);
         if due || (triggered && elapsed >= WATCHER_DEBOUNCE) {
             refresh(&mut app);
@@ -498,7 +500,7 @@ fn refresh(app: &mut AppState) {
         if prev == Some(s.state) {
             continue;
         }
-        notify_os::alert(s);
+        notify_os::alert(s, &app.config);
     }
     app.last_states = sessions.iter().map(|s| (s.pid, s.state)).collect();
 
