@@ -296,10 +296,16 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
 fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
     let total = app.sessions.len();
     let counts = format!("{total} session{}", if total == 1 { "" } else { "s" });
+    // Show pane width inline + a `zoom` indicator when auto-detect is active,
+    // so it's obvious whether Enter will zoom on the current device.
+    let zoom_marker = if app.should_zoom_on_jump() { " · zoom" } else { "" };
+    let dims = format!("{}cols{}", app.last_pane_width, zoom_marker);
     let line = Line::from(vec![
         Span::styled("triage", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("   "),
         Span::styled(counts, Style::default().fg(Color::DarkGray)),
+        Span::raw("   "),
+        Span::styled(dims, Style::default().fg(Color::DarkGray)),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -326,9 +332,11 @@ impl LayoutMode {
     }
 }
 
-/// Pane widths below this trigger auto-zoom-on-jump. Phone-attached tmux
-/// clients are typically 30–80 cols; desktop is 100+. 100 is the safe split.
-pub const MOBILE_WIDTH_THRESHOLD: u16 = 100;
+/// Pane widths below this trigger auto-zoom-on-jump. Calibrated against
+/// real devices: iPhone ~30–80, iPad portrait ~120, iPad landscape ~200,
+/// desktop ~200+. 140 catches iPad portrait without false-positive on a
+/// narrow desktop split-screen layout (which is typically 100–130).
+pub const MOBILE_WIDTH_THRESHOLD: u16 = 140;
 
 fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
     // Stash for the Enter handler's auto-zoom decision (see `should_zoom_on_jump`).

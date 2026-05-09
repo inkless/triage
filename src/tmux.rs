@@ -142,15 +142,22 @@ pub fn jump_to_self(zoom: bool) -> std::io::Result<()> {
 /// designed for the popup-launch flow on mobile, where the user is jumping
 /// onto a tiny phone screen and probably wants the destination pane maximized.
 pub fn jump_to(target: &str, zoom: bool) -> std::io::Result<()> {
-    // `select-pane -t session:window.pane` handles session + window + pane,
-    // but `switch-client` is required to actually focus the session if the
-    // user is currently attached to a different one.
+    // Three-step pin: session → window → pane. Empirically, `select-pane`
+    // alone doesn't reliably switch the *window* when the target window
+    // differs from the calling client's current window — symptom seen
+    // when triage was spawned via M-p (new window in same session as the
+    // jump target): status said "jumped" but the client stayed on
+    // triage's window. Explicit select-window resolves it.
     let session = target.split_once(':').map(|(s, _)| s).unwrap_or("");
+    let window = target.rsplit_once('.').map(|(w, _)| w).unwrap_or(target);
     if !session.is_empty() {
         Command::new("tmux")
             .args(["switch-client", "-t", session])
             .status()?;
     }
+    Command::new("tmux")
+        .args(["select-window", "-t", window])
+        .status()?;
     Command::new("tmux")
         .args(["select-pane", "-t", target])
         .status()?;
