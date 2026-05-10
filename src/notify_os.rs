@@ -15,34 +15,22 @@ use crate::models::{AttentionState, Session};
 /// macOS 14+. Falls back to `osascript display notification` (display-only,
 /// no click action). `terminal-notifier` was tried earlier but its
 /// `-execute` callback was silently broken on recent macOS.
-pub fn alert(session: &Session, cfg: &Config) {
+pub fn alert(session: &Session, cfg: &Config, phone_push: bool) {
     let title = match session.state {
         AttentionState::Blocked => "needs your input",
         AttentionState::Error => "error",
         _ => return,
     };
-    let label = session
-        .name
-        .clone()
-        .or_else(|| {
-            session
-                .cwd
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "session".to_string());
-    let preview = session
-        .headline
-        .as_deref()
-        .or(session.last_prompt.as_deref())
-        .map(|s| s.replace('\n', " "))
-        .map(|s| s.chars().take(140).collect::<String>())
-        .unwrap_or_default();
+    let label = session_label(session);
+    let preview = session_preview(session);
 
     // Phone push (ntfy). Body deliberately minimal — `<label> · <state>` —
     // so the publish target (whoever can read the topic) doesn't see prompt
-    // contents. See specs/notify-self-host.md.
-    if let Some(ntfy) = cfg.ntfy.as_ref() {
+    // contents. See specs/notify-self-host.md. Suppressed when `phone_push`
+    // is false — caller (refresh) sets this to defer Blocked transitions
+    // through the auditor when auto-mode is on; phone fires later only on
+    // a `WAIT` verdict via `push_to_phone`.
+    if phone_push && let Some(ntfy) = cfg.ntfy.as_ref() {
         ntfy_push(ntfy, &label, title);
     }
 
@@ -51,6 +39,46 @@ pub fn alert(session: &Session, cfg: &Config) {
         return;
     }
     send_via_osascript(title, &label, &preview);
+}
+
+/// Phone-only push. Used by the auto-mode WAIT path: triage deferred the
+/// phone push when the session went Blocked under auto-mode (the auditor
+/// might've handled it silently); now that the verdict is WAIT, surface the
+/// session to the phone. Desktop notification has already fired from the
+/// original `alert()` call.
+pub fn push_to_phone(session: &Session, cfg: &Config) {
+    let title = match session.state {
+        AttentionState::Blocked => "needs your input",
+        AttentionState::Error => "error",
+        _ => return,
+    };
+    let label = session_label(session);
+    if let Some(ntfy) = cfg.ntfy.as_ref() {
+        ntfy_push(ntfy, &label, title);
+    }
+}
+
+fn session_label(session: &Session) -> String {
+    session
+        .name
+        .clone()
+        .or_else(|| {
+            session
+                .cwd
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "session".to_string())
+}
+
+fn session_preview(session: &Session) -> String {
+    session
+        .headline
+        .as_deref()
+        .or(session.last_prompt.as_deref())
+        .map(|s| s.replace('\n', " "))
+        .map(|s| s.chars().take(140).collect::<String>())
+        .unwrap_or_default()
 }
 
 fn ntfy_push(ntfy: &NtfyConfig, label: &str, state: &str) {

@@ -500,7 +500,14 @@ fn refresh(app: &mut AppState) {
         if prev == Some(s.state) {
             continue;
         }
-        notify_os::alert(s, &app.config);
+        // Defer phone push for Blocked transitions when auto-mode is on:
+        // the auditor will likely route the prompt without user action,
+        // and a phone buzz that resolves itself a few seconds later is
+        // noise. Phone push fires later only if the auditor returns WAIT
+        // (see `drive_autonomous` verdict drain). Error transitions still
+        // fire phone immediately — no auditor involvement on Error.
+        let phone_push = !(app.autonomous && s.state == models::AttentionState::Blocked);
+        notify_os::alert(s, &app.config, phone_push);
     }
     app.last_states = sessions.iter().map(|s| (s.pid, s.state)).collect();
 
@@ -576,6 +583,15 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
             "auditor {}: pid {} ({})",
             v.decision, v.pid, v.tool_name
         ));
+        // Phone push for the WAIT verdict — this is the case the user
+        // actually needs to act on. APPROVE/DENY were handled by the
+        // auditor's hook routing, so a phone buzz would be noise. The
+        // original `notify_os::alert` call from refresh() already fired
+        // the desktop notification with `phone_push=false`; this is the
+        // deferred phone fan-out.
+        if v.decision == "WAIT" {
+            notify_os::push_to_phone(s, &app.config);
+        }
     }
 
     if !app.autonomous {
