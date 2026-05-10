@@ -133,6 +133,29 @@ pub fn attach_if_alive(zoom: bool) -> std::io::Result<bool> {
     Ok(false)
 }
 
+/// Width of the *calling tmux client* in columns. Different from the
+/// triage pane's `area.width` (ratatui) — that one reflects the pane
+/// subset, which a split-screen layout can shrink even on a desktop
+/// terminal. Client width is the actual terminal/device dimension we want
+/// for "is the user on a narrow device?" auto-zoom decisions: laptop
+/// fullscreen tmux is 200+ regardless of pane layout, iPad portrait is
+/// ~120, iPhone is ~30–80.
+///
+/// When triage is invoked from a tmux client (the normal case), tmux's
+/// `display-message` resolves the calling client via `TMUX_PANE` →
+/// containing window → most-recently-active client. Returns None outside
+/// tmux or if the query fails.
+pub fn current_client_width() -> Option<u16> {
+    let out = Command::new("tmux")
+        .args(["display-message", "-p", "#{client_width}"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
 pub fn jump_to_self(zoom: bool) -> std::io::Result<()> {
     let panes = list_panes();
     let cmd = if zoom { "triage --zoom-on-jump" } else { "triage" };

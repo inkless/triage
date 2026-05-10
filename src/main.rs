@@ -398,6 +398,14 @@ fn deliver_deny(app: &AppState) -> String {
 }
 
 fn refresh(app: &mut AppState) {
+    // Cache calling client's width once per tick — `should_zoom_on_jump`
+    // reads this to decide whether to auto-zoom on Enter. Cheap (single
+    // tmux subprocess). Falls to 0 outside tmux; that disables auto-zoom,
+    // leaving the explicit --zoom-on-jump / --exit-on-jump flags as the
+    // only zoom path. See specs/notify-self-host.md context for why pane
+    // width was wrong (laptop split-screen produces narrow pane on a
+    // wide-client terminal).
+    app.last_client_width = tmux::current_client_width().unwrap_or(0);
     let mut sessions = discovery::discover_live_sessions();
     let panes = tmux::list_panes();
 

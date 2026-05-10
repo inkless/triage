@@ -85,12 +85,16 @@ pub struct AppState {
     /// to phone-narrow) get the right behavior automatically. The flag is
     /// for "I want zoom even on a wide pane" overrides.
     pub zoom_on_jump: bool,
-    /// Most recent table-area width from ratatui's draw cycle. Auto-detect
-    /// signal for "the user is currently on a narrow client (mobile)" —
-    /// tmux panes resize to the smallest attached client, so the rendering
-    /// width reflects the device that's actively viewing this pane. Read
-    /// at Enter time to decide whether to zoom.
+    /// Most recent table-area width from ratatui's draw cycle. Just for the
+    /// header indicator — NOT the auto-zoom signal anymore (laptop split-
+    /// screen makes pane width narrow even on a desktop terminal). See
+    /// `last_client_width` for the actual zoom decision.
     pub last_pane_width: u16,
+    /// Most recent tmux `client_width` reading. This is the actual
+    /// terminal/device width, not the pane subset. Refreshed once per
+    /// `refresh()` tick (cheap — single tmux subprocess). Zero when not
+    /// in tmux or query failed.
+    pub last_client_width: u16,
     /// Loaded once at startup (config file + env overrides). Read-only
     /// after this point.
     pub config: Config,
@@ -127,6 +131,7 @@ impl AppState {
             exit_on_jump: false,
             zoom_on_jump: false,
             last_pane_width: 0,
+            last_client_width: 0,
             config: Config::default(),
         }
     }
@@ -190,8 +195,8 @@ impl AppState {
     pub fn should_zoom_on_jump(&self) -> bool {
         self.exit_on_jump
             || self.zoom_on_jump
-            || (self.last_pane_width > 0
-                && self.last_pane_width < self.config.thresholds.mobile_width)
+            || (self.last_client_width > 0
+                && self.last_client_width < self.config.thresholds.mobile_width)
     }
 
     pub fn visible(&self) -> Vec<&Session> {
@@ -305,7 +310,17 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
     // Show pane width inline + a `zoom` indicator when auto-detect is active,
     // so it's obvious whether Enter will zoom on the current device.
     let zoom_marker = if app.should_zoom_on_jump() { " · zoom" } else { "" };
-    let dims = format!("{}cols{}", app.last_pane_width, zoom_marker);
+    // Show pane width (left, what ratatui drew into) and client width
+    // (right, what tmux says the terminal is). The client width drives
+    // auto-zoom; pane being narrow alone doesn't.
+    let dims = if app.last_client_width > 0 && app.last_client_width != app.last_pane_width {
+        format!(
+            "{}cols (pane) / {}cols (client){zoom_marker}",
+            app.last_pane_width, app.last_client_width
+        )
+    } else {
+        format!("{}cols{zoom_marker}", app.last_pane_width)
+    };
     let line = Line::from(vec![
         Span::styled("triage", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("   "),
