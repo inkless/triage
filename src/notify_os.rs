@@ -130,18 +130,30 @@ fn send_via_triage_notify(
         let session_name = pane.tmux_session.as_str();
         let activate_cmd = detected_terminal_bundle(cfg)
             .map(|bundle| {
-                // AppleScript needs DOUBLE quotes around the bundle ID
-                // (string literal); the entire AppleScript expression then
-                // needs SINGLE quotes for /bin/sh -c.
-                let applescript = format!(
-                    "tell application id {} to activate",
-                    applescript_string(bundle)
-                );
-                format!("/usr/bin/osascript -e {} && ", shell_quote(&applescript))
+                // Use LaunchServices (`open -b <bundle>`) rather than
+                // `osascript -e 'tell application id ... to activate'`.
+                // AppleScript activate is unreliable for terminals without a
+                // scripting suite (kitty, ghostty): osascript exits 0 but
+                // the app does not come forward, and on some macOS configs
+                // Script Editor pops as a fallback handler. `open -b` goes
+                // through LaunchServices directly and reliably foregrounds
+                // the bundle.
+                format!("/usr/bin/open -b {} && ", shell_quote(bundle))
             })
             .unwrap_or_default();
+        // `unset TMUX`: macOS launches the response-mode helper outside any
+        // tmux client, and the inherited env can carry a broken `TMUX` value
+        // (observed: `/opt/homebrew/bin/tmux` — the binary path, not a
+        // socket path). When set, tmux honors it as the socket and fails
+        // with "Socket operation on non-socket". Clearing it makes tmux
+        // fall back to its default `/tmp/tmux-$UID/default` socket, which
+        // is what the user's running server listens on.
+        //
+        // `switch-client` with no `-c` targets "the most recently used
+        // client" — which is what we want, since `open -b` brings the
+        // user's terminal-and-its-tmux-client to the foreground.
         let action = format!(
-            "{activate}{tmux} switch-client -t {session} && {tmux} select-pane -t {target}",
+            "unset TMUX; {activate}{tmux} switch-client -t {session} && {tmux} select-pane -t {target}",
             activate = activate_cmd,
             tmux = shell_quote(tmux),
             session = shell_quote(session_name),
