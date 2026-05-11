@@ -1,3 +1,4 @@
+use std::io::{self, Read};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::thread;
@@ -79,6 +80,95 @@ fn session_preview(session: &Session) -> String {
         .map(|s| s.replace('\n', " "))
         .map(|s| s.chars().take(140).collect::<String>())
         .unwrap_or_default()
+}
+
+/// One-shot CLI entry: `triage notify [--title T] [--tags T] <message...>`.
+///
+/// Unlike the in-TUI `ntfy_push` which fire-and-forgets, this blocks on curl
+/// so the calling process (agent, hook, script) gets a real exit status. The
+/// 5-second timeout still bounds it.
+///
+/// Errors are reported to stderr; the function returns a non-zero `io::Error`
+/// on any failure (missing config, empty message, curl non-zero, curl missing).
+pub fn cli_notify(args: &[String]) -> io::Result<()> {
+    let mut title: Option<String> = None;
+    let mut tags: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--title" => {
+                title = Some(args.get(i + 1).cloned().ok_or_else(|| {
+                    io::Error::other("--title needs a value")
+                })?);
+                i += 2;
+            }
+            "--tags" => {
+                tags = Some(args.get(i + 1).cloned().ok_or_else(|| {
+                    io::Error::other("--tags needs a value")
+                })?);
+                i += 2;
+            }
+            _ => {
+                positional.push(args[i].clone());
+                i += 1;
+            }
+        }
+    }
+
+    // Stdin convention: a single positional `-` reads the message from stdin.
+    // Multiline output is preserved (we only trim trailing newline so
+    // `echo` / heredocs feel natural).
+    let message = if positional.len() == 1 && positional[0] == "-" {
+        let mut buf = String::new();
+        io::stdin().read_to_string(&mut buf)?;
+        buf.trim_end_matches('\n').to_string()
+    } else {
+        positional.join(" ")
+    };
+
+    if message.is_empty() {
+        return Err(io::Error::other(
+            "usage: triage notify [--title T] [--tags T] <message...>",
+        ));
+    }
+
+    let cfg = Config::load();
+    let ntfy = cfg.ntfy.as_ref().ok_or_else(|| {
+        io::Error::other(
+            "ntfy not configured. Add an [ntfy] block with `url=` (and optional \
+             `user=`/`token=`) to ~/.config/triage/config.toml.",
+        )
+    })?;
+
+    let title = title.as_deref().unwrap_or("triage agent");
+    let tags = tags.as_deref().unwrap_or("information");
+
+    let mut cmd = Command::new("curl");
+    cmd.args(["-fsSL", "-m", "5", "-X", "POST"]);
+    if let (Some(user), Some(token)) = (ntfy.user.as_deref(), ntfy.token.as_deref()) {
+        cmd.arg("-u").arg(format!("{user}:{token}"));
+    }
+    cmd.arg("-H").arg(format!("Title: {title}"));
+    cmd.arg("-H").arg(format!("Tags: {tags}"));
+    cmd.args(["-d", &message]);
+    cmd.arg(&ntfy.url);
+
+    let status = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|e| io::Error::other(format!("failed to invoke curl: {e}")))?;
+    if !status.success() {
+        return Err(io::Error::other(format!(
+            "curl exited {} posting to {}",
+            status.code().unwrap_or(-1),
+            ntfy.url,
+        )));
+    }
+    Ok(())
 }
 
 fn ntfy_push(ntfy: &NtfyConfig, label: &str, state: &str) {

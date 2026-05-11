@@ -34,6 +34,13 @@ const WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    // One-shot subcommand: `triage notify [flags] <message...>` posts to
+    // ntfy using the config's [ntfy] block. Detected by positional argv[1]
+    // (not a flag) so it doesn't collide with `--notify` style flags
+    // elsewhere. Blocking call; exit status reflects curl outcome.
+    if args.get(1).map(String::as_str) == Some("notify") {
+        return notify_os::cli_notify(&args[2..]);
+    }
     if args.iter().any(|a| a == "--probe") {
         return probe();
     }

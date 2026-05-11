@@ -16,7 +16,18 @@ Different shape from [`agentop`](https://crates.io/crates/agentop) (process-cent
 cargo install --path .
 triage              # launch the TUI
 triage --probe      # print the joined session table once (no TUI)
+triage notify "..." # one-shot ntfy push using config.toml's [ntfy] block
 ```
+
+The `notify` subcommand lets any agent, hook, or shell script ping the user's phone without re-implementing ntfy auth:
+
+```bash
+triage notify "build green on PR #123"                   # positional
+triage notify --title "deploy done" "all stage smoke ok" # title override
+git log --oneline -3 | triage notify --title "shipped" - # stdin
+```
+
+Blocks until curl confirms the POST (5s timeout); exit status reflects the outcome. Requires an `[ntfy]` block in `~/.config/triage/config.toml` (see [Configuration](#configuration)).
 
 `cargo build` auto-builds the macOS notification helper (`triage-notify.app`) under `scripts/triage-notify/` via `build.rs`. Without it, desktop notifications still appear (via `osascript` fallback) but the click-to-jump action is lost — clicking does nothing. Build manually if needed:
 
