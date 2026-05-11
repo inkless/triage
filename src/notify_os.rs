@@ -394,23 +394,34 @@ fn command_of(pid: u32) -> Option<String> {
 
 /// Locate the `triage-notify.app` bundle. Returns the `.app` directory
 /// (not the binary inside) — we hand this to `open -na` for proper
-/// LaunchServices registration. Searches relative to the running triage
-/// binary: workspace `scripts/` (cargo build context), sibling `scripts/`
-/// (`cargo install --root .`), or a sibling `.app` (manual install).
+/// LaunchServices registration.
+///
+/// Searches `~/.config/triage/` first (where `build.rs` stages a copy on
+/// every `cargo build` / `cargo install` — this is the path the
+/// cargo-installed binary at `~/.cargo/bin/triage` relies on), then a few
+/// fallbacks relative to the running binary so dev / manual installs
+/// continue to work.
 fn triage_notify_path() -> Option<&'static str> {
     static CACHED: OnceLock<Option<String>> = OnceLock::new();
     CACHED
         .get_or_init(|| {
+            let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+            // User XDG-style location populated by build.rs. First priority
+            // because it's stable across binary location (cargo-install vs
+            // workspace) and tracks the most recently built helper.
+            if let Some(home) = std::env::var_os("HOME") {
+                candidates.push(
+                    std::path::PathBuf::from(home).join(".config/triage/triage-notify.app"),
+                );
+            }
             let exe = std::env::current_exe().ok()?;
             let exe_dir = exe.parent()?;
-            let candidates = [
-                // Workspace layout: target/release/triage → ../../scripts/...
-                exe_dir.join("../../scripts/triage-notify/triage-notify.app"),
-                // Sibling layout: <prefix>/bin/triage → <prefix>/scripts/...
-                exe_dir.join("../scripts/triage-notify/triage-notify.app"),
-                // Same-dir layout
-                exe_dir.join("triage-notify.app"),
-            ];
+            // Workspace layout: target/release/triage → ../../scripts/...
+            candidates.push(exe_dir.join("../../scripts/triage-notify/triage-notify.app"));
+            // Sibling layout: <prefix>/bin/triage → <prefix>/scripts/...
+            candidates.push(exe_dir.join("../scripts/triage-notify/triage-notify.app"));
+            // Same-dir layout
+            candidates.push(exe_dir.join("triage-notify.app"));
             for c in &candidates {
                 if let Ok(p) = c.canonicalize()
                     && p.is_dir()

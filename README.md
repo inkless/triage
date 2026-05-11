@@ -29,7 +29,7 @@ git log --oneline -3 | triage notify --title "shipped" - # stdin
 
 Blocks until curl confirms the POST (5s timeout); exit status reflects the outcome. Requires an `[ntfy]` block in `~/.config/triage/config.toml` (see [Configuration](#configuration)).
 
-`cargo build` auto-builds the macOS notification helper (`triage-notify.app`) under `scripts/triage-notify/` via `build.rs`. Without it, desktop notifications still appear (via `osascript` fallback) but the click-to-jump action is lost — clicking does nothing. Build manually if needed:
+`cargo build` auto-builds the macOS notification helper (`triage-notify.app`) under `scripts/triage-notify/` via `build.rs`, then stages a copy to `~/.config/triage/triage-notify.app`. The staged location is what the cargo-installed binary at `~/.cargo/bin/triage` finds at runtime — without it, notifications fall back to `osascript` which shows a "Show" button that routes to Script Editor. Build manually if needed:
 
 ```bash
 bash scripts/triage-notify/build.sh
