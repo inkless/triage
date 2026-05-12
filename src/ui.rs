@@ -36,6 +36,11 @@ pub struct AppState {
     /// spawns a `claude -p` auditor for each `waiting` session and routes
     /// APPROVE/DENY through the same machinery as manual `a`/`d`.
     pub autonomous: bool,
+    /// ntfy phone push gate (T-79). Toggle with `p`. When off, app-driven
+    /// ntfy POSTs are suppressed — Mac local banners still fire. The
+    /// `triage notify` CLI (T-77) bypasses this gate (user-initiated pings
+    /// are explicit and always pass through).
+    pub phone_push_enabled: bool,
     /// Pids whose auditor is currently running, keyed to the SystemTime the
     /// worker thread was spawned. Prevents double-firing on successive refresh
     /// ticks while a verdict is in flight; the timestamp drives the
@@ -117,6 +122,7 @@ impl AppState {
             last_states: HashMap::new(),
             approval_mode: loaded.approval_mode,
             autonomous: loaded.autonomous,
+            phone_push_enabled: loaded.phone_push_enabled,
             audit_in_flight: HashMap::new(),
             audit_decided: HashSet::new(),
             audit_notes: HashMap::new(),
@@ -164,6 +170,11 @@ impl AppState {
         self.persist_state();
     }
 
+    pub fn toggle_phone_push(&mut self) {
+        self.phone_push_enabled = !self.phone_push_enabled;
+        self.persist_state();
+    }
+
     pub fn oldest_pending_uuid(&self) -> Option<String> {
         self.selected_session()
             .filter(|s| s.status == "waiting")
@@ -184,7 +195,12 @@ impl AppState {
     }
 
     pub fn persist_state(&self) {
-        persist::save_state(self.muted.iter(), self.approval_mode, self.autonomous);
+        persist::save_state(
+            self.muted.iter(),
+            self.approval_mode,
+            self.autonomous,
+            self.phone_push_enabled,
+        );
     }
 
     /// Decide whether `Enter` should zoom the destination pane. Three sources:
@@ -1215,13 +1231,21 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         } else {
             "auto:off".to_string()
         };
+        // Phone-push indicator: only shown when off (the non-default state).
+        // ON is silent — same minimalism as autonomous's "auto:off" hint.
+        // Narrow mode skips the indicator to stay under the budget.
+        let phone_off_seg = if !app.phone_push_enabled {
+            " [phone:off]"
+        } else {
+            ""
+        };
         let hint = match LayoutMode::from_width(area.width) {
             LayoutMode::Narrow => format!(" ⏎ a d n h:{mode} A:{auto} q"),
             LayoutMode::Medium => format!(
-                " ⏎ jump  n/N hop  a/d  h [{mode}]  A [{auto}]  q"
+                " ⏎ jump  n/N hop  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  q"
             ),
             LayoutMode::Wide => format!(
-                "  ⏎ jump  n/N priority  a/d approve/deny  h [{mode}]  A [{auto}]  m mute  H log  q quit"
+                "  ⏎ jump  n/N priority  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  H log  q quit"
             ),
         };
         let style = if app.autonomous {

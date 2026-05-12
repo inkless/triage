@@ -79,6 +79,7 @@ Approve / deny / mute:
   d                deny
   h                cycle approve mode: hook ↔ tmux
   A                toggle autonomous mode (off → on)
+  p                toggle ntfy phone push (on by default; Mac banners unaffected)
   m                mute / unmute selected session
 
 Audit-log overlay (only when auto mode is on):

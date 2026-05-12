@@ -35,6 +35,13 @@ struct PersistedState {
     /// Autonomous-mode toggle (T-56). Off by default; explicit opt-in only.
     #[serde(default)]
     autonomous: bool,
+    /// ntfy phone push enabled. Defaults true (preserves behavior on first
+    /// load + for existing state.json files written before this field
+    /// existed). Toggle with `p`. Gates the *app-driven* ntfy POSTs only —
+    /// the `triage notify` CLI is unaffected (user-initiated pings always
+    /// fire).
+    #[serde(default = "default_true")]
+    phone_push_enabled: bool,
     /// Tmux pane id (`%N`) of the last-running triage instance. Tombstone
     /// — kept across triage exits so `--jump-to-self` and plain `triage`
     /// can locate the previous pane and `respawn-pane` there instead of
@@ -42,6 +49,10 @@ struct PersistedState {
     /// records its own pane on startup.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_pane_id: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn state_path() -> PathBuf {
@@ -53,23 +64,27 @@ pub struct LoadedState {
     pub mutes: Vec<(MuteKey, SystemTime)>,
     pub approval_mode: ApprovalMode,
     pub autonomous: bool,
+    pub phone_push_enabled: bool,
+}
+
+impl LoadedState {
+    fn empty() -> Self {
+        Self {
+            mutes: Vec::new(),
+            approval_mode: ApprovalMode::default(),
+            autonomous: false,
+            phone_push_enabled: true,
+        }
+    }
 }
 
 pub fn load_state() -> LoadedState {
     let path = state_path();
     let Ok(bytes) = fs::read(&path) else {
-        return LoadedState {
-            mutes: Vec::new(),
-            approval_mode: ApprovalMode::default(),
-            autonomous: false,
-        };
+        return LoadedState::empty();
     };
     let Ok(state) = serde_json::from_slice::<PersistedState>(&bytes) else {
-        return LoadedState {
-            mutes: Vec::new(),
-            approval_mode: ApprovalMode::default(),
-            autonomous: false,
-        };
+        return LoadedState::empty();
     };
     let mutes = state
         .mutes
@@ -89,6 +104,7 @@ pub fn load_state() -> LoadedState {
         mutes,
         approval_mode: state.approval_mode.unwrap_or_default(),
         autonomous: state.autonomous,
+        phone_push_enabled: state.phone_push_enabled,
     }
 }
 
@@ -124,8 +140,12 @@ pub fn save_last_pane_id(pane_id: &str) {
 
 /// Best-effort save. Failures are ignored — losing prefs is annoying
 /// but not catastrophic, and we don't want IO errors to surface in the TUI.
-pub fn save_state<'a, I>(entries: I, approval_mode: ApprovalMode, autonomous: bool)
-where
+pub fn save_state<'a, I>(
+    entries: I,
+    approval_mode: ApprovalMode,
+    autonomous: bool,
+    phone_push_enabled: bool,
+) where
     I: IntoIterator<Item = (&'a MuteKey, &'a SystemTime)>,
 {
     let mutes: Vec<PersistedMute> = entries
@@ -140,8 +160,9 @@ where
         })
         .collect();
     // Read existing pane_id and preserve. The full save path is for mutes /
-    // approval-mode / autonomous; pane_id is owned by AliveGuard and we
-    // shouldn't accidentally overwrite it from this code path.
+    // approval-mode / autonomous / phone-push; pane_id is owned by
+    // AliveGuard and we shouldn't accidentally overwrite it from this code
+    // path.
     let existing_pane_id = fs::read(state_path())
         .ok()
         .and_then(|b| serde_json::from_slice::<PersistedState>(&b).ok())
@@ -150,6 +171,7 @@ where
         mutes,
         approval_mode: Some(approval_mode),
         autonomous,
+        phone_push_enabled,
         last_pane_id: existing_pane_id,
     };
     let Ok(json) = serde_json::to_vec_pretty(&state) else {

@@ -304,6 +304,13 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                 if app.autonomous { "ON" } else { "off" }
             ));
         }
+        KeyCode::Char('p') => {
+            app.toggle_phone_push();
+            app.status_msg = Some(format!(
+                "phone push: {}",
+                if app.phone_push_enabled { "ON" } else { "off" }
+            ));
+        }
         KeyCode::Char('H') => {
             if app.toggle_audit_log() {
                 app.status_msg = Some(format!(
@@ -521,7 +528,11 @@ fn refresh(app: &mut AppState) {
         // noise. Phone push fires later only if the auditor returns WAIT
         // (see `drive_autonomous` verdict drain). Error transitions still
         // fire phone immediately — no auditor involvement on Error.
-        let phone_push = !(app.autonomous && s.state == models::AttentionState::Blocked);
+        // Also gated on the user-level `phone_push_enabled` toggle (T-79):
+        // when off, never POST to ntfy regardless of state. Mac local
+        // banner still fires from `notify_os::alert` unchanged.
+        let phone_push = app.phone_push_enabled
+            && !(app.autonomous && s.state == models::AttentionState::Blocked);
         notify_os::alert(s, &app.config, phone_push);
     }
     app.last_states = sessions.iter().map(|s| (s.pid, s.state)).collect();
@@ -604,7 +615,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         // original `notify_os::alert` call from refresh() already fired
         // the desktop notification with `phone_push=false`; this is the
         // deferred phone fan-out.
-        if v.decision == "WAIT" {
+        if v.decision == "WAIT" && app.phone_push_enabled {
             notify_os::push_to_phone(s, &app.config);
         }
     }
