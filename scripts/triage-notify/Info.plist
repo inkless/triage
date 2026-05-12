@@ -10,6 +10,8 @@
   <string>triage</string>
   <key>CFBundleExecutable</key>
   <string>triage-notify</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleVersion</key>
