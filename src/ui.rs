@@ -1266,10 +1266,10 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         let hint = match LayoutMode::from_width(area.width) {
             LayoutMode::Narrow => format!(" ⏎ a d h:{mode} A:{auto} q"),
             LayoutMode::Medium => format!(
-                " ⏎ jump  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  q"
+                " ⏎ jump  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  w  q"
             ),
             LayoutMode::Wide => format!(
-                "  ⏎ jump  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  H log  q quit"
+                "  ⏎ jump  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  w watch  H log  q quit"
             ),
         };
         let style = if app.autonomous {
