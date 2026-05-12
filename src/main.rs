@@ -217,6 +217,10 @@ fn run(
 }
 
 fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
+    // `g` is the first half of a `gg` chord (jump to top); `G` jumps to
+    // bottom. Both the audit-log overlay and the main table support these
+    // (and they share `pending_g` since the two key blocks are mutually
+    // exclusive). Any non-`g` key clears the pending chord.
     // Audit-log overlay has its own input scheme: ↑↓/jk scrolls instead of
     // moving the table selection. Vim chords + half-page motion supported.
     if app.audit_log_open {
@@ -282,11 +286,24 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         return true;
     }
 
+    let was_pending_g = app.pending_g;
+    if !matches!(code, KeyCode::Char('g')) {
+        app.pending_g = false;
+    }
     match code {
         KeyCode::Char('q') => return false,
         KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
         KeyCode::Up | KeyCode::Char('k') => app.move_selection(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_selection(1),
+        KeyCode::Char('g') => {
+            if was_pending_g {
+                app.select_first();
+                app.pending_g = false;
+            } else {
+                app.pending_g = true;
+            }
+        }
+        KeyCode::Char('G') => app.select_last(),
         KeyCode::Char(' ') => app.detail_open = !app.detail_open,
         KeyCode::Char('m') => {
             app.toggle_mute_selected();
@@ -319,16 +336,6 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                 ));
             } else {
                 app.status_msg = Some("audit log unavailable — auto mode is off".to_string());
-            }
-        }
-        KeyCode::Char('n') => {
-            if !app.hop_priority(true) {
-                app.status_msg = Some("no priority rows".to_string());
-            }
-        }
-        KeyCode::Char('N') => {
-            if !app.hop_priority(false) {
-                app.status_msg = Some("no priority rows".to_string());
             }
         }
         KeyCode::Char('r') => {

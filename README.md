@@ -68,7 +68,6 @@ triage --uninstall-hooks       # remove
 ```
 General:
   ↑↓ / j k         move selection
-  n / N            hop to next / prev priority row (error / block / done)
   ⏎                jump to selected session's tmux pane
   space            toggle detail panel
   r                request manual refresh

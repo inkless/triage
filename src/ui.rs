@@ -219,45 +219,19 @@ impl AppState {
         self.sessions.iter().collect()
     }
 
-    /// `n`/`N` priority-hop target list: indices into `visible()` for sessions
-    /// whose state is in the top attention bucket (error / block / done). The
-    /// table is already sorted by priority so these will be a contiguous prefix
-    /// in practice, but we collect by predicate so a future re-sort can't break
-    /// the hop.
-    pub fn priority_indices(&self) -> Vec<usize> {
-        self.visible()
-            .iter()
-            .enumerate()
-            .filter(|(_, s)| {
-                matches!(
-                    s.state,
-                    AttentionState::Error
-                        | AttentionState::Blocked
-                        | AttentionState::JustFinished
-                )
-            })
-            .map(|(i, _)| i)
-            .collect()
+    /// Vim `gg` — jump to the first visible row.
+    pub fn select_first(&mut self) {
+        if !self.visible().is_empty() {
+            self.selected.select(Some(0));
+        }
     }
 
-    /// Move selection to the next/prev priority row, wrapping around. Returns
-    /// `false` when there are no priority rows so the caller can surface a
-    /// status-bar message instead of a silent no-op.
-    pub fn hop_priority(&mut self, forward: bool) -> bool {
-        let targets = self.priority_indices();
-        if targets.is_empty() {
-            return false;
+    /// Vim `G` — jump to the last visible row.
+    pub fn select_last(&mut self) {
+        let n = self.visible().len();
+        if n > 0 {
+            self.selected.select(Some(n - 1));
         }
-        let cur = self.selected.selected().unwrap_or(0);
-        let next = if forward {
-            // First target strictly greater than cur, else wrap to first.
-            targets.iter().copied().find(|&i| i > cur).unwrap_or(targets[0])
-        } else {
-            // Last target strictly less than cur, else wrap to last.
-            targets.iter().copied().rev().find(|&i| i < cur).unwrap_or(*targets.last().unwrap())
-        };
-        self.selected.select(Some(next));
-        true
     }
 
     pub fn selected_session(&self) -> Option<&Session> {
@@ -1240,12 +1214,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
             ""
         };
         let hint = match LayoutMode::from_width(area.width) {
-            LayoutMode::Narrow => format!(" ⏎ a d n h:{mode} A:{auto} q"),
+            LayoutMode::Narrow => format!(" ⏎ a d h:{mode} A:{auto} q"),
             LayoutMode::Medium => format!(
-                " ⏎ jump  n/N hop  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  q"
+                " ⏎ jump  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  q"
             ),
             LayoutMode::Wide => format!(
-                "  ⏎ jump  n/N priority  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  H log  q quit"
+                "  ⏎ jump  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  H log  q quit"
             ),
         };
         let style = if app.autonomous {
