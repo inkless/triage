@@ -26,6 +26,11 @@ pub struct AppState {
     /// than pid so the entries survive a triage restart and don't accidentally
     /// re-mute a recycled pid.
     pub muted: HashMap<MuteKey, SystemTime>,
+    /// In-memory set of sessions to fire a "finished" notification for on each
+    /// transition into `JustFinished` (T-81). Sticky — only the user can
+    /// clear an entry by pressing `w` again on the row. Not persisted across
+    /// restarts; a watch only makes sense while the session exists.
+    pub watched: HashSet<MuteKey>,
     /// pid → most recently observed AttentionState. Used to detect transitions
     /// (e.g. into `Blocked`) so we can fire a desktop notification once per
     /// transition rather than on every refresh while the session stays blocked.
@@ -119,6 +124,7 @@ impl AppState {
             status_msg: None,
             digest_cache: DigestCache::new(),
             muted,
+            watched: HashSet::new(),
             last_states: HashMap::new(),
             approval_mode: loaded.approval_mode,
             autonomous: loaded.autonomous,
@@ -192,6 +198,29 @@ impl AppState {
             self.muted.insert(key, SystemTime::now());
         }
         self.persist_state();
+    }
+
+    /// Toggle watch on the selected session. Returns the new state + a label
+    /// so the caller can build a status message. Watches are in-memory; no
+    /// `persist_state` call.
+    pub fn toggle_watch_selected(&mut self) -> Option<(bool, String)> {
+        let s = self.selected_session()?;
+        let key = MuteKey {
+            cwd: s.cwd.clone(),
+            started_at_ms: s.started_at_ms,
+        };
+        let label = s
+            .name
+            .clone()
+            .or_else(|| s.cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| "session".to_string());
+        let now_watching = if self.watched.remove(&key) {
+            false
+        } else {
+            self.watched.insert(key);
+            true
+        };
+        Some((now_watching, label))
     }
 
     pub fn persist_state(&self) {
@@ -490,15 +519,32 @@ fn build_row(
         LayoutMode::Narrow => format!("{session_label}  {age}  · {headline_raw}"),
         _ => headline_raw,
     };
-
     let wrapped = wrap_text(&headline_raw, headline_width, 4);
     let height = wrapped.len().max(1) as u16;
-    let headline_lines: Vec<Line> = wrapped.into_iter().map(Line::from).collect();
+    let mut headline_lines: Vec<Line> = wrapped.into_iter().map(Line::from).collect();
+    // T-81: prepend a bold cyan ● on the first line of watched rows. Span
+    // approach (vs string prefix) keeps the wrap correct and gives the
+    // marker its own color independent of row state.
+    if s.watched && !headline_lines.is_empty() {
+        let first_line = std::mem::take(&mut headline_lines[0]);
+        let mut spans = vec![Span::styled(
+            "● ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )];
+        spans.extend(first_line.spans);
+        headline_lines[0] = Line::from(spans);
+    }
 
     // Muted rows render dimmed across all columns so the user's eye skips
     // them. The state glyph still shows its label but in a muted color.
+    // Watched rows append `·w` to the state label so the user can see the
+    // arm-state in the column they're already scanning for state changes.
     let (state_label, state_color) = if s.muted {
         ("muted".to_string(), Color::DarkGray)
+    } else if s.watched {
+        (format!("{state_str}·w"), color)
     } else {
         (state_str, color)
     };
@@ -744,6 +790,10 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
     if s.muted {
         header.push(sep());
         header.push(Span::styled("[muted]", yellow()));
+    }
+    if s.watched {
+        header.push(sep());
+        header.push(Span::styled("[watch]", Style::default().fg(Color::Cyan)));
     }
     lines.push(Line::from(header));
 

@@ -42,6 +42,29 @@ pub fn alert(session: &Session, cfg: &Config, phone_push: bool) {
     send_via_osascript(title, &label, &preview);
 }
 
+/// User-armed "session finished" alert (T-81). Fired when a watched session
+/// transitions into `JustFinished`. Mirrors `alert` shape: Mac local banner
+/// via the triage-notify.app helper (with click-to-jump to the session's
+/// pane) + optional ntfy push gated on the caller-supplied `phone_push`.
+///
+/// Title is `finished` rather than `needs your input` / `error` so the
+/// banner is visually distinct from the auto-fire actionable-state alerts.
+pub fn notify_session_done(session: &Session, cfg: &Config, phone_push: bool) {
+    let title = "finished";
+    let label = session_label(session);
+    let preview = session_preview(session);
+
+    if phone_push && let Some(ntfy) = cfg.ntfy.as_ref() {
+        ntfy_push(ntfy, &label, title);
+    }
+
+    if let Some(notifier) = triage_notify_path() {
+        send_via_triage_notify(notifier, title, &label, &preview, session.pane.as_ref(), cfg);
+        return;
+    }
+    send_via_osascript(title, &label, &preview);
+}
+
 /// Phone-only push. Used by the auto-mode WAIT path: triage deferred the
 /// phone push when the session went Blocked under auto-mode (the auditor
 /// might've handled it silently); now that the verdict is WAIT, surface the

@@ -78,6 +78,10 @@ pub struct Session {
     /// True when the user has muted this session. Muted sessions still update
     /// in the background but render dimmed and sort to the bottom of the list.
     pub muted: bool,
+    /// True when the user has armed a watch on this session via `w` (T-81).
+    /// Watched sessions fire a "finished" notification on each transition
+    /// into `JustFinished` until toggled off. In-memory only — not persisted.
+    pub watched: bool,
     /// Pending tool-use approval requests captured by the hook. Newest last.
     /// These enrich the headline/detail and hook-mode `a`/`d` flow, but they
     /// are only actionable when Claude itself reports `status == "waiting"`.

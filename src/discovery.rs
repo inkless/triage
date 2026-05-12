@@ -85,6 +85,7 @@ pub fn discover_live_sessions() -> Vec<Session> {
             latest_assistant_text: None,
             state: AttentionState::Unknown,
             muted: false,
+            watched: false,
             pending_approvals: Vec::new(),
         });
     }

@@ -308,6 +308,16 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         KeyCode::Char('m') => {
             app.toggle_mute_selected();
         }
+        KeyCode::Char('w') => {
+            if let Some((now_watching, label)) = app.toggle_watch_selected() {
+                app.status_msg = Some(format!(
+                    "{}: {label}",
+                    if now_watching { "watching" } else { "unwatched" }
+                ));
+            } else {
+                app.status_msg = Some("no session selected".to_string());
+            }
+        }
         KeyCode::Char('a') => app.status_msg = Some(deliver_approve(app)),
         KeyCode::Char('d') => app.status_msg = Some(deliver_deny(app)),
         KeyCode::Char('h') => {
@@ -495,6 +505,7 @@ fn refresh(app: &mut AppState) {
             started_at_ms: s.started_at_ms,
         };
         s.muted = app.muted.contains_key(&key);
+        s.watched = app.watched.contains(&key);
     }
     if app.muted.len() != mute_count_before {
         app.persist_state();
@@ -541,6 +552,23 @@ fn refresh(app: &mut AppState) {
         let phone_push = app.phone_push_enabled
             && !(app.autonomous && s.state == models::AttentionState::Blocked);
         notify_os::alert(s, &app.config, phone_push);
+    }
+    // T-81 watch fire: any watched session that just transitioned into
+    // `JustFinished` gets a "finished" banner (Mac local + ntfy gated on the
+    // phone toggle). Watch is sticky — we deliberately do NOT remove from
+    // `app.watched`; the user clears it with `w` when they're done.
+    for s in &sessions {
+        if !s.watched {
+            continue;
+        }
+        if s.state != models::AttentionState::JustFinished {
+            continue;
+        }
+        let prev = app.last_states.get(&s.pid).copied();
+        if prev == Some(models::AttentionState::JustFinished) {
+            continue;
+        }
+        notify_os::notify_session_done(s, &app.config, app.phone_push_enabled);
     }
     app.last_states = sessions.iter().map(|s| (s.pid, s.state)).collect();
 

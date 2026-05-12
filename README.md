@@ -73,13 +73,14 @@ General:
   r                request manual refresh
   q / Ctrl-C       quit
 
-Approve / deny / mute:
+Approve / deny / mute / watch:
   a                approve (selected session must be paused on a permission prompt)
   d                deny
   h                cycle approve mode: hook ↔ tmux
   A                toggle autonomous mode (off → on)
   p                toggle ntfy phone push (on by default; Mac banners unaffected)
   m                mute / unmute selected session
+  w                watch / unwatch selected session — sticky; fires a "finished" banner on every work → done transition until toggled off
 
 Audit-log overlay (only when auto mode is on):
   H                open / close
