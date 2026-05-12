@@ -176,14 +176,45 @@ pub fn assign_transcripts(sessions: &mut [Session], cache: &mut DigestCache) {
             jsonls.push((mtime, user_ts, path));
         }
 
-        // Active session in this cwd, if any. There is at most one active
-        // pane per attached tmux client.
+        // PASS 1 — sessionId direct match (TRI-83). The canonical pointer
+        // from session → transcript lives in `Session.session_id`. When two
+        // sessions share a cwd, this is the only reliable signal; the
+        // greedy step below uses sessions-JSON `updatedAt` which lags 30+
+        // min on idle Claude processes and can mis-pair freshly-typed
+        // sessions to the wrong row. We do this before the active-pane
+        // step so that an active pane whose sessionId still points at its
+        // own (slightly older) transcript doesn't accidentally steal a
+        // peer's freshest jsonl.
+        let mut matched: Vec<usize> = Vec::new();
+        for (pos, &si) in idxs.iter().enumerate() {
+            let sid = &sessions[si].session_id;
+            if sid.is_empty() {
+                continue;
+            }
+            let target_name = format!("{sid}.jsonl");
+            if let Some(j) = jsonls
+                .iter()
+                .position(|(_, _, p)| p.file_name().map(|f| f == target_name.as_str()).unwrap_or(false))
+            {
+                let (_, _, path) = jsonls.swap_remove(j);
+                sessions[si].transcript_path = Some(path);
+                matched.push(pos);
+            }
+        }
+        // Drop matched indices from `idxs` (descending so swap_remove is
+        // safe).
+        matched.sort_unstable();
+        for pos in matched.into_iter().rev() {
+            idxs.swap_remove(pos);
+        }
+
+        // PASS 2 — active pane gets the jsonl with newest last-user-text.
+        // Only runs for sessions still unmatched after pass 1.
         let active_idx = idxs
             .iter()
             .position(|&i| sessions[i].pane.as_ref().is_some_and(|p| p.active));
 
         if let (Some(pos), false) = (active_idx, jsonls.is_empty()) {
-            // Active pane gets the jsonl with newest last-user-text.
             let pick = jsonls
                 .iter()
                 .enumerate()
@@ -196,7 +227,9 @@ pub fn assign_transcripts(sessions: &mut [Session], cache: &mut DigestCache) {
             }
         }
 
-        // Remaining sessions: greedy by updatedAt DESC against mtime DESC.
+        // PASS 3 — greedy fallback for any remaining sessions whose
+        // sessionId was stale (post-`/clear` is the documented case).
+        // Pair by updatedAt DESC against mtime DESC.
         jsonls.sort_by(|a, b| b.0.cmp(&a.0));
         idxs.sort_by_key(|&i| std::cmp::Reverse(sessions[i].updated_at_ms));
         for (k, &si) in idxs.iter().enumerate() {
