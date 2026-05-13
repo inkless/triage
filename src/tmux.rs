@@ -12,7 +12,7 @@ pub fn list_panes() -> HashMap<u32, Pane> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}|#{window_index}.#{pane_index}|#{pane_pid}|#{pane_tty}|#{pane_current_command}|#{pane_current_path}|#{?pane_active,1,0}|#{pane_id}",
+            "#{session_name}|#{window_index}.#{pane_index}|#{pane_pid}|#{pane_tty}|#{pane_current_command}|#{pane_current_path}|#{?pane_active,1,0}|#{pane_id}|#{window_name}",
         ])
         .output();
     let Ok(out) = out else { return map };
@@ -21,8 +21,10 @@ pub fn list_panes() -> HashMap<u32, Pane> {
     }
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
-        let parts: Vec<&str> = line.splitn(8, '|').collect();
-        if parts.len() < 8 {
+        // splitn(9, …) keeps any embedded `|` in the window_name itself in
+        // the final slot — pane_id (slot 7) never contains `|`.
+        let parts: Vec<&str> = line.splitn(9, '|').collect();
+        if parts.len() < 9 {
             continue;
         }
         let Ok(pid) = parts[2].parse::<u32>() else {
@@ -38,6 +40,7 @@ pub fn list_panes() -> HashMap<u32, Pane> {
             Pane {
                 target: format!("{}:{}", parts[0], parts[1]),
                 tmux_session: parts[0].to_string(),
+                window_name: parts[8].to_string(),
                 pane_id: parts[7].to_string(),
                 pid,
                 tty: parts[3].to_string(),

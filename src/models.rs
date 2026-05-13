@@ -10,6 +10,13 @@ pub struct Pane {
     /// `#{session_name}` portion of `target`. Split out here so consumers
     /// (UI, notify, jump) don't all re-parse the same colon-separated string.
     pub tmux_session: String,
+    /// `#{window_name}` for the containing window. Used as a label fallback
+    /// when a Claude session was launched without `--name`/`/rename` — the
+    /// user-set window name is the closest signal of intent. Beware
+    /// `automatic-rename`: when on, tmux sets the window name to the
+    /// foreground command. Consumers should skip names that equal
+    /// `current_command` or look like terminal-emitted tab IDs (`2.1.139`).
+    pub window_name: String,
     /// Tmux's permanent unique ID for this pane (e.g. `%42`). Unlike
     /// `target`, this is immutable for the pane's lifetime — survives
     /// `renumber-windows`, `move-window`, etc. Used as the stable handle

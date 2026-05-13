@@ -261,6 +261,7 @@ impl AppState {
         let label = s
             .name
             .clone()
+            .or_else(|| s.pane.as_ref().and_then(useful_window_name))
             .or_else(|| s.cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| "session".to_string());
         let now_watching = if self.watched.remove(&key) {
@@ -520,12 +521,15 @@ fn build_row(
         .unwrap_or_else(|| "—".to_string());
 
     // Order: Claude `/rename` (most deliberate, session-specific) → tmux
-    // session name (workspace label the user actively chose) → cwd basename
-    // (default). Tmux's auto-assigned numeric names ("0", "1", …) are skipped
-    // because they're worse than the cwd basename for telling rows apart.
+    // window name (user-set per-window label) → tmux session name
+    // (workspace-level) → cwd basename (default). Numeric tmux session
+    // names ("0", "1", …) and auto-renamed window names (==current_command,
+    // or terminal tab IDs like `2.1.139`) are skipped because they tell
+    // rows apart worse than the cwd basename.
     let session_label = s
         .name
         .clone()
+        .or_else(|| s.pane.as_ref().and_then(useful_window_name))
         .or_else(|| {
             s.pane
                 .as_ref()
@@ -1547,4 +1551,25 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         Line::from(Span::styled(hint, style))
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+/// Return `Pane.window_name` only when it carries user intent. Skip when:
+/// - empty
+/// - tmux's automatic-rename has set it to the foreground command
+///   (window_name == current_command) — `nvim`, `fish`, `claude`, etc.
+/// - it's a terminal-emitted tab ID like `2.1.139` (all chars are digits or
+///   dots). These show up under iTerm/Kitty / some shell prompts when the
+///   user hasn't named the window themselves.
+fn useful_window_name(pane: &crate::models::Pane) -> Option<String> {
+    let name = pane.window_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if name == pane.current_command {
+        return None;
+    }
+    if name.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    Some(name.to_string())
 }
