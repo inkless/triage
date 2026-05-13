@@ -2,6 +2,7 @@ mod approval;
 mod auditor;
 mod classifier;
 mod config;
+mod cost_rollup;
 mod discovery;
 mod models;
 mod notify_os;
@@ -40,6 +41,11 @@ fn main() -> io::Result<()> {
     // elsewhere. Blocking call; exit status reflects curl outcome.
     if args.get(1).map(String::as_str) == Some("notify") {
         return notify_os::cli_notify(&args[2..]);
+    }
+    // `triage cost [flags]` — daily/weekly Claude spend across all
+    // sessions on disk. One-shot scan; no persistence. See cost_rollup.rs.
+    if args.get(1).map(String::as_str) == Some("cost") {
+        return cost_rollup::cli_cost(&args[2..]);
     }
     if args.iter().any(|a| a == "--probe") {
         return probe();
@@ -223,6 +229,54 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
     // exclusive). Any non-`g` key clears the pending chord.
     // Audit-log overlay has its own input scheme: ↑↓/jk scrolls instead of
     // moving the table selection. Vim chords + half-page motion supported.
+    if app.cost_overlay_open {
+        let was_pending_g = app.pending_g;
+        if !matches!(code, KeyCode::Char('g')) {
+            app.pending_g = false;
+        }
+        match code {
+            KeyCode::Char('q') => return false,
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Char('$') | KeyCode::Esc => {
+                app.cost_overlay_open = false;
+                app.cost_overlay_offset = 0;
+                app.pending_g = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.cost_overlay_offset = app.cost_overlay_offset.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                app.cost_overlay_offset = app.cost_overlay_offset.saturating_add(1);
+            }
+            KeyCode::PageUp => {
+                app.cost_overlay_offset = app.cost_overlay_offset.saturating_sub(10);
+            }
+            KeyCode::PageDown => {
+                app.cost_overlay_offset = app.cost_overlay_offset.saturating_add(10);
+            }
+            KeyCode::Char('d') if mods.contains(KeyModifiers::CONTROL) => {
+                app.cost_overlay_offset = app.cost_overlay_offset.saturating_add(10);
+            }
+            KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+                app.cost_overlay_offset = app.cost_overlay_offset.saturating_sub(10);
+            }
+            KeyCode::Char('g') => {
+                if was_pending_g {
+                    app.cost_overlay_offset = 0;
+                    app.pending_g = false;
+                } else {
+                    app.pending_g = true;
+                }
+            }
+            KeyCode::Char('G') => {
+                app.cost_overlay_offset = u16::MAX;
+            }
+            KeyCode::Home => app.cost_overlay_offset = 0,
+            KeyCode::End => app.cost_overlay_offset = u16::MAX,
+            _ => {}
+        }
+        return true;
+    }
     if app.audit_log_open {
         // `g` is special — it might be the first half of a `gg` chord, OR a
         // standalone half-page-down (`Ctrl-d` shape) on its own. We use `gg`
@@ -347,6 +401,13 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             } else {
                 app.status_msg = Some("audit log unavailable — auto mode is off".to_string());
             }
+        }
+        KeyCode::Char('$') => {
+            app.toggle_cost_overlay();
+            app.status_msg = Some(format!(
+                "cost overlay {}",
+                if app.cost_overlay_open { "open" } else { "closed" }
+            ));
         }
         KeyCode::Char('r') => {
             app.status_msg = Some("refreshing…".to_string());

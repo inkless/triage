@@ -81,6 +81,13 @@ pub struct AppState {
     /// re-parsing the whole JSONL on every draw — most draws happen with
     /// no new audit, so the cache hit rate is high.
     pub audit_log_cache: Option<(SystemTime, u64, Vec<serde_json::Value>)>,
+    /// `$` overlay state — daily/weekly cost rollup across all sessions.
+    /// Computed lazily on open + cached for `COST_OVERLAY_TTL` (60s) so
+    /// re-opens within the same minute don't re-walk ~/.claude/projects.
+    pub cost_overlay_open: bool,
+    pub cost_overlay_offset: u16,
+    pub cost_overlay_total_lines: u16,
+    pub cost_cache: Option<(SystemTime, crate::cost_rollup::Rollup)>,
     /// When true, triage exits cleanly after a successful `Enter` jump. Set
     /// by `--exit-on-jump`. Designed for the tmux popup launch pattern: the
     /// popup closes when triage exits, so a single keypress (`Enter`) both
@@ -140,12 +147,54 @@ impl AppState {
             audit_log_total_lines: 0,
             pending_g: false,
             audit_log_cache: None,
+            cost_overlay_open: false,
+            cost_overlay_offset: 0,
+            cost_overlay_total_lines: 0,
+            cost_cache: None,
             exit_on_jump: false,
             zoom_on_jump: false,
             last_pane_width: 0,
             last_client_width: 0,
             config: Config::default(),
         }
+    }
+
+    /// Open / close the `$` cost overlay. Always succeeds — unlike the audit
+    /// log there's no on/off prerequisite (every user has historical
+    /// transcripts). On open, drops the scroll offset and warms the cache if
+    /// it's stale.
+    pub fn toggle_cost_overlay(&mut self) {
+        self.cost_overlay_open = !self.cost_overlay_open;
+        if !self.cost_overlay_open {
+            self.cost_overlay_offset = 0;
+            self.pending_g = false;
+            return;
+        }
+        // Opening: clear scroll + invalidate stale cache so the open shows
+        // fresh data. The actual scan happens lazily in `cost_rollup_cached`
+        // on the next draw — keeps the keypress non-blocking.
+        self.cost_overlay_offset = 0;
+        self.pending_g = false;
+        const TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        let fresh = self
+            .cost_cache
+            .as_ref()
+            .and_then(|(t, _)| SystemTime::now().duration_since(*t).ok())
+            .is_some_and(|age| age < TTL);
+        if !fresh {
+            self.cost_cache = None;
+        }
+    }
+
+    /// Return the cached rollup, computing one if missing. Called from the
+    /// overlay draw path; the first draw after `toggle_cost_overlay` opens
+    /// the overlay pays the scan cost (~hundreds of ms in release).
+    pub fn cost_rollup_cached(&mut self) -> &crate::cost_rollup::Rollup {
+        if self.cost_cache.is_none() {
+            let r = crate::cost_rollup::compute_rollup();
+            self.cost_cache = Some((SystemTime::now(), r));
+        }
+        &self.cost_cache.as_ref().unwrap().1
     }
 
     pub fn toggle_audit_log(&mut self) -> bool {
@@ -302,6 +351,16 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
         draw_audit_log(f, chunks[1], app, now);
         // draw_footer borrows app immutably — clone the small bits we need
         // and let it run after draw_audit_log writes back its line count.
+        draw_footer(f, chunks[2], app);
+        return;
+    }
+    if app.cost_overlay_open {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)])
+            .split(f.area());
+        draw_header(f, chunks[0], app);
+        draw_cost_overlay(f, chunks[1], app);
         draw_footer(f, chunks[2], app);
         return;
     }
@@ -1228,12 +1287,220 @@ fn draw_audit_log(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime
     f.render_widget(para, area);
 }
 
+fn draw_cost_overlay(f: &mut Frame, area: Rect, app: &mut AppState) {
+    use crate::cost_rollup::{format_usd, short_cwd};
+    let dim = || Style::default().fg(Color::DarkGray);
+    let bold = || Style::default().add_modifier(Modifier::BOLD);
+
+    // Pull the cached rollup (computes once per overlay-open within the TTL).
+    // Clone the few small bits we render so the borrow ends before we touch
+    // `app` again to write back total_lines.
+    let r = app.cost_rollup_cached();
+    let (
+        total_today,
+        total_7d,
+        total_30d,
+        total_all,
+        scanned_files,
+        scan_duration_ms,
+        today_label,
+        days,
+        cwds,
+        models,
+    ) = (
+        r.total_today,
+        r.total_7d,
+        r.total_30d,
+        r.total_all,
+        r.scanned_files,
+        r.scan_duration_ms,
+        r.today.format(),
+        r.days.clone(),
+        r.cwds.clone(),
+        r.models.clone(),
+    );
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // Headline totals — biggest fonts (relative), one per row.
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("today  ", dim()),
+        Span::styled(format_usd(total_today), bold().fg(Color::Green)),
+        Span::styled(format!("   ({today_label})"), dim()),
+    ]));
+    let avg7 = if total_7d > 0.0 { total_7d / 7.0 } else { 0.0 };
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("7-day  ", dim()),
+        Span::styled(format_usd(total_7d), bold()),
+        Span::styled(format!("   (avg {}/day)", format_usd(avg7)), dim()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("30-day ", dim()),
+        Span::styled(format_usd(total_30d), bold()),
+    ]));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("all    ", dim()),
+        Span::styled(format_usd(total_all), bold()),
+        Span::styled(
+            format!(
+                "   ({scanned_files} session{} · {scan_duration_ms} ms)",
+                if scanned_files == 1 { "" } else { "s" }
+            ),
+            dim(),
+        ),
+    ]));
+
+    // Last-14-days strip.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  last 14 days",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    let want_days = 14;
+    let mut day_map: HashMap<crate::cost_rollup::DayKey, f64> =
+        days.iter().map(|d| (d.key, d.cost_usd)).collect();
+    // Walk back from today.
+    let today_key = app.cost_cache.as_ref().unwrap().1.today;
+    let mut strip: Vec<(crate::cost_rollup::DayKey, f64)> = Vec::new();
+    {
+        let today_secs = day_start_secs_from_key(today_key);
+        for back in (0..want_days).rev() {
+            let secs = today_secs - back as i64 * 86_400;
+            let k = day_key_at_secs(secs);
+            let cost = day_map.remove(&k).unwrap_or(0.0);
+            strip.push((k, cost));
+        }
+    }
+    let peak = strip.iter().map(|(_, c)| *c).fold(0.0_f64, f64::max).max(0.01);
+    let bar_width = 28u16;
+    for (k, c) in &strip {
+        let filled = ((*c / peak) * bar_width as f64).round() as usize;
+        let bar: String = "█".repeat(filled);
+        let label = if *k == today_key { "  (today)" } else { "" };
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(k.format(), dim()),
+            Span::raw("  "),
+            Span::styled(format!("{:>8}", format_usd(*c)), bold()),
+            Span::raw("  "),
+            Span::styled(bar, Style::default().fg(Color::Cyan)),
+            Span::styled(label, dim()),
+        ]));
+    }
+
+    // Top-5 cwds.
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  top cwds (all time)",
+        Style::default().add_modifier(Modifier::BOLD),
+    )));
+    let cwd_peak = cwds.first().map(|c| c.cost_usd).unwrap_or(0.01).max(0.01);
+    for c in cwds.iter().take(5) {
+        let filled = ((c.cost_usd / cwd_peak) * 24.0).round() as usize;
+        let bar: String = "█".repeat(filled);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{:>8}", format_usd(c.cost_usd)), bold()),
+            Span::raw("  "),
+            Span::styled(format!("{:>3} sess", c.session_count), dim()),
+            Span::raw("  "),
+            Span::raw(format!("{:<28}", short_cwd(&c.cwd))),
+            Span::styled(bar, Style::default().fg(Color::Magenta)),
+        ]));
+    }
+
+    // Per-model split.
+    if !models.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  by model (all time)",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        let total: f64 = models.iter().map(|m| m.cost_usd).sum();
+        for m in &models {
+            let pct = if total > 0.0 { 100.0 * m.cost_usd / total } else { 0.0 };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{:<8}", m.model), bold()),
+                Span::raw("  "),
+                Span::styled(format!("{:>8}", format_usd(m.cost_usd)), bold()),
+                Span::styled(format!("   {pct:>4.1}%"), dim()),
+            ]));
+        }
+    }
+
+    app.cost_overlay_total_lines = lines.len() as u16;
+    let max_offset = app
+        .cost_overlay_total_lines
+        .saturating_sub(area.height.saturating_sub(2));
+    if app.cost_overlay_offset > max_offset {
+        app.cost_overlay_offset = max_offset;
+    }
+
+    let title = format!(
+        " cost  ·  {} sessions  ·  scanned {} ms ",
+        scanned_files, scan_duration_ms
+    );
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .title(Span::styled(title, dim()));
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false })
+        .scroll((app.cost_overlay_offset, 0));
+    f.render_widget(para, area);
+}
+
+// Local copies of the day-second helpers (cost_rollup keeps them private to
+// the module since their main consumer is `cli_cost`; the overlay uses the
+// same arithmetic). Keeping them inline here avoids exposing more surface
+// from cost_rollup than necessary.
+fn day_start_secs_from_key(d: crate::cost_rollup::DayKey) -> i64 {
+    days_from_civil_local(d.year as i64, d.month, d.day) * 86_400
+}
+
+fn day_key_at_secs(secs: i64) -> crate::cost_rollup::DayKey {
+    crate::cost_rollup::local_day(
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs((secs + 1).max(0) as u64),
+    )
+}
+
+fn days_from_civil_local(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as u64 + 2) / 5 + d as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
 fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
     if app.audit_log_open {
         let hint = if app.pending_g {
             "  g … press g again to jump to top, any other key cancels".to_string()
         } else {
             "  j/k scroll  ·  ^d/^u half-page  ·  gg top  ·  G bottom  ·  H/Esc close  ·  q quit"
+                .to_string()
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
+    if app.cost_overlay_open {
+        let hint = if app.pending_g {
+            "  g … press g again to jump to top, any other key cancels".to_string()
+        } else {
+            "  j/k scroll  ·  ^d/^u half-page  ·  gg top  ·  G bottom  ·  $/Esc close  ·  q quit"
                 .to_string()
         };
         f.render_widget(
@@ -1269,7 +1536,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
                 " ⏎ jump  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  w  q"
             ),
             LayoutMode::Wide => format!(
-                "  ⏎ jump  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  w watch  H log  q quit"
+                "  ⏎ jump  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  w watch  H log  $ cost  q quit"
             ),
         };
         let style = if app.autonomous {
