@@ -587,17 +587,22 @@ pub fn enrich(session: &mut Session, now: SystemTime, cache: &mut DigestCache) {
     };
     session.transcript_path = Some(path.clone());
     let Some(d) = cache.get(&path) else { return };
-    // Prompt supersedes the recap when the user started new work AND the session
-    // is genuinely still active. We gate on last_event_at (latest transcript
-    // event) rather than session.status, because the sessions JSON status lags
-    // and can stay "busy" long after activity has stopped. If the transcript
-    // hasn't seen any event in PROMPT_FRESH_WINDOW, the away_summary should have
-    // caught up; if it didn't, the prompt is stale and the recap is preferable.
-    let session_is_active = d
+    // Prompt supersedes the recap when the user started new work AND the
+    // session is genuinely still active. Two signals; either fires:
+    //   1. transcript activity in the last PROMPT_FRESH_WINDOW (covers
+    //      finished-recently / idle-but-still-typing).
+    //   2. sessions JSON `status == "busy"` (covers long Bash / build /
+    //      auto-mode auditor handshake — Claude is mid-turn but hasn't
+    //      written a transcript event for >5min).
+    // The earlier comment worried about `status` being stuck on dead
+    // sessions, but discover_live_sessions already filters those via
+    // pid_alive before enrich runs, so the staleness risk is bounded.
+    let transcript_fresh = d
         .last_event_at
         .and_then(|t| now.duration_since(t).ok())
         .map(|age| age <= PROMPT_FRESH_WINDOW)
         .unwrap_or(false);
+    let session_is_active = transcript_fresh || session.status == "busy";
     let prompt_supersedes = match (d.headline_at, d.last_prompt_at) {
         (Some(h), Some(p)) => p > h && session_is_active,
         (None, Some(_)) => session_is_active,
