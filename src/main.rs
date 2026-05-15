@@ -153,6 +153,25 @@ fn probe() -> io::Result<()> {
             s.last_tool_use = Some((name, brief));
         }
     }
+    // Deterministic Blocked scan: for any busy session whose cheaper
+    // signals haven't already flagged it, capture the pane tail and look
+    // for the `❯ 1. Yes` + `Esc to cancel` anchor that only the live
+    // permission UI prints. Catches the cc-gh-warn case where Claude is on
+    // its native permission prompt and sessions JSON never wrote
+    // status=waiting. We don't gate on `last_tool_use` or transcript age:
+    // a pending tool_use is exactly what a permission prompt looks like at
+    // the transcript level, so excluding those would miss the case. The
+    // strict anchor keeps the false-positive risk negligible.
+    for s in &mut sessions {
+        if s.status == "busy"
+            && s.pending_approvals.is_empty()
+            && let Some(pane) = &s.pane
+            && let Some(content) = tmux::capture_pane_tail(&pane.target, 15)
+            && tmux::has_pending_permission_prompt(&content)
+        {
+            s.pane_blocked = true;
+        }
+    }
     for s in &mut sessions {
         s.state = classifier::classify(s, now);
         let pane = s.pane.as_ref().map(|p| p.target.as_str()).unwrap_or("(none)");
@@ -535,6 +554,25 @@ fn refresh(app: &mut AppState) {
     // can render the hook-captured tool input in the headline/detail.
     let pending = approval::read_pending();
     approval::attach_to_sessions(pending, &mut sessions);
+    // Deterministic Blocked scan: for any busy session whose cheaper
+    // signals haven't already flagged it (no status=waiting, no hook
+    // pending file), capture the pane tail and look for the `❯ 1. Yes` +
+    // `Esc to cancel` anchor that only the live permission UI prints.
+    // Catches cases where Claude is on its native permission prompt and
+    // sessions JSON never wrote status=waiting. No `last_tool_use` or time
+    // gate: a pending tool_use is exactly what a permission prompt looks
+    // like at the transcript level, so excluding those would miss the
+    // case. The strict anchor keeps the false-positive risk negligible.
+    for s in &mut sessions {
+        if s.status == "busy"
+            && s.pending_approvals.is_empty()
+            && let Some(pane) = &s.pane
+            && let Some(content) = tmux::capture_pane_tail(&pane.target, 15)
+            && tmux::has_pending_permission_prompt(&content)
+        {
+            s.pane_blocked = true;
+        }
+    }
     for s in &mut sessions {
         s.state = classifier::classify(s, now);
     }

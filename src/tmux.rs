@@ -330,6 +330,51 @@ pub fn capture_pane(target: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Bounded variant: capture only the last `lines` lines of the pane. Used
+/// when we only need to spot the permission-UI anchor near the bottom (the
+/// box never spans more than ~30 lines, so 40 leaves headroom). Cheaper than
+/// `capture_pane`'s 200-line default.
+pub fn capture_pane_tail(target: &str, lines: u32) -> Option<String> {
+    let start = format!("-{lines}");
+    let out = Command::new("tmux")
+        .args(["capture-pane", "-p", "-S", &start, "-t", target])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// True iff the captured pane shows a Claude permission prompt UI in its
+/// most recent block. We require two distinct UI lines to BOTH appear as
+/// trimmed exact-line matches:
+///
+///   `❯ 1. Yes`                         (the live cursor on option 1)
+///   `Esc to cancel · Tab to amend`     (the prompt footer)
+///
+/// Anchoring on whole lines (not substring) is what keeps this from
+/// false-firing on code edits / diffs / prose that *quote* these strings
+/// inside source — Claude renders them on their own lines (with at most
+/// leading whitespace), while a quote in code has surrounding chars.
+pub fn has_pending_permission_prompt(pane: &str) -> bool {
+    let mut found_cursor = false;
+    let mut found_footer = false;
+    for line in pane.lines() {
+        let trimmed = line.trim();
+        if trimmed == "❯ 1. Yes" {
+            found_cursor = true;
+        }
+        if trimmed == "Esc to cancel · Tab to amend" {
+            found_footer = true;
+        }
+        if found_cursor && found_footer {
+            return true;
+        }
+    }
+    false
+}
+
 /// Pull the human-readable preview of what Claude is asking from a captured
 /// pane. Anchors on `1. Yes` (the option list, reliable across all prompt
 /// variants) and walks upward, collecting every content line until we hit

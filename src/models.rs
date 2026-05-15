@@ -82,6 +82,12 @@ pub struct Session {
     pub latest_assistant_text: Option<String>,
 
     pub state: AttentionState,
+    /// Pane content shows a Claude permission UI (`1. Yes`/`2. No` anchor) in
+    /// the last few lines. The ground-truth signal that Claude is paused on
+    /// user input — supersedes sessions JSON `status=waiting`, which lags or
+    /// gets skipped entirely on some prompts. Set in the refresh pass for
+    /// candidate busy-but-quiet sessions (see refresh in main.rs).
+    pub pane_blocked: bool,
     /// True when the user has muted this session. Muted sessions still update
     /// in the background but render dimmed and sort to the bottom of the list.
     pub muted: bool,

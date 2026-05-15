@@ -84,6 +84,7 @@ pub fn discover_live_sessions() -> Vec<Session> {
             latest_model: None,
             latest_assistant_text: None,
             state: AttentionState::Unknown,
+            pane_blocked: false,
             muted: false,
             watched: false,
             pending_approvals: Vec::new(),

@@ -8,29 +8,24 @@ const IDLE_LONG_THRESHOLD: Duration = Duration::from_secs(30 * 60);
 /// the user has likely moved on and the row should sink to the bottom even if
 /// sessions JSON still says `status=busy` (which lags badly for stale sessions).
 const STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
-/// `status=busy` with no transcript activity for this long AND no pending
-/// tool_use → classify as Blocked. Catches "silently stuck" sessions where
-/// the hook decision file piled up under auto mode, or Claude Code missed
-/// a `status=waiting` transition. The `last_tool_use.is_none()` gate is
-/// what makes this safe vs the old pre-`ec5ff7c` 90s rule that false-fired
-/// on long Bash / cargo builds — a mid-execution tool keeps last_tool_use
-/// set to its un-completed entry.
-const STUCK_BUSY_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
 pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
     if session.last_stop_had_errors {
         return AttentionState::Error;
     }
 
-    // Sessions JSON `status=waiting` is the canonical "user attention needed"
-    // signal (Claude Code 2.1.13x+ sets this when it pauses on a permission
-    // prompt). We deliberately do NOT use `pending_approvals` alone: our
-    // PreToolUse hook fires for every tool call (including auto-approved
-    // Reads/Edits/etc.), so a pending file just means the hook is blocking
-    // — not that Claude is actually waiting on a user decision. Pending files
-    // still feed into the headline + `a`/`d` actions, but only when status
-    // also says waiting.
-    if session.status == "waiting" {
+    // Two-signal Blocked detection:
+    //   1. Sessions JSON `status=waiting` — Claude Code's own canonical
+    //      signal. Cheapest path, accurate when set, but routinely missed:
+    //      observed cases where the native permission UI was visibly up for
+    //      minutes while status stayed `busy`. We can't fix that from
+    //      outside Claude Code, so we layer a second signal underneath.
+    //   2. `pane_blocked` — set in the refresh pass when the pane content
+    //      shows the `1. Yes`/`2. No` permission UI anchor. Deterministic
+    //      ground truth from the pixels Claude actually drew; survives the
+    //      hook's 3-s timeout (after which the hook file is gone and only
+    //      the pane tells us the user is still being asked).
+    if session.status == "waiting" || session.pane_blocked {
         return AttentionState::Blocked;
     }
 
@@ -52,18 +47,6 @@ pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
     }
 
     if session.status == "busy" {
-        // Stuck-busy detection: Claude says busy, but the transcript has
-        // been silent for STUCK_BUSY_THRESHOLD AND there's no pending
-        // tool_use to explain the silence (i.e. no long Bash/build is
-        // mid-execution). Most likely cause: auto-mode hook decision-file
-        // pile-up, or Claude Code missed a `status=waiting` transition.
-        // Surfacing the row as Blocked gives the user a signal to look.
-        if session.last_tool_use.is_none()
-            && let Some(age) = event_age
-            && age >= STUCK_BUSY_THRESHOLD
-        {
-            return AttentionState::Blocked;
-        }
         return AttentionState::Working;
     }
 
