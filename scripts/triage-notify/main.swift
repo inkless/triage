@@ -1,31 +1,33 @@
 // triage-notify: macOS notification helper using UNUserNotificationCenter.
 //
-// Two modes — distinguished by whether `--title` was passed:
+// NSApplication-based. The earlier CommandLine version (no NSApp / RunLoop)
+// triggered macOS's "<app> is not responding" dialog whenever 2+ helper
+// instances were alive — the bundle had no Apple Event handler, so the
+// `kAEOpenApplication` event the OS sends to coordinate launches timed out.
+// NSApplication.run() handles those events automatically, so the OS sees
+// a responsive app regardless of how many instances stack.
+//
+// Two modes — same binary, distinguished by whether `--title` was passed:
 //
 //   POST MODE  (`--title <text> ...`):
-//     called by triage to schedule a notification. We request authorization,
-//     post the notification with the action shell command embedded in
-//     userInfo, then exit shortly. The user's click happens later and is
-//     delivered to a separate response-mode instance launched by macOS.
+//     Called by triage to schedule a notification. Posts via
+//     UNUserNotificationCenter, then RunLoops until --timeout. Clicks
+//     arriving during the window are handled by THIS instance's delegate.
 //
 //   RESPONSE MODE  (no args):
-//     macOS launches the bundle automatically when the user interacts with a
-//     pending notification. This instance has no argv from the original
-//     post; instead, the action command lives in the notification's
-//     userInfo dict. We set up the delegate, run a brief RunLoop to receive
-//     the queued response, run the action via /bin/sh -c, and exit.
+//     macOS launches the bundle when the user clicks a queued notification
+//     whose original poster has already exited. We register the delegate,
+//     RunLoop for the timeout window, and run actions out of the
+//     UNNotificationResponse's userInfo (`actionCommand`).
 //
-// Without this two-mode split, response-mode launches see no `--title`,
-// bail out, and the click event is silently lost. (That bug was caught
-// by debug logging — see /tmp/triage-notify.log).
+// In both modes, didReceive deliberately does NOT terminate the app — the
+// same delegate stays alive to absorb subsequent clicks on sibling stacked
+// notifications. The DispatchQueue.main.asyncAfter terminate is the only
+// exit path.
 
-import Foundation
+import Cocoa
 import UserNotifications
 
-// Diagnostics gated on TRIAGE_NOTIFY_DEBUG=1 so a normal install doesn't
-// write /tmp/triage-notify.log on every notification. Set the env var (in
-// the parent triage process or via `launchctl setenv`) to re-enable when
-// debugging click delivery or permission state.
 let debugEnabled = ProcessInfo.processInfo.environment["TRIAGE_NOTIFY_DEBUG"] == "1"
 
 func dbg(_ msg: String) {
@@ -73,16 +75,42 @@ func parseArgs() -> Args {
     return result
 }
 
-final class Delegate: NSObject, UNUserNotificationCenterDelegate {
-    var done = false
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
+    let args: Args
 
-    // Show banners + sound even when the foreground app is the helper itself.
+    init(_ args: Args) {
+        self.args = args
+        super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        dbg("appDidFinishLaunching pid=\(getpid()) bundleId=\(Bundle.main.bundleIdentifier ?? "nil") hasTitle=\(args.title != nil)")
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+
+        if let title = args.title {
+            postNotification(title: title)
+        } else {
+            dbg("response-mode: awaiting didReceive")
+        }
+
+        // Single shared terminate path: schedule on the main RunLoop and let
+        // it fire once the timeout elapses. Click handlers don't terminate;
+        // they just let the timer run out, which lets one helper absorb N
+        // clicks on stacked notifications.
+        DispatchQueue.main.asyncAfter(deadline: .now() + args.timeout) {
+            dbg("timeout reached; terminating")
+            NSApp.terminate(nil)
+        }
+    }
+
+    // Show banner + sound when the foreground app is the helper itself.
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         willPresent notification: UNNotification,
         withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
     ) {
-        dbg("willPresent fired (banner shown)")
+        dbg("willPresent")
         if #available(macOS 11.0, *) {
             completionHandler([.banner, .sound])
         } else {
@@ -90,11 +118,11 @@ final class Delegate: NSObject, UNUserNotificationCenterDelegate {
         }
     }
 
-    // Click / action-button callback. Fires both for body taps (default
-    // action) and for the explicit "open" action button. The action shell
-    // command lives in notification.request.content.userInfo, NOT on this
-    // delegate instance — because in response mode the helper that runs
-    // didn't post the notification originally and has no other source.
+    // Click / action-button callback. Fires for body taps (default action)
+    // and for the explicit "open" button. The action shell command lives in
+    // notification.request.content.userInfo — works the same whether this
+    // instance posted the notification or just inherited it via response-
+    // mode launch.
     func userNotificationCenter(
         _ center: UNUserNotificationCenter,
         didReceive response: UNNotificationResponse,
@@ -123,96 +151,63 @@ final class Delegate: NSObject, UNUserNotificationCenterDelegate {
         } else {
             dbg("non-click action (id=\(id)) — ignoring")
         }
-        done = true
         completionHandler()
+        // Intentionally NOT terminating — see class comment.
+    }
+
+    private func postNotification(title: String) {
+        let center = UNUserNotificationCenter.current()
+        center.requestAuthorization(options: [.alert, .sound]) { granted, err in
+            dbg("requestAuthorization granted=\(granted) err=\(err?.localizedDescription ?? "nil")")
+            if !granted {
+                FileHandle.standardError.write(Data("triage-notify: notification permission denied\n".utf8))
+            }
+        }
+
+        let content = UNMutableNotificationContent()
+        content.title = title
+        if let s = args.subtitle { content.subtitle = s }
+        if let m = args.message { content.body = m }
+        if let a = args.action {
+            content.userInfo = ["actionCommand": a]
+        }
+
+        if args.action != nil {
+            let openAction = UNNotificationAction(
+                identifier: "open",
+                title: "Open",
+                options: [.foreground]
+            )
+            let category = UNNotificationCategory(
+                identifier: "triage.click",
+                actions: [openAction],
+                intentIdentifiers: [],
+                options: []
+            )
+            center.setNotificationCategories([category])
+            content.categoryIdentifier = "triage.click"
+        }
+
+        let request = UNNotificationRequest(
+            identifier: UUID().uuidString,
+            content: content,
+            trigger: nil
+        )
+        dbg("posting notification id=\(request.identifier) hasAction=\(args.action != nil)")
+        center.add(request) { err in
+            dbg("center.add completion err=\(err?.localizedDescription ?? "nil")")
+            if let err = err {
+                FileHandle.standardError.write(Data("triage-notify: post error: \(err.localizedDescription)\n".utf8))
+            }
+        }
     }
 }
 
 let args = parseArgs()
-dbg("startup pid=\(getpid()) bundleId=\(Bundle.main.bundleIdentifier ?? "nil") hasTitle=\(args.title != nil)")
-
-let delegate = Delegate()
-let center = UNUserNotificationCenter.current()
-center.delegate = delegate
-
-if let title = args.title {
-    // ── POST MODE ─────────────────────────────────────────────────────
-    let authGroup = DispatchGroup()
-    authGroup.enter()
-    center.requestAuthorization(options: [.alert, .sound]) { granted, err in
-        defer { authGroup.leave() }
-        dbg("requestAuthorization granted=\(granted) err=\(err?.localizedDescription ?? "nil")")
-        if !granted {
-            FileHandle.standardError.write(Data("triage-notify: notification permission denied\n".utf8))
-        }
-        if let err = err {
-            FileHandle.standardError.write(Data("triage-notify: auth error: \(err.localizedDescription)\n".utf8))
-        }
-    }
-    authGroup.wait()
-
-    let content = UNMutableNotificationContent()
-    content.title = title
-    if let s = args.subtitle { content.subtitle = s }
-    if let m = args.message { content.body = m }
-    if let a = args.action {
-        // Embed the action shell command in userInfo so a fresh response-
-        // mode instance can recover it on click.
-        content.userInfo = ["actionCommand": a]
-    }
-
-    if args.action != nil {
-        let openAction = UNNotificationAction(
-            identifier: "open",
-            title: "Open",
-            options: [.foreground]
-        )
-        let category = UNNotificationCategory(
-            identifier: "triage.click",
-            actions: [openAction],
-            intentIdentifiers: [],
-            options: []
-        )
-        center.setNotificationCategories([category])
-        content.categoryIdentifier = "triage.click"
-    }
-
-    let request = UNNotificationRequest(
-        identifier: UUID().uuidString,
-        content: content,
-        trigger: nil
-    )
-    dbg("posting notification id=\(request.identifier) categoryId=\(content.categoryIdentifier) hasAction=\(args.action != nil)")
-    let postGroup = DispatchGroup()
-    postGroup.enter()
-    center.add(request) { err in
-        dbg("center.add completion err=\(err?.localizedDescription ?? "nil")")
-        if let err = err {
-            FileHandle.standardError.write(Data("triage-notify: post error: \(err.localizedDescription)\n".utf8))
-        }
-        postGroup.leave()
-    }
-    postGroup.wait()
-
-    // Brief wait so an in-process click (user racing the banner appearance)
-    // gets handled before we exit. Real clicks usually arrive seconds
-    // later and route to a separate response-mode instance.
-    dbg("post-mode RunLoop wait, timeout=\(args.timeout)")
-    let deadline = Date().addingTimeInterval(args.timeout)
-    while !delegate.done && Date() < deadline {
-        RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.5))
-    }
-    dbg("post-mode exiting (done=\(delegate.done))")
-    exit(0)
-}
-
-// ── RESPONSE MODE ────────────────────────────────────────────────────────
-// Launched by macOS to deliver a queued notification response. The delegate
-// is set above; just RunLoop until didReceive fires (or we time out).
-dbg("response-mode RunLoop wait")
-let responseDeadline = Date().addingTimeInterval(10)
-while !delegate.done && Date() < responseDeadline {
-    RunLoop.current.run(mode: .default, before: Date(timeIntervalSinceNow: 0.2))
-}
-dbg("response-mode exiting (done=\(delegate.done))")
-exit(0)
+let app = NSApplication.shared
+let delegate = AppDelegate(args)
+app.delegate = delegate
+// Accessory: no Dock icon, no menu bar. LSUIElement=true in Info.plist also
+// helps, but setting the activation policy explicitly is the canonical way.
+app.setActivationPolicy(.accessory)
+app.run()

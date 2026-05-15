@@ -274,10 +274,14 @@ fn send_via_triage_notify(
         );
         cmd.args(["--action", &action]);
     }
-    // 60s default timeout; matches the hook claim handshake's timeout for
-    // auto-mode notifications. Helper exits cleanly when interacted-with
-    // sooner.
-    cmd.args(["--timeout", "60"]);
+    // Short helper lifetime to limit pile-up. Multiple concurrent helpers
+    // can trigger macOS's "<app> is not responding" dialog because the
+    // CommandLine .app has no NSApplication / AppleEvent handler. 20s is
+    // a tradeoff: clicks beyond that window won't fire (rare in practice
+    // — banners get clicked within seconds), but stacked notifications
+    // clear quickly. The proper fix is an NSApplication-based daemon
+    // (tracked separately).
+    cmd.args(["--timeout", "20"]);
     spawn_detached(cmd);
 }
 
