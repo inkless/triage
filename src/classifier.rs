@@ -8,6 +8,14 @@ const IDLE_LONG_THRESHOLD: Duration = Duration::from_secs(30 * 60);
 /// the user has likely moved on and the row should sink to the bottom even if
 /// sessions JSON still says `status=busy` (which lags badly for stale sessions).
 const STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
+/// `status=busy` with no transcript activity for this long AND no pending
+/// tool_use → classify as Blocked. Catches "silently stuck" sessions where
+/// the hook decision file piled up under auto mode, or Claude Code missed
+/// a `status=waiting` transition. The `last_tool_use.is_none()` gate is
+/// what makes this safe vs the old pre-`ec5ff7c` 90s rule that false-fired
+/// on long Bash / cargo builds — a mid-execution tool keeps last_tool_use
+/// set to its un-completed entry.
+const STUCK_BUSY_THRESHOLD: Duration = Duration::from_secs(5 * 60);
 
 pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
     if session.last_stop_had_errors {
@@ -44,6 +52,18 @@ pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
     }
 
     if session.status == "busy" {
+        // Stuck-busy detection: Claude says busy, but the transcript has
+        // been silent for STUCK_BUSY_THRESHOLD AND there's no pending
+        // tool_use to explain the silence (i.e. no long Bash/build is
+        // mid-execution). Most likely cause: auto-mode hook decision-file
+        // pile-up, or Claude Code missed a `status=waiting` transition.
+        // Surfacing the row as Blocked gives the user a signal to look.
+        if session.last_tool_use.is_none()
+            && let Some(age) = event_age
+            && age >= STUCK_BUSY_THRESHOLD
+        {
+            return AttentionState::Blocked;
+        }
         return AttentionState::Working;
     }
 
