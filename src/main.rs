@@ -35,6 +35,16 @@ const WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    // Top-level help. Must come before any other dispatch so an agent or
+    // human running `triage --help` doesn't accidentally launch the TUI.
+    if args
+        .iter()
+        .skip(1)
+        .any(|a| a == "--help" || a == "-h" || a == "help")
+    {
+        print_top_level_help();
+        return Ok(());
+    }
     // One-shot subcommand: `triage notify [flags] <message...>` posts to
     // ntfy using the config's [ntfy] block. Detected by positional argv[1]
     // (not a flag) so it doesn't collide with `--notify` style flags
@@ -119,6 +129,46 @@ fn main() -> io::Result<()> {
     let result = run(&mut terminal, exit_on_jump, zoom_on_jump);
     restore_terminal()?;
     result
+}
+
+fn print_top_level_help() {
+    println!(
+        r#"triage — TUI to monitor parallel Claude Code sessions across tmux panes
+
+USAGE:
+  triage                    launch the TUI (or silent-attach to a running
+                            instance in the current tmux session)
+  triage <subcommand>       one-shot subcommand
+  triage <flag>             one-shot flag operation
+
+SUBCOMMANDS:
+  notify <msg> [...]        post a one-shot ntfy push using ~/.config/triage/config.toml
+  cost [--by day|cwd|session|model] [--days N] [--top N] [--json]
+                            daily/weekly Claude spend across every transcript
+
+FLAGS:
+  --help, -h, help          print this message and exit
+  --probe                   print joined session table (non-TUI smoke test)
+  --install-hooks           install triage's PreToolUse hook into ~/.claude/settings.json
+  --uninstall-hooks         remove triage's PreToolUse hook entries
+  --install-hooks-hint      print manual install instructions
+  --dry-run                 (with install/uninstall-hooks) show changes without writing
+  --audit <pid>             feed the session's pending tool_use to the auditor
+  --audit-prompt            print the auditor prompt to stdout
+  --jump-to-self [--zoom]   focus an existing triage pane (tmux-binding entrypoint)
+  --exit-on-jump            exit cleanly after a successful Enter jump (popup-launch mode)
+  --zoom-on-jump            force zoom-on-jump regardless of pane width
+  --force-new               spawn a new TUI instance even if one is already alive
+
+IN-TUI KEYBINDINGS:
+  ⏎ jump · a/d approve/deny · h toggle approval mode · A toggle auto mode
+  p toggle phone push · m mute · w watch · H audit log · $ cost overlay · q quit
+
+DOCS:
+  README:        https://github.com/inkless/triage
+  config file:   ~/.config/triage/config.toml (optional)
+"#
+    );
 }
 
 fn probe() -> io::Result<()> {
