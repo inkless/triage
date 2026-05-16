@@ -538,6 +538,12 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                     match tmux::jump_to(&target, app.should_zoom_on_jump()) {
                         Ok(()) => {
                             app.status_msg = Some(format!("jumped → {target}"));
+                            // Clear the search query — the user is moving
+                            // on, and a stale filter when they come back to
+                            // triage hides the rest of their session list.
+                            // Only on a successful jump; failures keep the
+                            // filter so the user can retry without retyping.
+                            app.filter.clear();
                             // Popup-launch mode: exit so the overlay closes
                             // and the user lands on the target pane in one
                             // keypress. Without this they'd press q after.
