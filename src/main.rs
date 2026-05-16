@@ -162,7 +162,8 @@ FLAGS:
 
 IN-TUI KEYBINDINGS:
   ⏎ jump · a/d approve/deny · h toggle approval mode · A toggle auto mode
-  p toggle phone push · m mute · w watch · H audit log · $ cost overlay · q quit
+  p toggle phone push · m mute · w watch · / filter (name + cwd)
+  H audit log · $ cost overlay · q quit
 
 DOCS:
   README:        https://github.com/inkless/triage
@@ -292,6 +293,30 @@ fn run(
 }
 
 fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
+    // Filter edit mode intercepts everything except Ctrl-C (still quits)
+    // so printable keys go into the filter string rather than triggering
+    // table navigation. Enter exits edit but keeps the filter applied;
+    // Esc exits edit AND clears the filter.
+    if app.filter_active {
+        match code {
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Esc => {
+                app.filter.clear();
+                app.filter_active = false;
+            }
+            KeyCode::Enter => {
+                app.filter_active = false;
+            }
+            KeyCode::Backspace => {
+                app.filter.pop();
+            }
+            KeyCode::Char(c) => {
+                app.filter.push(c);
+            }
+            _ => {}
+        }
+        return true;
+    }
     // `g` is the first half of a `gg` chord (jump to top); `G` jumps to
     // bottom. Both the audit-log overlay and the main table support these
     // (and they share `pending_g` since the two key blocks are mutually
@@ -477,6 +502,13 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                 "cost overlay {}",
                 if app.cost_overlay_open { "open" } else { "closed" }
             ));
+        }
+        KeyCode::Char('/') => {
+            // Enter filter edit mode without clearing the existing query,
+            // so the user can keep refining a typed string. Esc inside
+            // edit mode is the clear path.
+            app.filter_active = true;
+            app.pending_g = false;
         }
         KeyCode::Char('r') => {
             app.status_msg = Some("refreshing…".to_string());

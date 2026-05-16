@@ -88,6 +88,15 @@ pub struct AppState {
     pub cost_overlay_offset: u16,
     pub cost_overlay_total_lines: u16,
     pub cost_cache: Option<(SystemTime, crate::cost_rollup::Rollup)>,
+    /// Active filter query. Empty = no filter applied. Case-insensitive
+    /// substring match against any of: Claude `--name`, tmux window_name,
+    /// tmux session_name, full cwd path.
+    pub filter: String,
+    /// True while the user is typing into the filter after `/`. Printable
+    /// keys append to `filter`; Enter/Esc exit edit mode (Enter keeps the
+    /// query, Esc clears it). Outside edit mode the filter just applies
+    /// and all other keybindings work normally on the filtered subset.
+    pub filter_active: bool,
     /// When true, triage exits cleanly after a successful `Enter` jump. Set
     /// by `--exit-on-jump`. Designed for the tmux popup launch pattern: the
     /// popup closes when triage exits, so a single keypress (`Enter`) both
@@ -151,6 +160,8 @@ impl AppState {
             cost_overlay_offset: 0,
             cost_overlay_total_lines: 0,
             cost_cache: None,
+            filter: String::new(),
+            filter_active: false,
             exit_on_jump: false,
             zoom_on_jump: false,
             last_pane_width: 0,
@@ -295,7 +306,14 @@ impl AppState {
     }
 
     pub fn visible(&self) -> Vec<&Session> {
-        self.sessions.iter().collect()
+        if self.filter.is_empty() {
+            return self.sessions.iter().collect();
+        }
+        let q = self.filter.to_lowercase();
+        self.sessions
+            .iter()
+            .filter(|s| session_matches_filter(s, &q))
+            .collect()
     }
 
     /// Vim `gg` — jump to the first visible row.
@@ -385,7 +403,12 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
 
 fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
     let total = app.sessions.len();
-    let counts = format!("{total} session{}", if total == 1 { "" } else { "s" });
+    let visible = app.visible().len();
+    let counts = if app.filter.is_empty() {
+        format!("{total} session{}", if total == 1 { "" } else { "s" })
+    } else {
+        format!("{visible}/{total} sessions")
+    };
     // Show pane width inline + a `zoom` indicator when auto-detect is active,
     // so it's obvious whether Enter will zoom on the current device.
     let zoom_marker = if app.should_zoom_on_jump() { " · zoom" } else { "" };
@@ -400,14 +423,23 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
     } else {
         format!("{}cols{zoom_marker}", app.last_pane_width)
     };
-    let line = Line::from(vec![
+    let mut spans: Vec<Span<'static>> = vec![
         Span::styled("triage", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("   "),
         Span::styled(counts, Style::default().fg(Color::DarkGray)),
-        Span::raw("   "),
-        Span::styled(dims, Style::default().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(Paragraph::new(line), area);
+    ];
+    if app.filter_active || !app.filter.is_empty() {
+        let cursor = if app.filter_active { "_" } else { "" };
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled("filter: ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            format!("{}{cursor}", app.filter),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    spans.push(Span::raw("   "));
+    spans.push(Span::styled(dims, Style::default().fg(Color::DarkGray)));
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 /// Terminal-width tiers. Picked once per draw based on `area.width`.
@@ -1516,6 +1548,17 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         );
         return;
     }
+    if app.filter_active {
+        let hint = "  type to filter  ·  ↵ keep  ·  Esc clear  ·  backspace edits";
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
     let line = if let Some(msg) = &app.status_msg {
         Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Yellow)))
     } else {
@@ -1540,7 +1583,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
                 " ⏎ jump  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  w  q"
             ),
             LayoutMode::Wide => format!(
-                "  ⏎ jump  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  w watch  H log  $ cost  q quit"
+                "  ⏎ jump  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  w watch  / filter  H log  $ cost  q quit"
             ),
         };
         let style = if app.autonomous {
@@ -1551,6 +1594,27 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         Line::from(Span::styled(hint, style))
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+/// Case-insensitive substring match against everything a user might want
+/// to search by: the Claude session's `--name`, the tmux window name, the
+/// tmux session name, and the full cwd path. `q` is already lowercased by
+/// the caller. Returning early on any hit keeps this cheap on large fleets.
+fn session_matches_filter(s: &Session, q: &str) -> bool {
+    if let Some(name) = &s.name
+        && name.to_lowercase().contains(q)
+    {
+        return true;
+    }
+    if let Some(pane) = &s.pane {
+        if !pane.window_name.is_empty() && pane.window_name.to_lowercase().contains(q) {
+            return true;
+        }
+        if !pane.tmux_session.is_empty() && pane.tmux_session.to_lowercase().contains(q) {
+            return true;
+        }
+    }
+    s.cwd.to_string_lossy().to_lowercase().contains(q)
 }
 
 /// Return `Pane.window_name` only when it carries user intent. Skip when:
