@@ -1549,7 +1549,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         return;
     }
     if app.filter_active {
-        let hint = "  type to filter  ·  ↵ keep  ·  Esc clear  ·  backspace edits";
+        let hint = "  type to filter  ·  ↑↓ nav  ·  ↵ keep  ·  Esc clear  ·  ^W word  ·  ^U line";
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint.to_string(),

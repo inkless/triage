@@ -293,10 +293,11 @@ fn run(
 }
 
 fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
-    // Filter edit mode intercepts everything except Ctrl-C (still quits)
-    // so printable keys go into the filter string rather than triggering
-    // table navigation. Enter exits edit but keeps the filter applied;
-    // Esc exits edit AND clears the filter.
+    // Filter edit mode. Printable keys go into the filter string; the rest
+    // are wired to either common readline editing (Ctrl+W / Ctrl+U / Ctrl+H)
+    // or table navigation (arrows / PgUp / PgDn) so the user can scroll the
+    // filtered rows without first exiting edit mode. Enter keeps the filter
+    // applied; Esc exits AND clears.
     if app.filter_active {
         match code {
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
@@ -307,9 +308,26 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             KeyCode::Enter => {
                 app.filter_active = false;
             }
+            // Readline-style line edits.
+            KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
+                delete_prev_word(&mut app.filter);
+            }
+            KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+                app.filter.clear();
+            }
+            KeyCode::Char('h') if mods.contains(KeyModifiers::CONTROL) => {
+                app.filter.pop();
+            }
             KeyCode::Backspace => {
                 app.filter.pop();
             }
+            // Navigation passes through to the table so the user can scan
+            // filtered rows live. j/k are deliberately NOT here — they're
+            // letters that must type into the filter.
+            KeyCode::Up => app.move_selection(-1),
+            KeyCode::Down => app.move_selection(1),
+            KeyCode::PageUp => app.move_selection(-10),
+            KeyCode::PageDown => app.move_selection(10),
             KeyCode::Char(c) => {
                 app.filter.push(c);
             }
@@ -983,4 +1001,19 @@ fn restore_terminal() -> io::Result<()> {
     disable_raw_mode()?;
     execute!(io::stdout(), LeaveAlternateScreen)?;
     Ok(())
+}
+
+/// Readline-style Ctrl+W: delete the last word from `s`. Strips trailing
+/// whitespace first (so `foo bar  <^W>` becomes `foo `), then pops
+/// non-whitespace until the word is gone (so the next press gets `foo`).
+fn delete_prev_word(s: &mut String) {
+    while s.ends_with(char::is_whitespace) {
+        s.pop();
+    }
+    while let Some(c) = s.chars().last() {
+        if c.is_whitespace() {
+            break;
+        }
+        s.pop();
+    }
 }
