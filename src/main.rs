@@ -306,7 +306,11 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                 app.filter_active = false;
             }
             KeyCode::Enter => {
+                // Exit edit AND jump in one keystroke. Avoids the awkward
+                // "press Enter to exit edit, press Enter again to jump"
+                // dance — less/vim search confirm-and-go behavior.
                 app.filter_active = false;
+                return jump_to_selected(app);
             }
             // Readline-style line edits.
             KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
@@ -531,33 +535,7 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         KeyCode::Char('r') => {
             app.status_msg = Some("refreshing…".to_string());
         }
-        KeyCode::Enter => {
-            if let Some(s) = app.selected_session() {
-                if let Some(pane) = &s.pane {
-                    let target = pane.target.clone();
-                    match tmux::jump_to(&target, app.should_zoom_on_jump()) {
-                        Ok(()) => {
-                            app.status_msg = Some(format!("jumped → {target}"));
-                            // Clear the search query — the user is moving
-                            // on, and a stale filter when they come back to
-                            // triage hides the rest of their session list.
-                            // Only on a successful jump; failures keep the
-                            // filter so the user can retry without retyping.
-                            app.filter.clear();
-                            // Popup-launch mode: exit so the overlay closes
-                            // and the user lands on the target pane in one
-                            // keypress. Without this they'd press q after.
-                            if app.exit_on_jump {
-                                return false;
-                            }
-                        }
-                        Err(e) => app.status_msg = Some(format!("jump failed: {e}")),
-                    }
-                } else {
-                    app.status_msg = Some("no tmux pane for this session".to_string());
-                }
-            }
-        }
+        KeyCode::Enter => return jump_to_selected(app),
         _ => {}
     }
     true
@@ -1022,4 +1000,33 @@ fn delete_prev_word(s: &mut String) {
         }
         s.pop();
     }
+}
+
+/// Jump to the currently-selected session's pane. Returns the value to
+/// propagate from `handle_key` — `false` only when `exit_on_jump` is set
+/// and the jump succeeded (popup-launch lifecycle). On success the filter
+/// is cleared so the next visit starts unfiltered; on failure the filter
+/// stays so the user can retry without retyping.
+fn jump_to_selected(app: &mut AppState) -> bool {
+    let Some(s) = app.selected_session() else {
+        return true;
+    };
+    let Some(pane) = &s.pane else {
+        app.status_msg = Some("no tmux pane for this session".to_string());
+        return true;
+    };
+    let target = pane.target.clone();
+    match tmux::jump_to(&target, app.should_zoom_on_jump()) {
+        Ok(()) => {
+            app.status_msg = Some(format!("jumped → {target}"));
+            app.filter.clear();
+            if app.exit_on_jump {
+                return false;
+            }
+        }
+        Err(e) => {
+            app.status_msg = Some(format!("jump failed: {e}"));
+        }
+    }
+    true
 }
