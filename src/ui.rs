@@ -1622,6 +1622,13 @@ fn session_matches_filter(s: &Session, q: &str) -> bool {
 /// - it's a terminal-emitted tab ID like `2.1.139` (all chars are digits or
 ///   dots). These show up under iTerm/Kitty / some shell prompts when the
 ///   user hasn't named the window themselves.
+/// - it's a `[bracketed]` marker (tmux uses `[tmux]` for nested instances,
+///   never user intent).
+/// - it's a known shell / editor / common-utility name that tmux's
+///   automatic-rename leaves in place after auto-rename gets disabled by a
+///   later `rename-window`. The `automatic_rename` flag is unreliable as a
+///   filter (stays off after manual rename even though the stale name was
+///   originally auto-derived), so we denylist the common offenders.
 fn useful_window_name(pane: &crate::models::Pane) -> Option<String> {
     let name = pane.window_name.trim();
     if name.is_empty() {
@@ -1633,5 +1640,37 @@ fn useful_window_name(pane: &crate::models::Pane) -> Option<String> {
     if name.chars().all(|c| c.is_ascii_digit() || c == '.') {
         return None;
     }
+    if name.starts_with('[') && name.ends_with(']') {
+        return None;
+    }
+    if is_auto_rename_residue(name) {
+        return None;
+    }
     Some(name.to_string())
+}
+
+/// Common shells / editors / utilities that tmux's automatic-rename
+/// historically set the window name to. We skip these as labels because
+/// they reflect what was running in the pane, not what the user wants the
+/// row to be called. The list is intentionally a small allowlist of "I've
+/// seen this auto-rename to a row label" rather than a sweeping catch-all.
+fn is_auto_rename_residue(name: &str) -> bool {
+    matches!(
+        name,
+        // shells
+        "fish" | "bash" | "zsh" | "sh" | "dash" | "ksh" | "tcsh"
+        // multiplexers / nested terminal
+        | "tmux" | "screen"
+        // editors
+        | "nvim" | "vim" | "vi" | "nano" | "emacs" | "helix" | "hx"
+        // common interpreters / CLIs
+        | "claude" | "node" | "python" | "python3" | "ruby" | "go"
+        | "irb" | "pry" | "ipython" | "psql" | "redis-cli" | "mysql"
+        // network / file tools
+        | "ssh" | "scp" | "rsync" | "git" | "lazygit" | "gh"
+        // monitors / pagers
+        | "top" | "htop" | "btop" | "less" | "more" | "cat" | "tail"
+        // build tools
+        | "make" | "cargo" | "pnpm" | "npm" | "yarn" | "bun"
+    )
 }
