@@ -509,14 +509,11 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             ));
         }
         KeyCode::Char('H') => {
-            if app.toggle_audit_log() {
-                app.status_msg = Some(format!(
-                    "audit log {}",
-                    if app.audit_log_open { "open" } else { "closed" }
-                ));
-            } else {
-                app.status_msg = Some("audit log unavailable — auto mode is off".to_string());
-            }
+            app.toggle_audit_log();
+            app.status_msg = Some(format!(
+                "audit log {}",
+                if app.audit_log_open { "open" } else { "closed" }
+            ));
         }
         KeyCode::Char('$') => {
             app.toggle_cost_overlay();

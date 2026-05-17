@@ -208,18 +208,16 @@ impl AppState {
         &self.cost_cache.as_ref().unwrap().1
     }
 
-    pub fn toggle_audit_log(&mut self) -> bool {
-        if !self.autonomous && !self.audit_log_open {
-            // Don't open the log when auto mode is off — there's nothing
-            // useful to look at, and the empty panel would be confusing.
-            return false;
-        }
+    pub fn toggle_audit_log(&mut self) {
+        // No autonomous gate: the log file persists historical entries
+        // across auto-mode toggles, so the user might genuinely want to
+        // review past decisions even when auto is currently off. The
+        // renderer already shows a sensible empty-state message.
         self.audit_log_open = !self.audit_log_open;
         if !self.audit_log_open {
             self.audit_log_offset = 0;
             self.pending_g = false;
         }
-        true
     }
 
     pub fn toggle_approval_mode(&mut self) {
