@@ -326,10 +326,13 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                 app.filter.pop();
             }
             // Navigation passes through to the table so the user can scan
-            // filtered rows live. j/k are deliberately NOT here — they're
-            // letters that must type into the filter.
+            // filtered rows live. Plain j/k are letters that must type into
+            // the filter, but Ctrl+J / Ctrl+K are free — wire them as vim-
+            // style nav for users whose hands stay on the home row.
             KeyCode::Up => app.move_selection(-1),
             KeyCode::Down => app.move_selection(1),
+            KeyCode::Char('k') if mods.contains(KeyModifiers::CONTROL) => app.move_selection(-1),
+            KeyCode::Char('j') if mods.contains(KeyModifiers::CONTROL) => app.move_selection(1),
             KeyCode::PageUp => app.move_selection(-10),
             KeyCode::PageDown => app.move_selection(10),
             KeyCode::Char(c) => {
