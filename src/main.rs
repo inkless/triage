@@ -557,7 +557,12 @@ fn deliver_approve(app: &AppState) -> String {
     let Some(t) = target else {
         return "session not at a prompt (or no pane)".to_string();
     };
-    match tmux::send_keys(&t, &["1", "Enter"]) {
+    // Just Enter — Claude's permission prompt defaults the highlight to
+    // option 1 (Yes). Sending a literal "1" first used to be belt-and-
+    // suspenders, but in the status-stale window where the prompt has
+    // already been dismissed the "1" lands as text in the chat input.
+    // Enter on an empty prompt is a no-op; "1" is visible damage.
+    match tmux::send_keys(&t, &["Enter"]) {
         Ok(()) if app.approval_mode == models::ApprovalMode::Hook => {
             format!("approved → {t} (tmux fallback)")
         }
@@ -967,7 +972,7 @@ fn route_decision(
         return;
     }
     let Some(target) = pane_target else { return };
-    let keys: &[&str] = if approve { &["1", "Enter"] } else { &["Escape"] };
+    let keys: &[&str] = if approve { &["Enter"] } else { &["Escape"] };
     let _ = tmux::send_keys(target, keys);
 }
 
