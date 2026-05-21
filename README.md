@@ -17,6 +17,7 @@ cargo install --path .
 triage              # launch the TUI
 triage --probe      # print the joined session table once (no TUI)
 triage notify "..." # one-shot ntfy push using config.toml's [ntfy] block
+triage cost         # daily/weekly Claude spend rollup across all transcripts
 ```
 
 The `notify` subcommand lets any agent, hook, or shell script ping the user's phone without re-implementing ntfy auth:
@@ -68,9 +69,9 @@ triage --uninstall-hooks       # remove
 ```
 General:
   ↑↓ / j k         move selection
+  gg / G           jump to top / bottom
   ⏎                jump to selected session's tmux pane
   space            toggle detail panel
-  r                request manual refresh
   q / Ctrl-C       quit
 
 Approve / deny / mute / watch:
@@ -82,8 +83,14 @@ Approve / deny / mute / watch:
   m                mute / unmute selected session
   w                watch / unwatch selected session — sticky; fires a "finished" banner on every work → done transition until toggled off
 
-Audit-log overlay (only when auto mode is on):
-  H                open / close
+Filter & overlays:
+  /                start filter (matches name + cwd, case-insensitive)
+                   in edit mode: type to filter · ↑↓ navigate · ⏎ jump to selection
+                                 Esc clear · ^W delete word · ^U clear line
+  H                open / close audit-log overlay (auto-mode decision history)
+  $                open / close cost overlay (cross-session spend rollup)
+
+Overlay navigation (H / $):
   j k / ↑↓         scroll one line
   ^d / ^u          half-page
   gg               jump to top
