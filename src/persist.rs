@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::ApprovalMode;
+use crate::models::{ApprovalMode, Session};
 
 /// Stable identity for a Claude session that survives a triage restart.
 /// We can't use pid (recycled by the OS) or sessionId (rewritten by `/clear`),
@@ -16,6 +16,23 @@ pub struct MuteKey {
     pub started_at_ms: u64,
 }
 
+/// Triage-local display alias identity. Provider + session id is stable for
+/// Codex thread ids and avoids collisions if providers use similar ids.
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AliasKey {
+    pub provider: String,
+    pub session_id: String,
+}
+
+impl AliasKey {
+    pub fn for_session(session: &Session) -> Self {
+        Self {
+            provider: session.provider.label().to_string(),
+            session_id: session.session_id.clone(),
+        }
+    }
+}
+
 /// On-disk shape: list of mutes with a Unix-seconds timestamp.
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedMute {
@@ -24,10 +41,21 @@ struct PersistedMute {
     muted_at_secs: u64,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedAlias {
+    provider: String,
+    session_id: String,
+    alias: String,
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 struct PersistedState {
     #[serde(default)]
     mutes: Vec<PersistedMute>,
+    /// User-provided triage-only row names. These deliberately do not mutate
+    /// Claude/Codex/tmux state; they are display aliases owned by triage.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    aliases: Vec<PersistedAlias>,
     /// Optional for backward-compat with state.json files written before the
     /// approval-mode toggle existed. Missing → use `ApprovalMode::default()`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,6 +90,7 @@ fn state_path() -> PathBuf {
 
 pub struct LoadedState {
     pub mutes: Vec<(MuteKey, SystemTime)>,
+    pub aliases: Vec<(AliasKey, String)>,
     pub approval_mode: ApprovalMode,
     pub autonomous: bool,
     pub phone_push_enabled: bool,
@@ -71,6 +100,7 @@ impl LoadedState {
     fn empty() -> Self {
         Self {
             mutes: Vec::new(),
+            aliases: Vec::new(),
             approval_mode: ApprovalMode::default(),
             autonomous: false,
             phone_push_enabled: true,
@@ -100,8 +130,23 @@ pub fn load_state() -> LoadedState {
             )
         })
         .collect();
+    let aliases = state
+        .aliases
+        .into_iter()
+        .filter(|a| !a.alias.trim().is_empty() && !a.session_id.is_empty())
+        .map(|a| {
+            (
+                AliasKey {
+                    provider: a.provider,
+                    session_id: a.session_id,
+                },
+                a.alias,
+            )
+        })
+        .collect();
     LoadedState {
         mutes,
+        aliases,
         approval_mode: state.approval_mode.unwrap_or_default(),
         autonomous: state.autonomous,
         phone_push_enabled: state.phone_push_enabled,
@@ -140,15 +185,17 @@ pub fn save_last_pane_id(pane_id: &str) {
 
 /// Best-effort save. Failures are ignored — losing prefs is annoying
 /// but not catastrophic, and we don't want IO errors to surface in the TUI.
-pub fn save_state<'a, I>(
-    entries: I,
+pub fn save_state<'a, M, A>(
+    mutes_iter: M,
+    aliases_iter: A,
     approval_mode: ApprovalMode,
     autonomous: bool,
     phone_push_enabled: bool,
 ) where
-    I: IntoIterator<Item = (&'a MuteKey, &'a SystemTime)>,
+    M: IntoIterator<Item = (&'a MuteKey, &'a SystemTime)>,
+    A: IntoIterator<Item = (&'a AliasKey, &'a String)>,
 {
-    let mutes: Vec<PersistedMute> = entries
+    let mutes: Vec<PersistedMute> = mutes_iter
         .into_iter()
         .filter_map(|(k, t)| {
             let secs = t.duration_since(UNIX_EPOCH).ok()?.as_secs();
@@ -157,6 +204,15 @@ pub fn save_state<'a, I>(
                 started_at_ms: k.started_at_ms,
                 muted_at_secs: secs,
             })
+        })
+        .collect();
+    let aliases: Vec<PersistedAlias> = aliases_iter
+        .into_iter()
+        .filter(|(_, alias)| !alias.trim().is_empty())
+        .map(|(key, alias)| PersistedAlias {
+            provider: key.provider.clone(),
+            session_id: key.session_id.clone(),
+            alias: alias.trim().to_string(),
         })
         .collect();
     // Read existing pane_id and preserve. The full save path is for mutes /
@@ -169,6 +225,7 @@ pub fn save_state<'a, I>(
         .and_then(|s| s.last_pane_id);
     let state = PersistedState {
         mutes,
+        aliases,
         approval_mode: Some(approval_mode),
         autonomous,
         phone_push_enabled,

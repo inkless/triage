@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime};
 
-use crate::models::{AttentionState, Session};
+use crate::models::{AttentionState, Provider, Session};
 
 const JUST_FINISHED_WINDOW: Duration = Duration::from_secs(3 * 60);
 const IDLE_LONG_THRESHOLD: Duration = Duration::from_secs(30 * 60);
@@ -10,6 +10,10 @@ const IDLE_LONG_THRESHOLD: Duration = Duration::from_secs(30 * 60);
 const STALE_THRESHOLD: Duration = Duration::from_secs(24 * 60 * 60);
 
 pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
+    if session.provider == Provider::Codex {
+        return classify_codex(session, now);
+    }
+
     if session.last_stop_had_errors {
         return AttentionState::Error;
     }
@@ -75,6 +79,41 @@ pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
     if let Some(last) = session.last_event_at
         && let Ok(age) = now.duration_since(last)
     {
+        if age <= JUST_FINISHED_WINDOW {
+            return AttentionState::JustFinished;
+        }
+        if age >= IDLE_LONG_THRESHOLD {
+            return AttentionState::IdleLong;
+        }
+        return AttentionState::IdleShort;
+    }
+
+    AttentionState::Unknown
+}
+
+fn classify_codex(session: &Session, now: SystemTime) -> AttentionState {
+    if session.pane_blocked {
+        return AttentionState::Blocked;
+    }
+
+    let event_age = session
+        .last_event_at
+        .and_then(|t| now.duration_since(t).ok());
+    if let Some(age) = event_age
+        && age >= STALE_THRESHOLD
+    {
+        return AttentionState::Stale;
+    }
+
+    if session.status == "busy" {
+        return AttentionState::Working;
+    }
+
+    if session.user_prompt_count == 0 && session.headline.is_none() {
+        return AttentionState::Fresh;
+    }
+
+    if let Some(age) = event_age {
         if age <= JUST_FINISHED_WINDOW {
             return AttentionState::JustFinished;
         }

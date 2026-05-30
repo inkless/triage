@@ -12,8 +12,8 @@ use std::collections::{HashMap, HashSet};
 use crate::auditor::Verdict;
 use crate::classifier::idle_age;
 use crate::config::Config;
-use crate::models::{ApprovalMode, AttentionState, Session};
-use crate::persist::{self, MuteKey};
+use crate::models::{ApprovalMode, AttentionState, Provider, Session};
+use crate::persist::{self, AliasKey, MuteKey};
 use crate::transcript::DigestCache;
 
 pub struct AppState {
@@ -22,6 +22,10 @@ pub struct AppState {
     pub detail_open: bool,
     pub status_msg: Option<String>,
     pub digest_cache: DigestCache,
+    pub codex_cache: crate::codex::CodexDigestCache,
+    /// Triage-local row aliases keyed by provider + provider session id.
+    /// These never mutate Claude/Codex/tmux state.
+    pub aliases: HashMap<AliasKey, String>,
     /// (cwd, started_at_ms) → time of mute. Keyed on a stable identity rather
     /// than pid so the entries survive a triage restart and don't accidentally
     /// re-mute a recycled pid.
@@ -97,6 +101,10 @@ pub struct AppState {
     /// query, Esc clears it). Outside edit mode the filter just applies
     /// and all other keybindings work normally on the filtered subset.
     pub filter_active: bool,
+    /// True while editing a triage-local alias after pressing `R`.
+    pub rename_active: bool,
+    pub rename_key: Option<AliasKey>,
+    pub rename_buffer: String,
     /// When true, triage exits cleanly after a successful `Enter` jump. Set
     /// by `--exit-on-jump`. Designed for the tmux popup launch pattern: the
     /// popup closes when triage exits, so a single keypress (`Enter`) both
@@ -132,6 +140,7 @@ impl AppState {
         state.select(Some(0));
         let loaded = persist::load_state();
         let muted = loaded.mutes.into_iter().collect();
+        let aliases = loaded.aliases.into_iter().collect();
         let (audit_tx, audit_rx) = mpsc::channel();
         Self {
             sessions: Vec::new(),
@@ -139,6 +148,8 @@ impl AppState {
             detail_open: false,
             status_msg: None,
             digest_cache: DigestCache::new(),
+            codex_cache: crate::codex::CodexDigestCache::new(),
+            aliases,
             muted,
             watched: HashSet::new(),
             last_states: HashMap::new(),
@@ -162,6 +173,9 @@ impl AppState {
             cost_cache: None,
             filter: String::new(),
             filter_active: false,
+            rename_active: false,
+            rename_key: None,
+            rename_buffer: String::new(),
             exit_on_jump: false,
             zoom_on_jump: false,
             last_pane_width: 0,
@@ -247,7 +261,9 @@ impl AppState {
     }
 
     pub fn toggle_mute_selected(&mut self) {
-        let Some(s) = self.selected_session() else { return };
+        let Some(s) = self.selected_session() else {
+            return;
+        };
         let key = MuteKey {
             cwd: s.cwd.clone(),
             started_at_ms: s.started_at_ms,
@@ -285,10 +301,61 @@ impl AppState {
     pub fn persist_state(&self) {
         persist::save_state(
             self.muted.iter(),
+            self.aliases.iter(),
             self.approval_mode,
             self.autonomous,
             self.phone_push_enabled,
         );
+    }
+
+    pub fn start_rename_selected(&mut self) -> Option<()> {
+        let s = self.selected_session()?;
+        let key = AliasKey::for_session(s);
+        self.rename_buffer = self
+            .aliases
+            .get(&key)
+            .cloned()
+            .or_else(|| s.name.clone())
+            .unwrap_or_default();
+        self.rename_active = true;
+        self.rename_key = Some(key);
+        self.pending_g = false;
+        Some(())
+    }
+
+    pub fn cancel_rename(&mut self) {
+        self.rename_active = false;
+        self.rename_key = None;
+        self.rename_buffer.clear();
+    }
+
+    pub fn commit_rename_selected(&mut self) -> Option<String> {
+        let key = self
+            .rename_key
+            .take()
+            .or_else(|| self.selected_session().map(AliasKey::for_session))?;
+        let alias = self
+            .rename_buffer
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        self.rename_active = false;
+        self.rename_buffer.clear();
+        let msg = if alias.is_empty() {
+            self.aliases.remove(&key);
+            format!("alias cleared for {}", key.provider)
+        } else {
+            self.aliases.insert(key.clone(), alias.clone());
+            format!("alias: {alias}")
+        };
+        for session in &mut self.sessions {
+            if AliasKey::for_session(session) == key {
+                session.name = (!alias.is_empty()).then_some(alias.clone());
+            }
+        }
+        apply_aliases_to_sessions(&mut self.sessions, &self.aliases);
+        self.persist_state();
+        Some(msg)
     }
 
     /// Decide whether `Enter` should zoom the destination pane. Three sources:
@@ -358,11 +425,26 @@ impl AppState {
     }
 }
 
+pub fn apply_aliases_to_sessions(sessions: &mut [Session], aliases: &HashMap<AliasKey, String>) {
+    for session in sessions {
+        let key = AliasKey::for_session(session);
+        if let Some(alias) = aliases.get(&key)
+            && !alias.trim().is_empty()
+        {
+            session.name = Some(alias.clone());
+        }
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
     if app.audit_log_open {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(5),
+                Constraint::Length(1),
+            ])
             .split(f.area());
         draw_header(f, chunks[0], app);
         draw_audit_log(f, chunks[1], app, now);
@@ -374,7 +456,11 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
     if app.cost_overlay_open {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(1), Constraint::Min(5), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(5),
+                Constraint::Length(1),
+            ])
             .split(f.area());
         draw_header(f, chunks[0], app);
         draw_cost_overlay(f, chunks[1], app);
@@ -409,7 +495,11 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
     };
     // Show pane width inline + a `zoom` indicator when auto-detect is active,
     // so it's obvious whether Enter will zoom on the current device.
-    let zoom_marker = if app.should_zoom_on_jump() { " · zoom" } else { "" };
+    let zoom_marker = if app.should_zoom_on_jump() {
+        " · zoom"
+    } else {
+        ""
+    };
     // Show pane width (left, what ratatui drew into) and client width
     // (right, what tmux says the terminal is). The client width drives
     // auto-zoom; pane being narrow alone doesn't.
@@ -426,10 +516,24 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
         Span::raw("   "),
         Span::styled(counts, Style::default().fg(Color::DarkGray)),
     ];
-    if app.filter_active || !app.filter.is_empty() {
+    if app.rename_active {
+        let cursor = "_";
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            "rename: ",
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!("{}{cursor}", app.rename_buffer),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if app.filter_active || !app.filter.is_empty() {
         let cursor = if app.filter_active { "_" } else { "" };
         spans.push(Span::raw("   "));
-        spans.push(Span::styled("filter: ", Style::default().fg(Color::DarkGray)));
+        spans.push(Span::styled(
+            "filter: ",
+            Style::default().fg(Color::DarkGray),
+        ));
         spans.push(Span::styled(
             format!("{}{cursor}", app.filter),
             Style::default().fg(Color::Yellow),
@@ -478,32 +582,36 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
             vec![Cell::from("STATE"), Cell::from("HEADLINE")],
         ),
         LayoutMode::Medium => (
-            7 + 5 + 16 + 3 + 2,
+            7 + 5 + 3 + 16 + 4 + 2,
             vec![
                 Constraint::Length(7),
                 Constraint::Length(5),
+                Constraint::Length(3),
                 Constraint::Length(16),
                 Constraint::Min(20),
             ],
             vec![
                 Cell::from("STATE"),
                 Cell::from("AGE"),
+                Cell::from("AI"),
                 Cell::from("SESSION"),
                 Cell::from("HEADLINE"),
             ],
         ),
         LayoutMode::Wide => (
-            7 + 5 + 20 + 28 + 4 + 2,
+            7 + 5 + 3 + 18 + 24 + 5 + 2,
             vec![
                 Constraint::Length(7),
                 Constraint::Length(5),
-                Constraint::Length(20),
-                Constraint::Length(28),
+                Constraint::Length(3),
+                Constraint::Length(18),
+                Constraint::Length(24),
                 Constraint::Min(20),
             ],
             vec![
                 Cell::from("STATE"),
                 Cell::from("AGE"),
+                Cell::from("AI"),
                 Cell::from("SESSION"),
                 Cell::from("CWD"),
                 Cell::from("HEADLINE"),
@@ -518,8 +626,11 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
         .map(|(i, s)| build_row(s, now, headline_width, layout, Some(i) == selected_idx))
         .collect();
 
-    let header = Row::new(header_cells)
-        .style(Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD));
+    let header = Row::new(header_cells).style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD),
+    );
 
     // Selected row gets uniform REVERSED on top of cells that have already
     // been rendered with neutralized colors (see `build_row` `is_selected`
@@ -567,18 +678,15 @@ fn build_row(
                 .filter(|n| !n.is_empty() && !n.chars().all(|c| c.is_ascii_digit()))
                 .map(|n| n.to_string())
         })
-        .or_else(|| {
-            s.cwd
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-        })
+        .or_else(|| s.cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
         .unwrap_or_else(|| "?".to_string());
+    let provider_label = s.provider.label();
 
-    let cwd_short = shorten_path(&s.cwd.to_string_lossy(), 28);
+    let cwd_short = shorten_path(&s.cwd.to_string_lossy(), 24);
     // Only show a permission headline when Claude itself is actually paused on
     // user input. Pending files alone are not enough: the hook also sees
     // auto-approved tool calls.
-    let headline_raw = if s.status == "waiting" {
+    let headline_raw = if s.provider == Provider::Claude && s.status == "waiting" {
         if let Some(a) = s.pending_approvals.first() {
             if a.tool_input_brief.is_empty() {
                 format!("⏸ approve? {}", a.tool_name)
@@ -598,6 +706,16 @@ fn build_row(
             let what = s.waiting_for.as_deref().unwrap_or("input");
             format!("⏸ {what}?")
         }
+    } else if s.provider == Provider::Codex && s.state == AttentionState::Blocked {
+        if let Some((name, brief)) = &s.last_tool_use {
+            if brief.is_empty() {
+                format!("⏸ approve {name}?")
+            } else {
+                format!("⏸ approve {name}? — {brief}")
+            }
+        } else {
+            "⏸ codex needs input".to_string()
+        }
     } else {
         s.headline
             .clone()
@@ -609,7 +727,7 @@ fn build_row(
     // Narrow layout has only STATE+HEADLINE columns, so prefix the headline
     // with session label + age — otherwise the user can't tell rows apart.
     let headline_raw = match layout {
-        LayoutMode::Narrow => format!("{session_label}  {age}  · {headline_raw}"),
+        LayoutMode::Narrow => format!("{provider_label} {session_label}  {age}  · {headline_raw}"),
         _ => headline_raw,
     };
     let wrapped = wrap_text(&headline_raw, headline_width, 4);
@@ -659,10 +777,16 @@ fn build_row(
     };
     let session_style = if s.muted {
         Style::default().fg(Color::DarkGray)
-    } else if is_selected {
-        Style::default().add_modifier(Modifier::BOLD)
     } else {
         Style::default().add_modifier(Modifier::BOLD)
+    };
+    let provider_style = if is_selected && !s.muted {
+        Style::default()
+    } else {
+        match s.provider {
+            Provider::Claude => Style::default().fg(Color::DarkGray),
+            Provider::Codex => Style::default().fg(Color::Cyan),
+        }
     };
     let cwd_style = if is_selected && !s.muted {
         Style::default()
@@ -678,12 +802,14 @@ fn build_row(
         LayoutMode::Medium => vec![
             Cell::from(state_label).style(state_cell_style),
             Cell::from(age).style(cwd_style),
+            Cell::from(provider_label).style(provider_style),
             Cell::from(session_label).style(session_style),
             Cell::from(Text::from(headline_lines)),
         ],
         LayoutMode::Wide => vec![
             Cell::from(state_label).style(state_cell_style),
             Cell::from(age).style(cwd_style),
+            Cell::from(provider_label).style(provider_style),
             Cell::from(session_label).style(session_style),
             Cell::from(cwd_short).style(cwd_style),
             Cell::from(Text::from(headline_lines)),
@@ -711,7 +837,11 @@ fn wrap_text(text: &str, width: usize, max_lines: usize) -> Vec<String> {
             break;
         }
         let wlen = word.chars().count();
-        let need = if line.is_empty() { wlen } else { line_chars + 1 + wlen };
+        let need = if line.is_empty() {
+            wlen
+        } else {
+            line_chars + 1 + wlen
+        };
         if need <= width {
             if !line.is_empty() {
                 line.push(' ');
@@ -842,18 +972,19 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
         .map(|s| s.peak_context_tokens)
         .max()
         .unwrap_or(0);
-    let window = context_window_for_session(
-        s,
-        app_peak,
-        app.default_model.as_deref(),
-        app.config.model.context_window,
-    );
+    let default_model = (s.provider == Provider::Claude)
+        .then_some(app.default_model.as_deref())
+        .flatten();
+    let window =
+        context_window_for_session(s, app_peak, default_model, app.config.model.context_window);
     let is_1m = window >= 1_000_000;
 
     let mut header = vec![
         Span::styled(
             state_str,
-            Style::default().fg(state_color).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(state_color)
+                .add_modifier(Modifier::BOLD),
         ),
         sep(),
         Span::styled(pane_target, bold()),
@@ -862,7 +993,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
     // the version, e.g. `opus-4-7`); fall back to the user's global default
     // from settings.json (e.g. `opus[1m]`). Strip the `claude-` prefix and
     // append ` (1M)` when we've confirmed the 1M variant via any signal.
-    let model_raw = s.latest_model.as_deref().or(app.default_model.as_deref());
+    let model_raw = s.latest_model.as_deref().or(default_model);
     if let Some(m) = model_raw {
         let short = m.strip_prefix("claude-").unwrap_or(m);
         let label = if is_1m && !short.contains("[1m]") && !short.contains("(1M)") {
@@ -876,10 +1007,11 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
     header.push(sep());
     header.push(Span::styled(uptime, dim()));
     header.push(sep());
-    header.push(Span::styled(
-        format!("{} mode", app.approval_mode.label()),
-        dim(),
-    ));
+    let mode_label = match s.provider {
+        Provider::Claude => format!("{} mode", app.approval_mode.label()),
+        Provider::Codex => "codex".to_string(),
+    };
+    header.push(Span::styled(mode_label, dim()));
     if s.muted {
         header.push(sep());
         header.push(Span::styled("[muted]", yellow()));
@@ -905,13 +1037,10 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
         ]));
     }
 
-    if s.status == "waiting" {
+    if s.provider == Provider::Claude && s.status == "waiting" {
         if let Some(a) = s.pending_approvals.first() {
             lines.push(Line::from(vec![
-                Span::styled(
-                    a.tool_name.clone(),
-                    yellow().add_modifier(Modifier::BOLD),
-                ),
+                Span::styled(a.tool_name.clone(), yellow().add_modifier(Modifier::BOLD)),
                 Span::styled("  (hook)", dim()),
             ]));
             for line in a.tool_input_detail().lines().take(6) {
@@ -929,6 +1058,23 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
                 Span::raw("  "),
                 Span::raw(truncate(brief, 400)),
             ]));
+        }
+    } else if s.provider == Provider::Codex && s.state == AttentionState::Blocked {
+        lines.push(Line::from(vec![
+            Span::styled("codex  ", dim()),
+            Span::styled("approval requested in pane", yellow()),
+        ]));
+        if let Some((name, brief)) = &s.last_tool_use {
+            lines.push(Line::from(vec![
+                Span::styled(name.clone(), yellow().add_modifier(Modifier::BOLD)),
+                Span::styled("  (visible prompt)", dim()),
+            ]));
+            if !brief.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::raw(truncate(brief, 400)),
+                ]));
+            }
         }
     }
 
@@ -975,11 +1121,20 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
 
     // Cost + context + tokens — all on one line so cost data scans as a
     // single unit. Skip when there's nothing to show (fresh session).
-    if s.total_cost_usd > 0.0 || s.total_tokens_in > 0 {
-        let mut stats: Vec<Span> = vec![
-            Span::styled("cost   ", dim()),
-            Span::raw(format_cost(s.total_cost_usd)),
-        ];
+    if s.total_cost_usd > 0.0 || s.total_tokens_in > 0 || s.latest_context_tokens > 0 {
+        let mut stats: Vec<Span> = vec![Span::styled(
+            if s.provider == Provider::Codex {
+                "usage  "
+            } else {
+                "cost   "
+            },
+            dim(),
+        )];
+        let mut needs_sep = false;
+        if s.provider == Provider::Claude {
+            stats.push(Span::raw(format_cost(s.total_cost_usd)));
+            needs_sep = true;
+        }
         if s.latest_context_tokens > 0 {
             // `window` was computed once up front for the header's (1M)
             // annotation; reuse it here so header and stats agree.
@@ -991,7 +1146,9 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
             } else {
                 Color::DarkGray
             };
-            stats.push(sep());
+            if needs_sep {
+                stats.push(sep());
+            }
             stats.push(Span::raw(format!(
                 "{}/{}",
                 format_tokens(s.latest_context_tokens),
@@ -1002,18 +1159,25 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
                 Style::default().fg(pct_color),
             ));
             stats.push(Span::styled(" ctx", dim()));
+            needs_sep = true;
         }
-        stats.push(sep());
-        stats.push(Span::styled(
-            format!(
-                "{} in · {} out · {} cache",
-                format_tokens(s.total_tokens_in),
-                format_tokens(s.total_tokens_out),
-                format_tokens(s.total_tokens_cache_write + s.total_tokens_cache_read),
-            ),
-            dim(),
-        ));
-        stats.push(Span::styled("  (approx)", dim()));
+        if s.total_tokens_in > 0 || s.total_tokens_out > 0 || s.total_tokens_cache_read > 0 {
+            if needs_sep {
+                stats.push(sep());
+            }
+            stats.push(Span::styled(
+                format!(
+                    "{} in · {} out · {} cache",
+                    format_tokens(s.total_tokens_in),
+                    format_tokens(s.total_tokens_out),
+                    format_tokens(s.total_tokens_cache_write + s.total_tokens_cache_read),
+                ),
+                dim(),
+            ));
+        }
+        if s.provider == Provider::Claude {
+            stats.push(Span::styled("  (approx)", dim()));
+        }
         lines.push(Line::from(stats));
     }
 
@@ -1051,12 +1215,16 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
     }
 
     let block = Block::default().borders(Borders::TOP);
-    let para = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
+    let para = Paragraph::new(lines)
+        .block(block)
+        .wrap(Wrap { trim: false });
     f.render_widget(para, area);
 }
 
 fn format_age_opt(ts: Option<SystemTime>, now: SystemTime) -> String {
-    let Some(ts) = ts else { return "—".to_string() };
+    let Some(ts) = ts else {
+        return "—".to_string();
+    };
     let Ok(d) = now.duration_since(ts) else {
         return "—".to_string();
     };
@@ -1113,6 +1281,11 @@ fn context_window_for_session(
     override_window: Option<u64>,
 ) -> u64 {
     if let Some(n) = override_window
+        && n > 0
+    {
+        return n;
+    }
+    if let Some(n) = s.context_window
         && n > 0
     {
         return n;
@@ -1267,7 +1440,12 @@ fn draw_audit_log(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime
         let mut row1: Vec<Span> = vec![
             Span::styled(format!("{:>10}", ago), dim()),
             Span::raw("  "),
-            Span::styled(format!("{:<7}", decision), Style::default().fg(decision_color).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{:<7}", decision),
+                Style::default()
+                    .fg(decision_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
             Span::raw("  "),
             Span::styled(format!("{:<6}", tool), bold()),
             Span::raw("  "),
@@ -1410,7 +1588,11 @@ fn draw_cost_overlay(f: &mut Frame, area: Rect, app: &mut AppState) {
             strip.push((k, cost));
         }
     }
-    let peak = strip.iter().map(|(_, c)| *c).fold(0.0_f64, f64::max).max(0.01);
+    let peak = strip
+        .iter()
+        .map(|(_, c)| *c)
+        .fold(0.0_f64, f64::max)
+        .max(0.01);
     let bar_width = 28u16;
     for (k, c) in &strip {
         let filled = ((*c / peak) * bar_width as f64).round() as usize;
@@ -1457,7 +1639,11 @@ fn draw_cost_overlay(f: &mut Frame, area: Rect, app: &mut AppState) {
         )));
         let total: f64 = models.iter().map(|m| m.cost_usd).sum();
         for m in &models {
-            let pct = if total > 0.0 { 100.0 * m.cost_usd / total } else { 0.0 };
+            let pct = if total > 0.0 {
+                100.0 * m.cost_usd / total
+            } else {
+                0.0
+            };
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("{:<8}", m.model), bold()),
@@ -1557,13 +1743,31 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         );
         return;
     }
+    if app.rename_active {
+        let hint = "  rename alias  ·  ↵ save  ·  Esc cancel  ·  ^W word  ·  ^U clear";
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
     let line = if let Some(msg) = &app.status_msg {
-        Line::from(Span::styled(msg.clone(), Style::default().fg(Color::Yellow)))
+        Line::from(Span::styled(
+            msg.clone(),
+            Style::default().fg(Color::Yellow),
+        ))
     } else {
         let mode = app.approval_mode.label();
         let auto = if app.autonomous {
             let n = app.audit_in_flight.len();
-            if n > 0 { format!("AUTO·{n}") } else { "AUTO".to_string() }
+            if n > 0 {
+                format!("AUTO·{n}")
+            } else {
+                "AUTO".to_string()
+            }
         } else {
             "auto:off".to_string()
         };
@@ -1577,11 +1781,11 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         };
         let hint = match LayoutMode::from_width(area.width) {
             LayoutMode::Narrow => format!(" ⏎ a d h:{mode} A:{auto} q"),
-            LayoutMode::Medium => format!(
-                " ⏎ jump  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  w  q"
-            ),
+            LayoutMode::Medium => {
+                format!(" ⏎ jump  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  R rename  w  q")
+            }
             LayoutMode::Wide => format!(
-                "  ⏎ jump  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  w watch  / filter  H log  $ cost  q quit"
+                "  ⏎ jump  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  w watch  R rename  / filter  H log  $ cost  q quit"
             ),
         };
         let style = if app.autonomous {
@@ -1599,6 +1803,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
 /// tmux session name, and the full cwd path. `q` is already lowercased by
 /// the caller. Returning early on any hit keeps this cheap on large fleets.
 fn session_matches_filter(s: &Session, q: &str) -> bool {
+    if s.provider.label().contains(q) || (s.provider == Provider::Codex && "codex".contains(q)) {
+        return true;
+    }
     if let Some(name) = &s.name
         && name.to_lowercase().contains(q)
     {

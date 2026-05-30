@@ -1,14 +1,15 @@
 mod approval;
 mod auditor;
 mod classifier;
+mod codex;
 mod config;
 mod cost_rollup;
 mod discovery;
 mod models;
 mod notify_os;
 mod persist;
-mod transcript;
 mod tmux;
+mod transcript;
 mod ui;
 mod watcher;
 
@@ -162,7 +163,7 @@ FLAGS:
 
 IN-TUI KEYBINDINGS:
   ⏎ jump · a/d approve/deny · h toggle approval mode · A toggle auto mode
-  p toggle phone push · m mute · w watch · / filter (name + cwd)
+  p toggle phone push · m mute · w watch · R rename · / filter (name + cwd)
   H audit log · $ cost overlay · q quit
 
 DOCS:
@@ -176,7 +177,6 @@ fn probe() -> io::Result<()> {
     let now = SystemTime::now();
     let mut sessions = discovery::discover_live_sessions();
     let panes = tmux::list_panes();
-    println!("# discovered {} live sessions, {} tmux panes\n", sessions.len(), panes.len());
     // Resolve panes before pairing so assign_transcripts can see which session
     // is in the currently-focused tmux pane.
     let ppid_map = tmux::build_ppid_map();
@@ -188,8 +188,24 @@ fn probe() -> io::Result<()> {
     for s in &mut sessions {
         transcript::enrich(s, now, &mut cache);
     }
+    let claude_count = sessions.len();
+    let mut codex_cache = codex::CodexDigestCache::new();
+    let mut codex_sessions = codex::discover_live_sessions(&panes, &ppid_map, &mut codex_cache);
+    let codex_count = codex_sessions.len();
+    sessions.append(&mut codex_sessions);
+    let loaded_state = persist::load_state();
+    let aliases = loaded_state.aliases.into_iter().collect();
+    ui::apply_aliases_to_sessions(&mut sessions, &aliases);
+    println!(
+        "# discovered {} live sessions ({} Claude, {} Codex), {} tmux panes\n",
+        sessions.len(),
+        claude_count,
+        codex_count,
+        panes.len()
+    );
     for s in &mut sessions {
-        if s.status == "waiting"
+        if s.provider == models::Provider::Claude
+            && s.status == "waiting"
             && s.last_tool_use.is_none()
             && let Some(pane) = &s.pane
             && let Some(content) = tmux::capture_pane(&pane.target)
@@ -214,7 +230,8 @@ fn probe() -> io::Result<()> {
     // the transcript level, so excluding those would miss the case. The
     // strict anchor keeps the false-positive risk negligible.
     for s in &mut sessions {
-        if s.status == "busy"
+        if s.provider == models::Provider::Claude
+            && s.status == "busy"
             && s.pending_approvals.is_empty()
             && let Some(pane) = &s.pane
             && let Some(content) = tmux::capture_pane_tail(&pane.target, 15)
@@ -224,8 +241,23 @@ fn probe() -> io::Result<()> {
         }
     }
     for s in &mut sessions {
+        if s.provider == models::Provider::Codex
+            && s.status == "busy"
+            && s.approval_prompt_pending
+            && let Some(pane) = &s.pane
+            && let Some(content) = tmux::capture_pane_tail(&pane.target, 40)
+            && tmux::has_codex_permission_prompt(&content)
+        {
+            s.pane_blocked = true;
+        }
+    }
+    for s in &mut sessions {
         s.state = classifier::classify(s, now);
-        let pane = s.pane.as_ref().map(|p| p.target.as_str()).unwrap_or("(none)");
+        let pane = s
+            .pane
+            .as_ref()
+            .map(|p| p.target.as_str())
+            .unwrap_or("(none)");
         let headline = s
             .headline
             .as_deref()
@@ -233,12 +265,15 @@ fn probe() -> io::Result<()> {
             .unwrap_or("(no transcript)")
             .replace('\n', " ");
         let head_short: String = headline.chars().take(80).collect();
+        let name_short: String = s.name.as_deref().unwrap_or("-").chars().take(28).collect();
         println!(
-            "  pid={:<6} state={:<6} status={:<5} pane={:<24} cwd={}",
+            "  {:<2} pid={:<6} state={:<6} status={:<5} pane={:<24} name={:<28} cwd={}",
+            s.provider.label(),
             s.pid,
             s.state.label(),
             s.status,
             pane,
+            name_short,
             s.cwd.display()
         );
         println!("    headline: {head_short}");
@@ -293,6 +328,38 @@ fn run(
 }
 
 fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
+    if app.rename_active {
+        match code {
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Esc => {
+                app.cancel_rename();
+                app.status_msg = Some("rename canceled".to_string());
+            }
+            KeyCode::Enter => {
+                app.status_msg = app
+                    .commit_rename_selected()
+                    .or_else(|| Some("no session selected".to_string()));
+            }
+            KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
+                delete_prev_word(&mut app.rename_buffer);
+            }
+            KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+                app.rename_buffer.clear();
+            }
+            KeyCode::Char('h') if mods.contains(KeyModifiers::CONTROL) => {
+                app.rename_buffer.pop();
+            }
+            KeyCode::Backspace => {
+                app.rename_buffer.pop();
+            }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                app.rename_buffer.push(c);
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     // Filter edit mode. Printable keys go into the filter string; the rest
     // are wired to either common readline editing (Ctrl+W / Ctrl+U / Ctrl+H)
     // or table navigation (arrows / PgUp / PgDn) so the user can scroll the
@@ -482,8 +549,19 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             if let Some((now_watching, label)) = app.toggle_watch_selected() {
                 app.status_msg = Some(format!(
                     "{}: {label}",
-                    if now_watching { "watching" } else { "unwatched" }
+                    if now_watching {
+                        "watching"
+                    } else {
+                        "unwatched"
+                    }
                 ));
+            } else {
+                app.status_msg = Some("no session selected".to_string());
+            }
+        }
+        KeyCode::Char('R') => {
+            if app.start_rename_selected().is_some() {
+                app.status_msg = None;
             } else {
                 app.status_msg = Some("no session selected".to_string());
             }
@@ -519,7 +597,11 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             app.toggle_cost_overlay();
             app.status_msg = Some(format!(
                 "cost overlay {}",
-                if app.cost_overlay_open { "open" } else { "closed" }
+                if app.cost_overlay_open {
+                    "open"
+                } else {
+                    "closed"
+                }
             ));
         }
         KeyCode::Char('/') => {
@@ -544,6 +626,13 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
 /// is genuinely paused. Tmux mode always sends keys directly. Returns the
 /// status-bar string to show.
 fn deliver_approve(app: &AppState) -> String {
+    let Some(selected) = app.selected_session() else {
+        return "no session selected".to_string();
+    };
+    if selected.provider == models::Provider::Codex {
+        return deliver_codex_decision(selected, true);
+    }
+
     if app.approval_mode == models::ApprovalMode::Hook
         && let Some(uuid) = app.oldest_pending_uuid()
     {
@@ -572,6 +661,13 @@ fn deliver_approve(app: &AppState) -> String {
 }
 
 fn deliver_deny(app: &AppState) -> String {
+    let Some(selected) = app.selected_session() else {
+        return "no session selected".to_string();
+    };
+    if selected.provider == models::Provider::Codex {
+        return deliver_codex_decision(selected, false);
+    }
+
     if app.approval_mode == models::ApprovalMode::Hook
         && let Some(uuid) = app.oldest_pending_uuid()
     {
@@ -592,6 +688,39 @@ fn deliver_deny(app: &AppState) -> String {
         Ok(()) => format!("denied → {t}"),
         Err(e) => format!("deny failed: {e}"),
     }
+}
+
+fn deliver_codex_decision(s: &models::Session, approve: bool) -> String {
+    if s.state != models::AttentionState::Blocked || !s.approval_prompt_pending {
+        return "codex session not blocked".to_string();
+    }
+    let Some(target) = s.pane.as_ref().map(|p| p.target.clone()) else {
+        return "codex session has no pane".to_string();
+    };
+    match route_codex_decision(&target, approve) {
+        Ok(()) if approve => format!("approved codex → {target}"),
+        Ok(()) => format!("denied codex → {target}"),
+        Err(e) if approve => format!("codex approve failed: {e}"),
+        Err(e) => format!("codex deny failed: {e}"),
+    }
+}
+
+fn route_codex_decision(target: &str, approve: bool) -> Result<(), String> {
+    let Some(content) = tmux::capture_pane_tail(target, 80) else {
+        return Err(format!("prompt check failed: {target}"));
+    };
+    if !tmux::has_codex_permission_prompt(&content) {
+        return Err("prompt no longer visible".to_string());
+    }
+    let Some(selected) = tmux::codex_selected_permission_choice(&content) else {
+        return Err("prompt has no selected choice".to_string());
+    };
+    if approve && selected != tmux::CodexPromptChoice::Yes {
+        return Err("Yes is not selected".to_string());
+    }
+
+    let key = if approve { "Enter" } else { "Escape" };
+    tmux::send_keys(target, &[key]).map_err(|e| e.to_string())
 }
 
 fn refresh(app: &mut AppState) {
@@ -615,13 +744,16 @@ fn refresh(app: &mut AppState) {
     for s in &mut sessions {
         transcript::enrich(s, now, &mut app.digest_cache);
     }
+    let mut codex_sessions = codex::discover_live_sessions(&panes, &ppid_map, &mut app.codex_cache);
+    sessions.append(&mut codex_sessions);
     // For sessions paused at a permission prompt, the pending tool_use isn't
     // yet in the JSONL — Claude only flushes tool_use+tool_result together
     // after the round-trip completes. Capture the pane and pull the brief
     // from the prompt UI directly. Tool name comes from sessions JSON
     // `waitingFor` ("approve Bash" → "Bash").
     for s in &mut sessions {
-        if s.status == "waiting"
+        if s.provider == models::Provider::Claude
+            && s.status == "waiting"
             && s.last_tool_use.is_none()
             && let Some(pane) = &s.pane
             && let Some(content) = tmux::capture_pane(&pane.target)
@@ -650,7 +782,8 @@ fn refresh(app: &mut AppState) {
     // like at the transcript level, so excluding those would miss the
     // case. The strict anchor keeps the false-positive risk negligible.
     for s in &mut sessions {
-        if s.status == "busy"
+        if s.provider == models::Provider::Claude
+            && s.status == "busy"
             && s.pending_approvals.is_empty()
             && let Some(pane) = &s.pane
             && let Some(content) = tmux::capture_pane_tail(&pane.target, 15)
@@ -659,10 +792,27 @@ fn refresh(app: &mut AppState) {
             s.pane_blocked = true;
         }
     }
+    // Codex has no `status=waiting` or hook decision-file path. Mark it
+    // Blocked only when the rollout says the latest unfinished tool requested
+    // approval AND the visible pane shows Codex's approval UI. A pending
+    // approval-shaped tool call alone may also be an already-approved
+    // long-running command, so pane evidence is required.
+    for s in &mut sessions {
+        if s.provider == models::Provider::Codex
+            && s.status == "busy"
+            && s.approval_prompt_pending
+            && let Some(pane) = &s.pane
+            && let Some(content) = tmux::capture_pane_tail(&pane.target, 40)
+            && tmux::has_codex_permission_prompt(&content)
+        {
+            s.pane_blocked = true;
+        }
+    }
     for s in &mut sessions {
         s.state = classifier::classify(s, now);
     }
     app.digest_cache.evict_missing();
+    app.codex_cache.evict_missing();
 
     // Auto-unmute any session whose user-text timestamp has advanced past the
     // mute-at time. The user typing in a muted pane is the strongest possible
@@ -678,10 +828,7 @@ fn refresh(app: &mut AppState) {
             // Not currently live — keep the entry; it'll apply if the session
             // shows up again, and become orphaned otherwise (still harmless).
             None => true,
-            Some(s) => match s.last_prompt_at {
-                Some(ts) if ts > *mute_at => false,
-                _ => true,
-            },
+            Some(s) => !matches!(s.last_prompt_at, Some(ts) if ts > *mute_at),
         }
     });
     for s in &mut sessions {
@@ -692,6 +839,7 @@ fn refresh(app: &mut AppState) {
         s.muted = app.muted.contains_key(&key);
         s.watched = app.watched.contains(&key);
     }
+    ui::apply_aliases_to_sessions(&mut sessions, &app.aliases);
     if app.muted.len() != mute_count_before {
         app.persist_state();
     }
@@ -734,8 +882,8 @@ fn refresh(app: &mut AppState) {
         // Also gated on the user-level `phone_push_enabled` toggle (T-79):
         // when off, never POST to ntfy regardless of state. Mac local
         // banner still fires from `notify_os::alert` unchanged.
-        let phone_push = app.phone_push_enabled
-            && !(app.autonomous && s.state == models::AttentionState::Blocked);
+        let phone_push =
+            app.phone_push_enabled && !(app.autonomous && is_auto_auditable_blocked(s));
         notify_os::alert(s, &app.config, phone_push);
     }
     // T-81 watch fire: any watched session that just transitioned into
@@ -762,6 +910,68 @@ fn refresh(app: &mut AppState) {
     app.status_msg = None;
 }
 
+fn is_auto_auditable_blocked(s: &models::Session) -> bool {
+    matches!(
+        s.provider,
+        models::Provider::Claude | models::Provider::Codex
+    ) && s.state == models::AttentionState::Blocked
+}
+
+fn audit_payload_for_session(s: &models::Session) -> Option<(String, String)> {
+    match s.provider {
+        models::Provider::Claude => audit_payload_for_claude(s),
+        models::Provider::Codex => audit_payload_for_codex(s),
+    }
+}
+
+fn audit_payload_for_claude(s: &models::Session) -> Option<(String, String)> {
+    // Prefer hook-captured (richer, structured, FULL untruncated input).
+    // When the hook didn't fire (timed out for a stale Blocked, or the
+    // session is in `permission_mode=auto` so the hook bailed), do a fresh
+    // pane capture and parse the full pending command, not the UI brief.
+    if let Some(a) = s.pending_approvals.first() {
+        return Some((a.tool_name.clone(), a.tool_input_full.clone()));
+    }
+    if let Some(pane) = &s.pane
+        && let Some(content) = tmux::capture_pane(&pane.target)
+        && let Some(full_input) = tmux::parse_pending_full(&content)
+    {
+        let tool_name = s
+            .last_tool_use
+            .as_ref()
+            .map(|(n, _)| n.clone())
+            .or_else(|| {
+                s.waiting_for
+                    .as_deref()
+                    .and_then(|w| w.strip_prefix("approve "))
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| "?".to_string());
+        return Some((tool_name, full_input));
+    }
+    s.last_tool_use
+        .as_ref()
+        .map(|(name, brief)| (name.clone(), brief.clone()))
+}
+
+fn audit_payload_for_codex(s: &models::Session) -> Option<(String, String)> {
+    let pane = s.pane.as_ref()?;
+    let content = tmux::capture_pane_tail(&pane.target, 80)?;
+    if !tmux::has_codex_permission_prompt(&content)
+        || tmux::codex_selected_permission_choice(&content).is_none()
+    {
+        return None;
+    }
+    let tool_name = s
+        .last_tool_use
+        .as_ref()
+        .map(|(name, _)| name.clone())
+        .unwrap_or_else(|| "codex tool".to_string());
+    let tool_input = tmux::parse_codex_pending_full(&content)
+        .or_else(|| s.last_tool_use.as_ref().map(|(_, brief)| brief.clone()))?;
+    Some((tool_name, tool_input))
+}
+
 /// T-56: autonomous-mode driver. Runs every refresh tick whether the toggle is
 /// on or off — drains finished verdicts (so an in-flight worker doesn't leak
 /// channel capacity after toggle-off) and clears stale `audit_decided` entries.
@@ -782,7 +992,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
     // time they pause on a permission prompt we'll audit again.
     let blocked_keys: HashSet<persist::MuteKey> = sessions
         .iter()
-        .filter(|s| s.state == models::AttentionState::Blocked)
+        .filter(|s| is_auto_auditable_blocked(s))
         .map(|s| persist::MuteKey {
             cwd: s.cwd.clone(),
             started_at_ms: s.started_at_ms,
@@ -815,9 +1025,10 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         if !app.autonomous {
             continue;
         }
-        let Some(s) = sessions.iter().find(|s| {
-            s.pid == v.pid && s.state == models::AttentionState::Blocked && !s.muted
-        }) else {
+        let Some(s) = sessions
+            .iter()
+            .find(|s| s.pid == v.pid && is_auto_auditable_blocked(s) && !s.muted)
+        else {
             continue;
         };
         let key = persist::MuteKey {
@@ -848,7 +1059,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
     // not muted, and with an actual tool_use to feed the auditor.
     for s in sessions
         .iter()
-        .filter(|s| s.state == models::AttentionState::Blocked && !s.muted)
+        .filter(|s| is_auto_auditable_blocked(s) && !s.muted)
     {
         if app.audit_in_flight.contains_key(&s.pid) {
             continue;
@@ -860,37 +1071,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         if app.audit_decided.contains(&key) {
             continue;
         }
-        // Prefer hook-captured (richer, structured, FULL untruncated input).
-        // When the hook didn't fire (timed out for a stale Blocked, or the
-        // session is in `permission_mode=auto` so the hook bailed), do a
-        // fresh pane capture and parse the full pending command — NOT the
-        // UI brief in `last_tool_use.1`, which is line-capped to 20 and
-        // joined with spaces (auditor was refusing on "truncated heredoc"
-        // for legitimate Bash commands).
-        let (tool_name, tool_input) = if let Some(a) = s.pending_approvals.first() {
-            (a.tool_name.clone(), a.tool_input_full.clone())
-        } else if let Some(pane) = &s.pane
-            && let Some(content) = tmux::capture_pane(&pane.target)
-            && let Some(full_input) = tmux::parse_pending_full(&content)
-        {
-            let tool_name = s
-                .last_tool_use
-                .as_ref()
-                .map(|(n, _)| n.clone())
-                .or_else(|| {
-                    s.waiting_for
-                        .as_deref()
-                        .and_then(|w| w.strip_prefix("approve "))
-                        .map(String::from)
-                })
-                .unwrap_or_else(|| "?".to_string());
-            (tool_name, full_input)
-        } else if let Some((n, b)) = &s.last_tool_use {
-            // Last-resort: the row already had a tool_use from transcript +
-            // brief from earlier capture, but the pane scrape just failed
-            // (process gone, etc.). Use the brief — better than nothing.
-            (n.clone(), b.clone())
-        } else {
+        let Some((tool_name, tool_input)) = audit_payload_for_session(s) else {
             continue;
         };
         let intent = s
@@ -910,6 +1091,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         // needs the pane target; we capture both and let the worker pick.
         let uuid = s.pending_approvals.first().map(|a| a.uuid.clone());
         let pane_target = s.pane.as_ref().map(|p| p.target.clone());
+        let provider = s.provider;
         let approval_mode = app.approval_mode;
         let tx = app.audit_tx.clone();
         // Stake the claim BEFORE spawning so the hook sees it on its next
@@ -919,7 +1101,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         }
         app.audit_in_flight.insert(pid, SystemTime::now());
         std::thread::spawn(move || {
-            let v = auditor::run_audit(
+            let mut v = auditor::run_audit(
                 pid,
                 &cwd,
                 recent_recap.as_deref(),
@@ -929,15 +1111,50 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
             );
             // Route APPROVE/DENY here so the decision file lands BEFORE
             // remove_claim. WAIT writes nothing — the hook sees claim removal
-            // with no decision and bails to Claude's native flow.
-            match v.decision.as_str() {
-                "APPROVE" => {
-                    route_decision(approval_mode, uuid.as_deref(), pane_target.as_deref(), true, &v.reason);
+            // with no decision and bails to Claude's native flow. Codex has
+            // no hook path, so route it through the same fresh prompt check
+            // as manual `a`/`d`.
+            let route_result = match (provider, v.decision.as_str()) {
+                (models::Provider::Claude, "APPROVE") => {
+                    route_decision(
+                        approval_mode,
+                        uuid.as_deref(),
+                        pane_target.as_deref(),
+                        true,
+                        &v.reason,
+                    );
+                    Ok(())
                 }
-                "DENY" => {
-                    route_decision(approval_mode, uuid.as_deref(), pane_target.as_deref(), false, &v.reason);
+                (models::Provider::Claude, "DENY") => {
+                    route_decision(
+                        approval_mode,
+                        uuid.as_deref(),
+                        pane_target.as_deref(),
+                        false,
+                        &v.reason,
+                    );
+                    Ok(())
                 }
-                _ => {} // WAIT: leave for human
+                (models::Provider::Codex, "APPROVE") => {
+                    if let Some(target) = pane_target.as_deref() {
+                        route_codex_decision(target, true)
+                    } else {
+                        Err("codex session has no pane".to_string())
+                    }
+                }
+                (models::Provider::Codex, "DENY") => {
+                    if let Some(target) = pane_target.as_deref() {
+                        route_codex_decision(target, false)
+                    } else {
+                        Err("codex session has no pane".to_string())
+                    }
+                }
+                _ => Ok(()), // WAIT: leave for human
+            };
+            if let Err(e) = route_result {
+                let audited_decision = v.decision.clone();
+                v.decision = "WAIT".to_string();
+                v.reason = format!("auditor {audited_decision} but routing failed: {e}");
             }
             let _ = tx.send(v);
             if let Some(uuid) = uuid {

@@ -66,8 +66,12 @@ pub fn build_ppid_map() -> HashMap<u32, u32> {
     }
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let mut parts = line.split_whitespace();
-        let Some(pid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else { continue };
-        let Some(ppid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else { continue };
+        let Some(pid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
+        let Some(ppid) = parts.next().and_then(|s| s.parse::<u32>().ok()) else {
+            continue;
+        };
         map.insert(pid, ppid);
     }
     map
@@ -161,7 +165,11 @@ pub fn current_client_width() -> Option<u16> {
 
 pub fn jump_to_self(zoom: bool) -> std::io::Result<()> {
     let panes = list_panes();
-    let cmd = if zoom { "triage --zoom-on-jump" } else { "triage" };
+    let cmd = if zoom {
+        "triage --zoom-on-jump"
+    } else {
+        "triage"
+    };
 
     match locate_triage(&panes) {
         Some(LocatedTriage::Live(pane)) => {
@@ -211,7 +219,13 @@ fn focus_and_maybe_zoom(pane: &Pane, zoom: bool) -> std::io::Result<()> {
         .status()?;
     if zoom {
         let already_zoomed = Command::new("tmux")
-            .args(["display-message", "-p", "-t", &pane.target, "#{window_zoomed_flag}"])
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &pane.target,
+                "#{window_zoomed_flag}",
+            ])
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
@@ -287,7 +301,13 @@ pub fn jump_to(target: &str, zoom: bool) -> std::io::Result<()> {
         // `-Z` toggles, so check `window_zoomed_flag` first — without this,
         // jumping to an already-zoomed pane would un-zoom it.
         let already_zoomed = Command::new("tmux")
-            .args(["display-message", "-p", "-t", target, "#{window_zoomed_flag}"])
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                target,
+                "#{window_zoomed_flag}",
+            ])
             .output()
             .ok()
             .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "1")
@@ -311,8 +331,14 @@ pub fn send_keys(target: &str, keys: &[&str]) -> std::io::Result<()> {
     for k in keys {
         cmd.arg(k);
     }
-    cmd.status()?;
-    Ok(())
+    let status = cmd.status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "tmux send-keys exited {status}"
+        )))
+    }
 }
 
 /// Capture the visible pane content plus 200 lines of scrollback. Used as a
@@ -373,6 +399,154 @@ pub fn has_pending_permission_prompt(pane: &str) -> bool {
         }
     }
     false
+}
+
+/// True iff the captured pane shows Codex's native approval UI.
+///
+/// Codex has no sessions-json equivalent of Claude's `status=waiting`, so
+/// this is intentionally paired with the rollout signal that the unfinished
+/// tool call requested approval. We require both the approval question and
+/// positive/negative choices in the visible pane block to avoid treating
+/// stale scrollback or quoted source text as a live prompt.
+pub fn has_codex_permission_prompt(pane: &str) -> bool {
+    let mut found_question = false;
+    let mut found_yes = false;
+    let mut found_no = false;
+
+    for line in pane.lines() {
+        let trimmed = trim_codex_prompt_line(line);
+        if is_codex_prompt_question(trimmed) {
+            found_question = true;
+        }
+        if is_codex_yes_choice(trimmed) {
+            found_yes = true;
+        }
+        if is_codex_no_choice(trimmed) {
+            found_no = true;
+        }
+        if found_question && found_yes && found_no {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexPromptChoice {
+    Yes,
+    No,
+    Other,
+}
+
+/// Return the currently highlighted Codex approval-menu choice, if the
+/// captured pane includes Codex's cursor marker.
+pub fn codex_selected_permission_choice(pane: &str) -> Option<CodexPromptChoice> {
+    let mut choice = None;
+    for line in pane.lines() {
+        let Some(trimmed) = selected_codex_prompt_line(line) else {
+            continue;
+        };
+        choice = Some(if is_codex_yes_choice(trimmed) {
+            CodexPromptChoice::Yes
+        } else if is_codex_no_choice(trimmed) {
+            CodexPromptChoice::No
+        } else {
+            CodexPromptChoice::Other
+        });
+    }
+    choice
+}
+
+/// Pull the full visible Codex approval body from the latest approval prompt
+/// in a captured pane tail. This intentionally excludes the yes/no choices,
+/// leaving the auditor with the reason and command/edit description.
+pub fn parse_codex_pending_full(pane: &str) -> Option<String> {
+    let lines: Vec<&str> = pane.lines().collect();
+    let (question_idx, question) = lines.iter().enumerate().rev().find_map(|(idx, line)| {
+        let trimmed = trim_codex_prompt_line(line);
+        is_codex_prompt_question(trimmed).then_some((idx, trimmed))
+    })?;
+
+    let mut collected = Vec::new();
+    for line in &lines[question_idx + 1..] {
+        let trimmed = trim_codex_prompt_line(line);
+        if trimmed.is_empty() {
+            continue;
+        }
+        if is_codex_choice(trimmed) || trimmed.starts_with("Press enter to confirm") {
+            break;
+        }
+        collected.push(trimmed.to_string());
+    }
+
+    if collected.is_empty() && question.starts_with("Allow Codex to ") {
+        collected.push(question.to_string());
+    }
+
+    (!collected.is_empty()).then(|| collected.join("\n"))
+}
+
+fn trim_codex_prompt_line(line: &str) -> &str {
+    let trimmed = line
+        .trim()
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '│' | '┃' | '║' | '┆' | '┊'))
+        .trim()
+        .trim_start_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '›' | '❯' | '>' | '-' | '•' | '●' | '○')
+        })
+        .trim();
+    strip_numbered_choice_prefix(trimmed)
+}
+
+fn selected_codex_prompt_line(line: &str) -> Option<&str> {
+    let trimmed = line
+        .trim()
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '│' | '┃' | '║' | '┆' | '┊'))
+        .trim();
+    let selected = trimmed
+        .strip_prefix('›')
+        .or_else(|| trimmed.strip_prefix('❯'))?;
+    Some(strip_numbered_choice_prefix(selected.trim()))
+}
+
+fn strip_numbered_choice_prefix(line: &str) -> &str {
+    let Some((prefix, rest)) = line.split_once(". ") else {
+        return line;
+    };
+    if prefix.chars().all(|c| c.is_ascii_digit()) {
+        rest.trim()
+    } else {
+        line
+    }
+}
+
+fn is_codex_prompt_question(line: &str) -> bool {
+    matches!(
+        line,
+        "Would you like to run the following command?"
+            | "Would you like to grant these permissions?"
+            | "Would you like to make the following edits?"
+    ) || line.starts_with("Allow Codex to run `")
+        || line.ends_with(" needs your approval.")
+}
+
+fn is_codex_yes_choice(line: &str) -> bool {
+    line.starts_with("Yes, proceed")
+        || line == "Yes, just this once"
+        || line.starts_with("Yes, and ")
+        || line.starts_with("Allow this request")
+        || line.starts_with("Run the tool")
+}
+
+fn is_codex_no_choice(line: &str) -> bool {
+    line.starts_with("No, ")
+        || line == "Cancel this request"
+        || line == "Decline this request and continue"
+}
+
+fn is_codex_choice(line: &str) -> bool {
+    is_codex_yes_choice(line) || is_codex_no_choice(line)
 }
 
 /// Pull the human-readable preview of what Claude is asking from a captured
@@ -465,11 +639,123 @@ fn is_inner_separator(s: &str) -> bool {
 
 fn is_chip_header(s: &str) -> bool {
     let mut iter = s.split_whitespace();
-    let Some(first) = iter.next() else { return false };
-    let Some(second) = iter.next() else { return false };
+    let Some(first) = iter.next() else {
+        return false;
+    };
+    let Some(second) = iter.next() else {
+        return false;
+    };
     if iter.next().is_some() {
         return false;
     }
     first.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-        && matches!(second, "command" | "file" | "search" | "fetch" | "URL" | "request")
+        && matches!(
+            second,
+            "command" | "file" | "search" | "fetch" | "URL" | "request"
+        )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_codex_command_approval_prompt() {
+        let pane = r#"
+╭────────────────────────────────────────────╮
+│ Would you like to run the following command? │
+│ cargo install --path .                       │
+│ › Yes, proceed                               │
+│ No, and tell Codex what to do differently    │
+╰────────────────────────────────────────────╯
+"#;
+        assert!(has_codex_permission_prompt(pane));
+    }
+
+    #[test]
+    fn detects_real_codex_numbered_command_prompt() {
+        let pane = r#"
+  Would you like to run the following command?
+
+  Reason: Allow Snowflake CLI to run a small context probe so I can identify why the tracker_v3 query is compiling as object-not-found?
+
+  $ snow sql --format CSV --silent -f ios-envelope-401/sql/current_snowflake_context_probe.sql > ios-envelope-401/data/current_snowflake_context_probe.csv 2> ios-envelope-401/data/current_snowflake_context_probe.err
+
+› 1. Yes, proceed (y)
+  2. Yes, and don't ask again for commands that start with `snow sql --format CSV --silent -f ios-envelope-401/sql/current_snowflake_context_probe.sql > ios-envelope-401/data/current_snowflake_context_probe.csv 2> ios-envelope-401/data/current_snowflake_context_probe.err` (p)
+  3. No, and tell Codex what to do differently (esc)
+
+  Press enter to confirm or esc to cancel
+"#;
+        assert!(has_codex_permission_prompt(pane));
+        assert_eq!(
+            codex_selected_permission_choice(pane),
+            Some(CodexPromptChoice::Yes)
+        );
+        assert_eq!(
+            parse_codex_pending_full(pane).as_deref(),
+            Some(
+                "Reason: Allow Snowflake CLI to run a small context probe so I can identify why the tracker_v3 query is compiling as object-not-found?\n$ snow sql --format CSV --silent -f ios-envelope-401/sql/current_snowflake_context_probe.sql > ios-envelope-401/data/current_snowflake_context_probe.csv 2> ios-envelope-401/data/current_snowflake_context_probe.err"
+            )
+        );
+    }
+
+    #[test]
+    fn ignores_codex_prompt_text_without_choices() {
+        let pane = r#"
+let s = "Would you like to run the following command?";
+println!("Yes, proceed");
+"#;
+        assert!(!has_codex_permission_prompt(pane));
+    }
+
+    #[test]
+    fn detects_codex_selected_no_choice() {
+        let pane = r#"
+Would you like to run the following command?
+  1. Yes, proceed (y)
+› 2. No, and tell Codex what to do differently (esc)
+"#;
+        assert_eq!(
+            codex_selected_permission_choice(pane),
+            Some(CodexPromptChoice::No)
+        );
+    }
+
+    #[test]
+    fn codex_selected_choice_prefers_latest_prompt_in_tail() {
+        let pane = r#"
+Would you like to run the following command?
+› 1. Yes, proceed (y)
+  2. No, and tell Codex what to do differently (esc)
+
+Would you like to run the following command?
+  1. Yes, proceed (y)
+› 2. No, and tell Codex what to do differently (esc)
+"#;
+        assert_eq!(
+            codex_selected_permission_choice(pane),
+            Some(CodexPromptChoice::No)
+        );
+    }
+
+    #[test]
+    fn parse_codex_pending_full_prefers_latest_prompt() {
+        let pane = r#"
+Would you like to run the following command?
+$ old command
+› 1. Yes, proceed (y)
+  2. No, and tell Codex what to do differently (esc)
+
+Would you like to run the following command?
+Reason: newer request
+$ date
+› 1. Yes, proceed (y)
+  2. No, and tell Codex what to do differently (esc)
+"#;
+        assert_eq!(
+            parse_codex_pending_full(pane).as_deref(),
+            Some("Reason: newer request\n$ date")
+        );
+    }
 }

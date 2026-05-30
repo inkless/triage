@@ -66,7 +66,10 @@ fn stage_to_user_config(built_app: &Path) {
     if dest_app.exists()
         && let Err(e) = std::fs::remove_dir_all(&dest_app)
     {
-        println!("cargo:warning=could not remove stale {}: {e}", dest_app.display());
+        println!(
+            "cargo:warning=could not remove stale {}: {e}",
+            dest_app.display()
+        );
         return;
     }
     let status = Command::new("cp")

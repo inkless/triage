@@ -3,6 +3,21 @@ use std::time::SystemTime;
 
 use crate::approval::PendingApproval;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Provider {
+    Claude,
+    Codex,
+}
+
+impl Provider {
+    pub fn label(self) -> &'static str {
+        match self {
+            Provider::Claude => "cc",
+            Provider::Codex => "cx",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Pane {
@@ -32,6 +47,7 @@ pub struct Pane {
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct Session {
+    pub provider: Provider,
     pub pid: u32,
     pub session_id: String,
     pub cwd: PathBuf,
@@ -73,6 +89,9 @@ pub struct Session {
     /// current context-window occupancy. Pair with `latest_model` (and the
     /// model's documented context size) to get a percentage.
     pub latest_context_tokens: u64,
+    /// Provider-reported context window when available. Claude sessions infer
+    /// this from model/settings; Codex token_count events report it directly.
+    pub context_window: Option<u64>,
     /// Peak `latest_context_tokens` observed across the session. >200k is
     /// solid evidence the user is on a 1M-context variant.
     pub peak_context_tokens: u64,
@@ -82,11 +101,16 @@ pub struct Session {
     pub latest_assistant_text: Option<String>,
 
     pub state: AttentionState,
-    /// Pane content shows a Claude permission UI (`1. Yes`/`2. No` anchor) in
-    /// the last few lines. The ground-truth signal that Claude is paused on
-    /// user input — supersedes sessions JSON `status=waiting`, which lags or
-    /// gets skipped entirely on some prompts. Set in the refresh pass for
-    /// candidate busy-but-quiet sessions (see refresh in main.rs).
+    /// Provider-specific prompt hint from the transcript/state layer. For
+    /// Codex this means the latest unfinished tool call explicitly requested
+    /// approval. This is not enough to classify as Blocked by itself because
+    /// a user-approved long-running command is also unfinished until output
+    /// returns.
+    pub approval_prompt_pending: bool,
+    /// Pane content shows a provider permission UI in the last few lines.
+    /// For Claude this is the native `1. Yes` / `Esc to cancel` prompt; for
+    /// Codex this is the `Would you like to ...?` approval surface. Set in
+    /// the refresh pass after the cheap provider signals identify candidates.
     pub pane_blocked: bool,
     /// True when the user has muted this session. Muted sessions still update
     /// in the background but render dimmed and sort to the bottom of the list.
@@ -101,6 +125,61 @@ pub struct Session {
     pub pending_approvals: Vec<PendingApproval>,
 }
 
+impl Session {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        provider: Provider,
+        pid: u32,
+        session_id: String,
+        cwd: PathBuf,
+        name: Option<String>,
+        status: String,
+        started_at_ms: u64,
+        updated_at_ms: u64,
+        waiting_for: Option<String>,
+    ) -> Self {
+        Self {
+            provider,
+            pid,
+            session_id,
+            cwd,
+            name,
+            status,
+            waiting_for,
+            started_at_ms,
+            updated_at_ms,
+            pane: None,
+            transcript_path: None,
+            headline: None,
+            last_prompt: None,
+            last_prompt_at: None,
+            last_turn_duration_ms: None,
+            last_turn_msg_count: None,
+            last_event_at: None,
+            last_stop_at: None,
+            user_prompt_count: 0,
+            last_stop_had_errors: false,
+            last_tool_use: None,
+            total_cost_usd: 0.0,
+            total_tokens_in: 0,
+            total_tokens_out: 0,
+            total_tokens_cache_write: 0,
+            total_tokens_cache_read: 0,
+            latest_context_tokens: 0,
+            context_window: None,
+            peak_context_tokens: 0,
+            latest_model: None,
+            latest_assistant_text: None,
+            state: AttentionState::Unknown,
+            approval_prompt_pending: false,
+            pane_blocked: false,
+            muted: false,
+            watched: false,
+            pending_approvals: Vec::new(),
+        }
+    }
+}
+
 /// How `a`/`d` deliver an approve/deny when a session is at a permission
 /// prompt. Two distinct mechanisms exist and we don't auto-fall-back between
 /// them — the user picks explicitly so behavior is predictable.
@@ -111,19 +190,13 @@ pub struct Session {
 /// - `Tmux`: `tmux send-keys` against the pane to dismiss Claude's native
 ///   permission prompt. Works regardless of managed policy. Deny is just
 ///   Escape — no reason payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ApprovalMode {
+    // Hook gives a richer approve/deny path (full tool_input, deny-with-reason).
+    // Falls back to Tmux when the hook is bypassed by managed policy.
+    #[default]
     Hook,
     Tmux,
-}
-
-impl Default for ApprovalMode {
-    fn default() -> Self {
-        // Hook gives a richer approve/deny path (full tool_input, deny-with-
-        // reason). Falls back to Tmux when the hook is bypassed by managed
-        // policy — toggle with `h`.
-        Self::Hook
-    }
 }
 
 impl ApprovalMode {

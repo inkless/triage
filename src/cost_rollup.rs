@@ -120,14 +120,18 @@ pub fn compute_rollup() -> Rollup {
         if !dir.is_dir() {
             continue;
         }
-        let Ok(files) = fs::read_dir(&dir) else { continue };
+        let Ok(files) = fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in files.flatten() {
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("jsonl") {
                 continue;
             }
             scanned_files += 1;
-            let Some(session) = score_session(&path) else { continue };
+            let Some(session) = score_session(&path) else {
+                continue;
+            };
             total_all += session.cost_usd;
 
             for (day_key, cost, in_tok, out_tok) in session.per_day {
@@ -187,12 +191,24 @@ pub fn compute_rollup() -> Rollup {
     days_vec.sort_by_key(|d| d.key);
 
     let mut cwds_vec: Vec<CwdBucket> = cwds.into_values().collect();
-    cwds_vec.sort_by(|a, b| b.cost_usd.partial_cmp(&a.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
+    cwds_vec.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     let mut models_vec: Vec<ModelBucket> = models.into_values().collect();
-    models_vec.sort_by(|a, b| b.cost_usd.partial_cmp(&a.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
+    models_vec.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    sessions.sort_by(|a, b| b.cost_usd.partial_cmp(&a.cost_usd).unwrap_or(std::cmp::Ordering::Equal));
+    sessions.sort_by(|a, b| {
+        b.cost_usd
+            .partial_cmp(&a.cost_usd)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
     Rollup {
         days: days_vec,
@@ -240,7 +256,10 @@ fn score_session(path: &Path) -> Option<SessionScore> {
         {
             cwd = Some(c.to_string());
         }
-        let ts = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_timestamp);
+        let ts = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(parse_timestamp);
         if let Some(t) = ts
             && last_event.is_none_or(|prev| t > prev)
         {
@@ -249,8 +268,12 @@ fn score_session(path: &Path) -> Option<SessionScore> {
         if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
             continue;
         }
-        let Some(msg) = v.get("message") else { continue };
-        let Some(u) = score_message(msg, &mut counted) else { continue };
+        let Some(msg) = v.get("message") else {
+            continue;
+        };
+        let Some(u) = score_message(msg, &mut counted) else {
+            continue;
+        };
         let MessageUsage {
             cost_usd,
             model,
@@ -264,7 +287,9 @@ fn score_session(path: &Path) -> Option<SessionScore> {
         total += cost_usd;
         // Bucket by local-day of the event timestamp. Missing timestamp →
         // bucket under "today" so the cost still surfaces somewhere.
-        let day_key = ts.map(local_day).unwrap_or_else(|| local_day(SystemTime::now()));
+        let day_key = ts
+            .map(local_day)
+            .unwrap_or_else(|| local_day(SystemTime::now()));
         let entry = per_day_map.entry(day_key).or_insert((0.0, 0, 0));
         entry.0 += cost_usd;
         entry.1 += in_tok;
@@ -320,7 +345,10 @@ fn model_family(model: &str) -> String {
 /// spring/fall boundaries but is also just the conventional "today" the user
 /// reads on their wall clock.
 pub fn local_day(t: SystemTime) -> DayKey {
-    let secs = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+    let secs = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
     // Safety: libc::localtime_r writes into the out parameter; we initialize
     // the struct to zero and pass a valid pointer. Reentrant variant, so no
     // global static-buffer race.
@@ -460,7 +488,11 @@ fn print_help() {
 
 fn print_glance(r: &Rollup, out: &mut impl Write) -> io::Result<()> {
     writeln!(out, "today  {}", format_usd(r.total_today))?;
-    let avg = if r.total_7d > 0.0 { r.total_7d / 7.0 } else { 0.0 };
+    let avg = if r.total_7d > 0.0 {
+        r.total_7d / 7.0
+    } else {
+        0.0
+    };
     writeln!(
         out,
         "7-day  {}  (avg {}/day)",
@@ -483,8 +515,7 @@ fn print_by_day(r: &Rollup, days: usize, out: &mut impl Write) -> io::Result<()>
     // Take the most recent N days that have data; pad missing days with $0
     // so the strip reads as a clean N-row table aligned to "today".
     let today_secs = day_start_secs(r.today);
-    let mut all_days: HashMap<DayKey, f64> =
-        r.days.iter().map(|d| (d.key, d.cost_usd)).collect();
+    let mut all_days: HashMap<DayKey, f64> = r.days.iter().map(|d| (d.key, d.cost_usd)).collect();
     let mut rows: Vec<(DayKey, f64)> = Vec::with_capacity(days);
     for back in (0..days).rev() {
         let secs = today_secs - back as i64 * 86_400;
@@ -492,13 +523,24 @@ fn print_by_day(r: &Rollup, days: usize, out: &mut impl Write) -> io::Result<()>
         let cost = all_days.remove(&key).unwrap_or(0.0);
         rows.push((key, cost));
     }
-    let peak = rows.iter().map(|(_, c)| *c).fold(0.0_f64, f64::max).max(0.01);
+    let peak = rows
+        .iter()
+        .map(|(_, c)| *c)
+        .fold(0.0_f64, f64::max)
+        .max(0.01);
     let bar_width = 30;
     for (k, c) in &rows {
         let filled = ((c / peak) * bar_width as f64).round() as usize;
         let bar: String = "█".repeat(filled);
         let label = if *k == r.today { " (today)" } else { "" };
-        writeln!(out, "{}  {:>8}  {}{}", k.format(), format_usd(*c), bar, label)?;
+        writeln!(
+            out,
+            "{}  {:>8}  {}{}",
+            k.format(),
+            format_usd(*c),
+            bar,
+            label
+        )?;
     }
     writeln!(
         out,
@@ -533,7 +575,13 @@ fn print_by_session(r: &Rollup, top_n: usize, out: &mut impl Write) -> io::Resul
     for s in r.sessions.iter().take(top_n) {
         let short = short_cwd(&s.cwd);
         let id_short: String = s.session_id.chars().take(8).collect();
-        writeln!(out, "{:>8}  {}  {}", format_usd(s.cost_usd), id_short, short)?;
+        writeln!(
+            out,
+            "{:>8}  {}  {}",
+            format_usd(s.cost_usd),
+            id_short,
+            short
+        )?;
     }
     Ok(())
 }
@@ -541,8 +589,18 @@ fn print_by_session(r: &Rollup, top_n: usize, out: &mut impl Write) -> io::Resul
 fn print_by_model(r: &Rollup, out: &mut impl Write) -> io::Result<()> {
     let total: f64 = r.models.iter().map(|m| m.cost_usd).sum();
     for m in &r.models {
-        let pct = if total > 0.0 { 100.0 * m.cost_usd / total } else { 0.0 };
-        writeln!(out, "{:<10}  {:>8}  {:>5.1}%", m.model, format_usd(m.cost_usd), pct)?;
+        let pct = if total > 0.0 {
+            100.0 * m.cost_usd / total
+        } else {
+            0.0
+        };
+        writeln!(
+            out,
+            "{:<10}  {:>8}  {:>5.1}%",
+            m.model,
+            format_usd(m.cost_usd),
+            pct
+        )?;
     }
     Ok(())
 }
@@ -564,7 +622,9 @@ fn print_json(r: &Rollup, out: &mut impl Write) -> io::Result<()> {
         r.scan_duration_ms
     );
     for (i, d) in r.days.iter().enumerate() {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         let _ = write!(
             s,
             "{{\"date\":\"{}\",\"cost_usd\":{:.6},\"tokens_in\":{},\"tokens_out\":{}}}",
@@ -576,7 +636,9 @@ fn print_json(r: &Rollup, out: &mut impl Write) -> io::Result<()> {
     }
     s.push_str("],\"cwds\":[");
     for (i, c) in r.cwds.iter().enumerate() {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         let _ = write!(
             s,
             "{{\"cwd\":{},\"cost_usd\":{:.6},\"sessions\":{}}}",
@@ -587,7 +649,9 @@ fn print_json(r: &Rollup, out: &mut impl Write) -> io::Result<()> {
     }
     s.push_str("],\"models\":[");
     for (i, m) in r.models.iter().enumerate() {
-        if i > 0 { s.push(','); }
+        if i > 0 {
+            s.push(',');
+        }
         let _ = write!(
             s,
             "{{\"model\":{},\"cost_usd\":{:.6}}}",

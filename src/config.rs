@@ -115,9 +115,8 @@ fn config_path() -> Option<PathBuf> {
 }
 
 fn read_disk() -> std::io::Result<DiskConfig> {
-    let path = config_path().ok_or_else(|| {
-        std::io::Error::other("HOME not set; cannot resolve config path")
-    })?;
+    let path = config_path()
+        .ok_or_else(|| std::io::Error::other("HOME not set; cannot resolve config path"))?;
     let bytes = fs::read(&path)?;
     // World/group-readable files are a footgun for `[ntfy].token`. Refuse to
     // load a config with permissive perms — better to noisily revert to
@@ -152,8 +151,10 @@ fn is_missing(e: &std::io::Error) -> bool {
 
 impl From<DiskConfig> for Config {
     fn from(d: DiskConfig) -> Self {
-        let mut cfg = Config::default();
-        cfg.ntfy = d.ntfy;
+        let mut cfg = Config {
+            ntfy: d.ntfy,
+            ..Default::default()
+        };
         if let Some(t) = d.thresholds {
             if let Some(v) = t.mobile_width {
                 cfg.thresholds.mobile_width = v;
@@ -171,4 +172,3 @@ impl From<DiskConfig> for Config {
         cfg
     }
 }
-

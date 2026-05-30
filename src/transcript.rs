@@ -11,7 +11,7 @@ use serde_json::Value;
 const PROMPT_FRESH_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 use crate::discovery::{encode_cwd, projects_dir};
-use crate::models::Session;
+use crate::models::{Provider, Session};
 
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -123,10 +123,7 @@ pub struct MessageUsage {
 /// per-session (digest). Cross-file IDs are random hex strings — collisions
 /// are astronomically unlikely — so either scope produces the same number in
 /// practice.
-pub fn score_message(
-    msg: &Value,
-    counted_msg_ids: &mut HashSet<String>,
-) -> Option<MessageUsage> {
+pub fn score_message(msg: &Value, counted_msg_ids: &mut HashSet<String>) -> Option<MessageUsage> {
     let usage = msg.get("usage")?;
     let msg_id = msg
         .get("id")
@@ -144,8 +141,14 @@ pub fn score_message(
         .unwrap_or("")
         .to_string();
     let r = rates_for_model(&model);
-    let in_tok = usage.get("input_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
-    let out_tok = usage.get("output_tokens").and_then(|n| n.as_u64()).unwrap_or(0);
+    let in_tok = usage
+        .get("input_tokens")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
+    let out_tok = usage
+        .get("output_tokens")
+        .and_then(|n| n.as_u64())
+        .unwrap_or(0);
     let cw_tok = usage
         .get("cache_creation_input_tokens")
         .and_then(|n| n.as_u64())
@@ -222,12 +225,17 @@ impl DigestCache {
 pub fn assign_transcripts(sessions: &mut [Session], cache: &mut DigestCache) {
     let mut by_cwd: HashMap<PathBuf, Vec<usize>> = HashMap::new();
     for (i, s) in sessions.iter().enumerate() {
+        if s.provider != Provider::Claude {
+            continue;
+        }
         by_cwd.entry(s.cwd.clone()).or_default().push(i);
     }
 
     for (cwd, mut idxs) in by_cwd {
         let dir = projects_dir().join(encode_cwd(&cwd));
-        let Ok(read) = fs::read_dir(&dir) else { continue };
+        let Ok(read) = fs::read_dir(&dir) else {
+            continue;
+        };
 
         // (mtime, last_user_text_at, path). last_user_text_at falls back to
         // mtime when the file has no qualifying user-text event, so files with
@@ -269,10 +277,11 @@ pub fn assign_transcripts(sessions: &mut [Session], cache: &mut DigestCache) {
                 continue;
             }
             let target_name = format!("{sid}.jsonl");
-            if let Some(j) = jsonls
-                .iter()
-                .position(|(_, _, p)| p.file_name().map(|f| f == target_name.as_str()).unwrap_or(false))
-            {
+            if let Some(j) = jsonls.iter().position(|(_, _, p)| {
+                p.file_name()
+                    .map(|f| f == target_name.as_str())
+                    .unwrap_or(false)
+            }) {
                 let (_, _, path) = jsonls.swap_remove(j);
                 sessions[si].transcript_path = Some(path);
                 matched.push(pos);
@@ -329,9 +338,10 @@ pub fn locate_transcript(cwd: &Path, session_id: &str) -> Option<PathBuf> {
     // Try sessionId first.
     let by_id = dir.join(format!("{session_id}.jsonl"));
     if let Ok(meta) = fs::metadata(&by_id)
-        && meta.len() > 0 {
-            return Some(by_id);
-        }
+        && meta.len() > 0
+    {
+        return Some(by_id);
+    }
 
     // Fallback: newest .jsonl in the dir.
     let entries = fs::read_dir(&dir).ok()?;
@@ -400,11 +410,15 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
         let Ok(v) = serde_json::from_str::<Value>(line) else {
             continue;
         };
-        let ts = v.get("timestamp").and_then(|t| t.as_str()).and_then(parse_ts);
+        let ts = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .and_then(parse_ts);
         if let Some(t) = ts
-            && last_event_at.is_none_or(|prev| t > prev) {
-                last_event_at = Some(t);
-            }
+            && last_event_at.is_none_or(|prev| t > prev)
+        {
+            last_event_at = Some(t);
+        }
         let ty = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
         match ty {
             "last-prompt" => {
@@ -430,8 +444,7 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
                     if let Some(arr) = content.as_array() {
                         for block in arr {
                             if block.get("type").and_then(|t| t.as_str()) == Some("tool_result")
-                                && let Some(id) =
-                                    block.get("tool_use_id").and_then(|i| i.as_str())
+                                && let Some(id) = block.get("tool_use_id").and_then(|i| i.as_str())
                             {
                                 completed_tool_ids.insert(id.to_string());
                             }
@@ -457,8 +470,7 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
                                 .and_then(|n| n.as_str())
                                 .unwrap_or("?")
                                 .to_string();
-                            let brief =
-                                crate::approval::brief_tool_input(block.get("input"));
+                            let brief = crate::approval::brief_tool_input(block.get("input"));
                             tool_uses.push((id, name, brief));
                         } else if block_type == Some("text")
                             && let Some(t) = block.get("text").and_then(|t| t.as_str())
@@ -506,11 +518,11 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
                 let sub = v.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
                 match sub {
                     "away_summary" => {
-                        if let (Some(c), Some(t)) =
-                            (v.get("content").and_then(|c| c.as_str()), ts)
-                            && headline.as_ref().is_none_or(|(prev, _)| t > *prev) {
-                                headline = Some((t, c.to_string()));
-                            }
+                        if let (Some(c), Some(t)) = (v.get("content").and_then(|c| c.as_str()), ts)
+                            && headline.as_ref().is_none_or(|(prev, _)| t > *prev)
+                        {
+                            headline = Some((t, c.to_string()));
+                        }
                     }
                     "turn_duration" => {
                         if let Some(ms) = v.get("durationMs").and_then(|d| d.as_u64()) {
@@ -578,6 +590,9 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
 }
 
 pub fn enrich(session: &mut Session, now: SystemTime, cache: &mut DigestCache) {
+    if session.provider != Provider::Claude {
+        return;
+    }
     let path = match &session.transcript_path {
         Some(p) => p.clone(),
         None => match locate_transcript(&session.cwd, &session.session_id) {
@@ -712,8 +727,7 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
     let yoe = (y - era * 400) as u64;
-    let doy =
-        (153 * (if m > 2 { m - 3 } else { m + 9 }) as u64 + 2) / 5 + d as u64 - 1;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as u64 + 2) / 5 + d as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe as i64 - 719468
 }

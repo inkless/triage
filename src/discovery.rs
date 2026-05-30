@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
-use crate::models::{AttentionState, Session};
+use crate::models::{Provider, Session};
 
 #[derive(Debug, Deserialize)]
 struct RawSession {
@@ -53,42 +53,17 @@ pub fn discover_live_sessions() -> Vec<Session> {
         if raw.name.as_deref() == Some(crate::auditor::AUDITOR_NAME) {
             continue;
         }
-        out.push(Session {
-            pid: raw.pid,
-            session_id: raw.session_id,
-            cwd: PathBuf::from(raw.cwd),
-            name: raw.name,
-            status: raw.status.unwrap_or_else(|| "unknown".to_string()),
-            started_at_ms: raw.started_at,
-            updated_at_ms: raw.updated_at,
-            waiting_for: raw.waiting_for,
-            pane: None,
-            transcript_path: None,
-            headline: None,
-            last_prompt: None,
-            last_prompt_at: None,
-            last_turn_duration_ms: None,
-            last_turn_msg_count: None,
-            last_event_at: None,
-            last_stop_at: None,
-            user_prompt_count: 0,
-            last_stop_had_errors: false,
-            last_tool_use: None,
-            total_cost_usd: 0.0,
-            total_tokens_in: 0,
-            total_tokens_out: 0,
-            total_tokens_cache_write: 0,
-            total_tokens_cache_read: 0,
-            latest_context_tokens: 0,
-            peak_context_tokens: 0,
-            latest_model: None,
-            latest_assistant_text: None,
-            state: AttentionState::Unknown,
-            pane_blocked: false,
-            muted: false,
-            watched: false,
-            pending_approvals: Vec::new(),
-        });
+        out.push(Session::new(
+            Provider::Claude,
+            raw.pid,
+            raw.session_id,
+            PathBuf::from(raw.cwd),
+            raw.name,
+            raw.status.unwrap_or_else(|| "unknown".to_string()),
+            raw.started_at,
+            raw.updated_at,
+            raw.waiting_for,
+        ));
     }
     out
 }

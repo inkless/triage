@@ -361,10 +361,15 @@ pub fn truncate(s: &str, n: usize) -> String {
 ///    one whose tmux pane is currently active over arbitrary first-match.
 /// 3. If still ambiguous, attach to the first cwd-matching session — better
 ///    than dropping the approval entirely.
-pub fn attach_to_sessions(approvals: Vec<PendingApproval>, sessions: &mut [crate::models::Session]) {
+pub fn attach_to_sessions(
+    approvals: Vec<PendingApproval>,
+    sessions: &mut [crate::models::Session],
+) {
     for a in approvals {
         // 1. session_id exact match.
-        if let Some(idx) = sessions.iter().position(|s| s.session_id == a.session_id) {
+        if let Some(idx) = sessions.iter().position(|s| {
+            s.provider == crate::models::Provider::Claude && s.session_id == a.session_id
+        }) {
             sessions[idx].pending_approvals.push(a);
             continue;
         }
@@ -372,7 +377,9 @@ pub fn attach_to_sessions(approvals: Vec<PendingApproval>, sessions: &mut [crate
         let cwd_matches: Vec<usize> = sessions
             .iter()
             .enumerate()
-            .filter_map(|(i, s)| (s.cwd == a.cwd).then_some(i))
+            .filter_map(|(i, s)| {
+                (s.provider == crate::models::Provider::Claude && s.cwd == a.cwd).then_some(i)
+            })
             .collect();
         let chosen = cwd_matches
             .iter()
@@ -398,8 +405,7 @@ const HOOK_SCRIPT: &str = include_str!("../scripts/hooks/triage-preuse.sh");
 /// Canonical install location for the bash hook. Stable across triage
 /// upgrades; settings.json points here, not at the source repo.
 fn hook_install_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".config/triage/hooks/triage-preuse.sh"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/triage/hooks/triage-preuse.sh"))
 }
 
 /// True when `cmd` looks like a triage PreToolUse hook entry — basename
@@ -427,7 +433,11 @@ fn write_hook_script(path: &Path, dry_run: bool) -> io::Result<bool> {
         return Ok(false);
     }
     if dry_run {
-        println!("DRY RUN — would write {} ({} bytes)", path.display(), HOOK_SCRIPT.len());
+        println!(
+            "DRY RUN — would write {} ({} bytes)",
+            path.display(),
+            HOOK_SCRIPT.len()
+        );
         return Ok(true);
     }
     if let Some(parent) = path.parent() {
@@ -455,9 +465,13 @@ fn set_executable(path: &Path) -> io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn is_executable(_path: &Path) -> bool { true }
+fn is_executable(_path: &Path) -> bool {
+    true
+}
 #[cfg(not(unix))]
-fn set_executable(_path: &Path) -> io::Result<()> { Ok(()) }
+fn set_executable(_path: &Path) -> io::Result<()> {
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallOutcome {
@@ -475,7 +489,10 @@ pub fn print_install_hint() {
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "~/.config/triage/hooks/triage-preuse.sh".to_string());
     println!("Run `triage --install-hooks` to install. Or, to merge by hand,");
-    println!("first write the bash hook to {} and then add the following to ~/.claude/settings.json:", path);
+    println!(
+        "first write the bash hook to {} and then add the following to ~/.claude/settings.json:",
+        path
+    );
     println!();
     println!("{{");
     println!("  \"hooks\": {{");
@@ -520,7 +537,10 @@ pub fn install_hooks(dry_run: bool) -> io::Result<InstallOutcome> {
             );
         }
         InstallOutcome::AlreadyInstalled => {
-            println!("Refreshed hook script at {} (settings.json unchanged)", script_str);
+            println!(
+                "Refreshed hook script at {} (settings.json unchanged)",
+                script_str
+            );
         }
         InstallOutcome::Installed if dry_run => {
             println!("DRY RUN — would update {}:", path.display());
@@ -625,7 +645,10 @@ fn apply_install(input: &Value, canonical_path: &str) -> (Value, InstallOutcome)
     let mut root = if input.is_object() {
         input.clone()
     } else {
-        return (make_fresh_settings(canonical_path), InstallOutcome::Installed);
+        return (
+            make_fresh_settings(canonical_path),
+            InstallOutcome::Installed,
+        );
     };
 
     // Migrate: drop any triage-named entries (any path) before adding the
@@ -641,14 +664,20 @@ fn apply_install(input: &Value, canonical_path: &str) -> (Value, InstallOutcome)
         .entry("hooks".to_string())
         .or_insert_with(|| Value::Object(serde_json::Map::new()));
     if !hooks.is_object() {
-        return (make_fresh_settings(canonical_path), InstallOutcome::Installed);
+        return (
+            make_fresh_settings(canonical_path),
+            InstallOutcome::Installed,
+        );
     }
     let hooks_obj = hooks.as_object_mut().unwrap();
     let pre = hooks_obj
         .entry("PreToolUse".to_string())
         .or_insert_with(|| Value::Array(Vec::new()));
     if !pre.is_array() {
-        return (make_fresh_settings(canonical_path), InstallOutcome::Installed);
+        return (
+            make_fresh_settings(canonical_path),
+            InstallOutcome::Installed,
+        );
     }
     let pre_arr = pre.as_array_mut().unwrap();
     pre_arr.push(serde_json::json!({
@@ -671,9 +700,7 @@ fn apply_uninstall(input: &Value) -> (Value, InstallOutcome) {
     {
         if let Some(pre) = hooks.get_mut("PreToolUse").and_then(|p| p.as_array_mut()) {
             for group in pre.iter_mut() {
-                if let Some(group_hooks) =
-                    group.get_mut("hooks").and_then(|h| h.as_array_mut())
-                {
+                if let Some(group_hooks) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) {
                     let before = group_hooks.len();
                     group_hooks.retain(|h| {
                         h.get("command")

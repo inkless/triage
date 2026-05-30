@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use std::thread;
 
 use crate::config::{Config, NtfyConfig};
-use crate::models::{AttentionState, Session};
+use crate::models::{AttentionState, Provider, Session};
 
 /// Fire a macOS desktop notification for a session that just became actionable
 /// (Blocked or Error). Best-effort — failures are silently ignored, since
@@ -36,7 +36,14 @@ pub fn alert(session: &Session, cfg: &Config, phone_push: bool) {
     }
 
     if let Some(notifier) = triage_notify_path() {
-        send_via_triage_notify(notifier, title, &label, &preview, session.pane.as_ref(), cfg);
+        send_via_triage_notify(
+            notifier,
+            title,
+            &label,
+            &preview,
+            session.pane.as_ref(),
+            cfg,
+        );
         return;
     }
     send_via_osascript(title, &label, &preview);
@@ -59,7 +66,14 @@ pub fn notify_session_done(session: &Session, cfg: &Config, phone_push: bool) {
     }
 
     if let Some(notifier) = triage_notify_path() {
-        send_via_triage_notify(notifier, title, &label, &preview, session.pane.as_ref(), cfg);
+        send_via_triage_notify(
+            notifier,
+            title,
+            &label,
+            &preview,
+            session.pane.as_ref(),
+            cfg,
+        );
         return;
     }
     send_via_osascript(title, &label, &preview);
@@ -83,7 +97,7 @@ pub fn push_to_phone(session: &Session, cfg: &Config) {
 }
 
 fn session_label(session: &Session) -> String {
-    session
+    let label = session
         .name
         .clone()
         .or_else(|| {
@@ -92,7 +106,11 @@ fn session_label(session: &Session) -> String {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
         })
-        .unwrap_or_else(|| "session".to_string())
+        .unwrap_or_else(|| "session".to_string());
+    match session.provider {
+        Provider::Claude => label,
+        Provider::Codex => format!("cx {label}"),
+    }
 }
 
 fn session_preview(session: &Session) -> String {
@@ -122,15 +140,19 @@ pub fn cli_notify(args: &[String]) -> io::Result<()> {
     while i < args.len() {
         match args[i].as_str() {
             "--title" => {
-                title = Some(args.get(i + 1).cloned().ok_or_else(|| {
-                    io::Error::other("--title needs a value")
-                })?);
+                title = Some(
+                    args.get(i + 1)
+                        .cloned()
+                        .ok_or_else(|| io::Error::other("--title needs a value"))?,
+                );
                 i += 2;
             }
             "--tags" => {
-                tags = Some(args.get(i + 1).cloned().ok_or_else(|| {
-                    io::Error::other("--tags needs a value")
-                })?);
+                tags = Some(
+                    args.get(i + 1)
+                        .cloned()
+                        .ok_or_else(|| io::Error::other("--tags needs a value"))?,
+                );
                 i += 2;
             }
             _ => {
@@ -437,9 +459,8 @@ fn triage_notify_path() -> Option<&'static str> {
             // because it's stable across binary location (cargo-install vs
             // workspace) and tracks the most recently built helper.
             if let Some(home) = std::env::var_os("HOME") {
-                candidates.push(
-                    std::path::PathBuf::from(home).join(".config/triage/triage-notify.app"),
-                );
+                candidates
+                    .push(std::path::PathBuf::from(home).join(".config/triage/triage-notify.app"));
             }
             let exe = std::env::current_exe().ok()?;
             let exe_dir = exe.parent()?;

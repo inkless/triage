@@ -15,22 +15,28 @@ pub struct FsWatcher {
 impl FsWatcher {
     pub fn spawn() -> notify::Result<Self> {
         let (tx, rx): (Sender<()>, Receiver<()>) = mpsc::channel();
-        let mut watcher: RecommendedWatcher = notify::recommended_watcher(
-            move |res: Result<notify::Event, notify::Error>| {
+        let mut watcher: RecommendedWatcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 if res.is_ok() {
                     let _ = tx.send(());
                 }
-            },
-        )?;
+            })?;
         let sessions = sessions_dir();
         let projects = projects_dir();
+        let codex_sessions = crate::codex::sessions_dir();
         if sessions.exists() {
             watcher.watch(&sessions, RecursiveMode::NonRecursive)?;
         }
         if projects.exists() {
             watcher.watch(&projects, RecursiveMode::Recursive)?;
         }
-        Ok(Self { rx, _watcher: watcher })
+        if codex_sessions.exists() {
+            watcher.watch(&codex_sessions, RecursiveMode::Recursive)?;
+        }
+        Ok(Self {
+            rx,
+            _watcher: watcher,
+        })
     }
 
     /// Drain accumulated events; returns true if at least one was waiting.

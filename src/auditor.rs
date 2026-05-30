@@ -99,7 +99,10 @@ fn load_system_prompt() -> (String, String) {
             return (content, p.display().to_string());
         }
     }
-    (DEFAULT_SYSTEM_PROMPT.to_string(), "built-in default".to_string())
+    (
+        DEFAULT_SYSTEM_PROMPT.to_string(),
+        "built-in default".to_string(),
+    )
 }
 
 /// Print the resolved system prompt and where it came from. `triage
@@ -228,12 +231,18 @@ fn run_claude(system_prompt: &str, user_prompt: &str) -> io::Result<String> {
 }
 
 fn parse_verdict(raw: &str) -> (String, String) {
-    let decision = raw
-        .lines()
-        .find_map(|l| l.trim().strip_prefix("DECISION:").map(|v| v.trim().to_string()));
+    let decision = raw.lines().find_map(|l| {
+        l.trim()
+            .strip_prefix("DECISION:")
+            .map(|v| v.trim().to_string())
+    });
     let reason = raw
         .lines()
-        .find_map(|l| l.trim().strip_prefix("REASON:").map(|v| v.trim().to_string()))
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("REASON:")
+                .map(|v| v.trim().to_string())
+        })
         .unwrap_or_default();
     match decision.as_deref() {
         Some("APPROVE" | "DENY" | "WAIT") => (decision.unwrap(), reason),
@@ -249,8 +258,7 @@ fn parse_verdict(raw: &str) -> (String, String) {
 }
 
 fn audit_log_path() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join(".config/triage/auto-decisions.jsonl"))
+    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config/triage/auto-decisions.jsonl"))
 }
 
 fn append_audit_log(
