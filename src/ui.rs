@@ -311,12 +311,7 @@ impl AppState {
     pub fn start_rename_selected(&mut self) -> Option<()> {
         let s = self.selected_session()?;
         let key = AliasKey::for_session(s);
-        self.rename_buffer = self
-            .aliases
-            .get(&key)
-            .cloned()
-            .or_else(|| s.name.clone())
-            .unwrap_or_default();
+        self.rename_buffer = self.aliases.get(&key).cloned().unwrap_or_default();
         self.rename_active = true;
         self.rename_key = Some(key);
         self.pending_g = false;
