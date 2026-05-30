@@ -4,7 +4,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{ApprovalMode, Session};
+use crate::models::{ApprovalMode, Provider, Session};
 
 /// Stable identity for a Claude session that survives a triage restart.
 /// We can't use pid (recycled by the OS) or sessionId (rewritten by `/clear`),
@@ -28,7 +28,28 @@ impl AliasKey {
     pub fn for_session(session: &Session) -> Self {
         Self {
             provider: session.provider.label().to_string(),
+            session_id: session
+                .alias_session_id
+                .as_deref()
+                .unwrap_or(&session.session_id)
+                .to_string(),
+        }
+    }
+
+    pub fn exact_for_session(session: &Session) -> Self {
+        Self {
+            provider: session.provider.label().to_string(),
             session_id: session.session_id.clone(),
+        }
+    }
+
+    pub fn candidates_for_session(session: &Session) -> Vec<Self> {
+        let exact = Self::exact_for_session(session);
+        let alias = Self::for_session(session);
+        if exact == alias {
+            vec![exact]
+        } else {
+            vec![exact, alias]
         }
     }
 }
@@ -130,18 +151,22 @@ pub fn load_state() -> LoadedState {
             )
         })
         .collect();
+    let codex_thread_roots = crate::codex::load_thread_roots_for_aliases();
     let aliases = state
         .aliases
         .into_iter()
         .filter(|a| !a.alias.trim().is_empty() && !a.session_id.is_empty())
         .map(|a| {
-            (
-                AliasKey {
-                    provider: a.provider,
-                    session_id: a.session_id,
-                },
-                a.alias,
-            )
+            let mut key = AliasKey {
+                provider: a.provider,
+                session_id: a.session_id,
+            };
+            if key.provider == Provider::Codex.label()
+                && let Some(root) = codex_thread_roots.get(&key.session_id)
+            {
+                key.session_id = root.clone();
+            }
+            (key, a.alias)
         })
         .collect();
     LoadedState {

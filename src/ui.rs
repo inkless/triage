@@ -23,7 +23,9 @@ pub struct AppState {
     pub status_msg: Option<String>,
     pub digest_cache: DigestCache,
     pub codex_cache: crate::codex::CodexDigestCache,
-    /// Triage-local row aliases keyed by provider + provider session id.
+    /// Triage-local row aliases keyed by provider + alias session id. For
+    /// Codex this is the root thread id so aliases follow spawned child
+    /// threads without following unrelated pane reuse.
     /// These never mutate Claude/Codex/tmux state.
     pub aliases: HashMap<AliasKey, String>,
     /// (cwd, started_at_ms) → time of mute. Keyed on a stable identity rather
@@ -311,7 +313,10 @@ impl AppState {
     pub fn start_rename_selected(&mut self) -> Option<()> {
         let s = self.selected_session()?;
         let key = AliasKey::for_session(s);
-        self.rename_buffer = self.aliases.get(&key).cloned().unwrap_or_default();
+        self.rename_buffer = AliasKey::candidates_for_session(s)
+            .iter()
+            .find_map(|key| self.aliases.get(key).cloned())
+            .unwrap_or_default();
         self.rename_active = true;
         self.rename_key = Some(key);
         self.pending_g = false;
@@ -325,6 +330,10 @@ impl AppState {
     }
 
     pub fn commit_rename_selected(&mut self) -> Option<String> {
+        let keys_to_clear = self
+            .selected_session()
+            .map(AliasKey::candidates_for_session)
+            .unwrap_or_default();
         let key = self
             .rename_key
             .take()
@@ -336,6 +345,9 @@ impl AppState {
             .join(" ");
         self.rename_active = false;
         self.rename_buffer.clear();
+        for candidate in keys_to_clear {
+            self.aliases.remove(&candidate);
+        }
         let msg = if alias.is_empty() {
             self.aliases.remove(&key);
             format!("alias cleared for {}", key.provider)
@@ -422,8 +434,9 @@ impl AppState {
 
 pub fn apply_aliases_to_sessions(sessions: &mut [Session], aliases: &HashMap<AliasKey, String>) {
     for session in sessions {
-        let key = AliasKey::for_session(session);
-        if let Some(alias) = aliases.get(&key)
+        if let Some(alias) = AliasKey::candidates_for_session(session)
+            .iter()
+            .find_map(|key| aliases.get(key))
             && !alias.trim().is_empty()
         {
             session.name = Some(alias.clone());

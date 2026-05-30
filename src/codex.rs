@@ -19,6 +19,7 @@ pub fn sessions_dir() -> PathBuf {
 pub struct CodexDigestCache {
     entries: HashMap<PathBuf, (SystemTime, CodexDigest)>,
     thread_titles: Option<(CodexStateStamp, HashMap<String, CodexThreadTitle>)>,
+    thread_roots: Option<(CodexStateStamp, HashMap<String, String>)>,
 }
 
 impl CodexDigestCache {
@@ -65,6 +66,24 @@ impl CodexDigestCache {
         self.thread_titles = Some((stamp, titles.clone()));
         titles
     }
+
+    fn thread_roots(&mut self) -> HashMap<String, String> {
+        let Some(path) = codex_state_path() else {
+            return HashMap::new();
+        };
+        let Some(stamp) = CodexStateStamp::for_path(&path) else {
+            self.thread_roots = None;
+            return HashMap::new();
+        };
+        if let Some((cached_stamp, cached)) = &self.thread_roots
+            && *cached_stamp == stamp
+        {
+            return cached.clone();
+        }
+        let roots = load_thread_roots(&path);
+        self.thread_roots = Some((stamp, roots.clone()));
+        roots
+    }
 }
 
 pub fn discover_live_sessions(
@@ -74,6 +93,7 @@ pub fn discover_live_sessions(
 ) -> Vec<Session> {
     let mut out = Vec::new();
     let thread_titles = cache.thread_titles();
+    let thread_roots = cache.thread_roots();
     for pid in codex_pids() {
         let Some(path) = rollout_path_for_pid(pid) else {
             continue;
@@ -108,6 +128,10 @@ pub fn discover_live_sessions(
             updated_at_ms,
             None,
         );
+        session.alias_session_id = thread_roots
+            .get(&digest.session_id)
+            .cloned()
+            .or_else(|| Some(digest.session_id.clone()));
         session.pane = tmux::find_owning_pane(pid, panes, ppid_map, 8);
         session.transcript_path = Some(path);
         session.headline = digest.headline.clone();
@@ -134,6 +158,13 @@ pub fn discover_live_sessions(
 fn codex_state_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(PathBuf::from(home).join(".codex/state_5.sqlite"))
+}
+
+pub fn load_thread_roots_for_aliases() -> HashMap<String, String> {
+    let Some(path) = codex_state_path() else {
+        return HashMap::new();
+    };
+    load_thread_roots(&path)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -192,6 +223,61 @@ fn load_thread_titles(path: &Path) -> HashMap<String, CodexThreadTitle> {
         return HashMap::new();
     }
     parse_thread_titles_json(&out.stdout)
+}
+
+fn load_thread_roots(path: &Path) -> HashMap<String, String> {
+    let Ok(out) = Command::new("sqlite3")
+        .args([
+            "-readonly",
+            "-json",
+            &path.to_string_lossy(),
+            "select parent_thread_id, child_thread_id from thread_spawn_edges",
+        ])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    if !out.status.success() {
+        return HashMap::new();
+    }
+    parse_thread_roots_json(&out.stdout)
+}
+
+fn parse_thread_roots_json(bytes: &[u8]) -> HashMap<String, String> {
+    let Ok(rows) = serde_json::from_slice::<Vec<Value>>(bytes) else {
+        return HashMap::new();
+    };
+    let mut parent_by_child = HashMap::new();
+    let mut ids = HashSet::new();
+    for row in rows {
+        let Some(parent) = row.get("parent_thread_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(child) = row.get("child_thread_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        parent_by_child.insert(child.to_string(), parent.to_string());
+        ids.insert(parent.to_string());
+        ids.insert(child.to_string());
+    }
+    ids.into_iter()
+        .map(|id| {
+            let root = resolve_thread_root(&id, &parent_by_child);
+            (id, root)
+        })
+        .collect()
+}
+
+fn resolve_thread_root(id: &str, parent_by_child: &HashMap<String, String>) -> String {
+    let mut cur = id.to_string();
+    let mut seen = HashSet::new();
+    while let Some(parent) = parent_by_child.get(&cur) {
+        if !seen.insert(cur.clone()) {
+            break;
+        }
+        cur = parent.clone();
+    }
+    cur
 }
 
 fn parse_thread_titles_json(bytes: &[u8]) -> HashMap<String, CodexThreadTitle> {
@@ -845,6 +931,20 @@ mod tests {
     fn nested_parallel_tool_approval_is_detected() {
         let args = r#"{"tool_uses":[{"recipient_name":"functions.exec_command","parameters":{"cmd":"gh pr checks","sandbox_permissions":"require_escalated"}}]}"#;
         assert!(codex_arguments_require_approval(args));
+    }
+
+    #[test]
+    fn parses_thread_roots_from_spawn_edges() {
+        let json = br#"[
+            {"parent_thread_id":"parent","child_thread_id":"child-a"},
+            {"parent_thread_id":"child-a","child_thread_id":"grandchild"},
+            {"parent_thread_id":"parent","child_thread_id":"child-b"}
+        ]"#;
+        let roots = parse_thread_roots_json(json);
+        assert_eq!(roots.get("parent").map(String::as_str), Some("parent"));
+        assert_eq!(roots.get("child-a").map(String::as_str), Some("parent"));
+        assert_eq!(roots.get("child-b").map(String::as_str), Some("parent"));
+        assert_eq!(roots.get("grandchild").map(String::as_str), Some("parent"));
     }
 
     #[test]

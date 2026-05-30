@@ -50,6 +50,11 @@ pub struct Session {
     pub provider: Provider,
     pub pid: u32,
     pub session_id: String,
+    /// Optional provider-specific display-alias identity. Codex child threads
+    /// spawned from one parent should share a display alias, so Codex fills
+    /// this with the root thread id. Providers without such a family concept
+    /// leave it unset and use `session_id` directly.
+    pub alias_session_id: Option<String>,
     pub cwd: PathBuf,
     pub name: Option<String>,
     pub status: String,
@@ -142,6 +147,7 @@ impl Session {
             provider,
             pid,
             session_id,
+            alias_session_id: None,
             cwd,
             name,
             status,
