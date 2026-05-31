@@ -1517,10 +1517,185 @@ fn draw_audit_log(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime
     f.render_widget(para, area);
 }
 
+#[derive(Debug, Default)]
+struct LiveCodexTokenRollup {
+    session_count: u64,
+    tokens_in: u64,
+    tokens_out: u64,
+    cache_read: u64,
+    total_tokens: u64,
+    top_cwds: Vec<LiveCodexCwdBucket>,
+    models: Vec<LiveCodexModelBucket>,
+    max_context: Option<LiveCodexContextPeak>,
+}
+
+#[derive(Debug)]
+struct LiveCodexCwdBucket {
+    cwd: String,
+    session_count: u64,
+    total_tokens: u64,
+}
+
+#[derive(Debug)]
+struct LiveCodexModelBucket {
+    model: String,
+    session_count: u64,
+    total_tokens: u64,
+}
+
+#[derive(Debug)]
+struct LiveCodexContextPeak {
+    cwd: String,
+    session_id: String,
+    tokens: u64,
+    window: Option<u64>,
+}
+
+fn live_codex_token_rollup(sessions: &[Session]) -> LiveCodexTokenRollup {
+    let mut rollup = LiveCodexTokenRollup::default();
+    let mut cwd_buckets: HashMap<String, LiveCodexCwdBucket> = HashMap::new();
+    let mut model_buckets: HashMap<String, LiveCodexModelBucket> = HashMap::new();
+
+    for s in sessions.iter().filter(|s| s.provider == Provider::Codex) {
+        let total_tokens = s.total_tokens_in + s.total_tokens_out;
+        if total_tokens == 0 && s.latest_context_tokens == 0 {
+            continue;
+        }
+        rollup.session_count += 1;
+        rollup.tokens_in += s.total_tokens_in;
+        rollup.tokens_out += s.total_tokens_out;
+        rollup.cache_read += s.total_tokens_cache_read;
+        rollup.total_tokens += total_tokens;
+
+        let cwd = s.cwd.display().to_string();
+        let cwd_bucket = cwd_buckets
+            .entry(cwd.clone())
+            .or_insert_with(|| LiveCodexCwdBucket {
+                cwd: cwd.clone(),
+                session_count: 0,
+                total_tokens: 0,
+            });
+        cwd_bucket.session_count += 1;
+        cwd_bucket.total_tokens += total_tokens;
+
+        if let Some(model) = s.latest_model.as_deref()
+            && !model.trim().is_empty()
+        {
+            let model_bucket =
+                model_buckets
+                    .entry(model.to_string())
+                    .or_insert_with(|| LiveCodexModelBucket {
+                        model: model.to_string(),
+                        session_count: 0,
+                        total_tokens: 0,
+                    });
+            model_bucket.session_count += 1;
+            model_bucket.total_tokens += total_tokens;
+        }
+
+        if s.latest_context_tokens > 0
+            && rollup
+                .max_context
+                .as_ref()
+                .is_none_or(|peak| context_rank_session(s) > context_rank_peak(peak))
+        {
+            rollup.max_context = Some(LiveCodexContextPeak {
+                cwd,
+                session_id: s.session_id.clone(),
+                tokens: s.latest_context_tokens,
+                window: s.context_window,
+            });
+        }
+    }
+
+    rollup.top_cwds = cwd_buckets.into_values().collect();
+    rollup.top_cwds.sort_by(|a, b| {
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then_with(|| b.session_count.cmp(&a.session_count))
+            .then_with(|| a.cwd.cmp(&b.cwd))
+    });
+    rollup.models = model_buckets.into_values().collect();
+    rollup.models.sort_by(|a, b| {
+        b.total_tokens
+            .cmp(&a.total_tokens)
+            .then_with(|| b.session_count.cmp(&a.session_count))
+            .then_with(|| a.model.cmp(&b.model))
+    });
+    rollup
+}
+
+fn context_rank_session(s: &Session) -> u64 {
+    s.context_window
+        .filter(|window| *window > 0)
+        .map(|window| s.latest_context_tokens.saturating_mul(10_000) / window)
+        .unwrap_or(s.latest_context_tokens)
+}
+
+fn context_rank_peak(peak: &LiveCodexContextPeak) -> u64 {
+    peak.window
+        .filter(|window| *window > 0)
+        .map(|window| peak.tokens.saturating_mul(10_000) / window)
+        .unwrap_or(peak.tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    #[test]
+    fn live_codex_token_rollup_uses_only_codex_sessions() {
+        let mut codex = Session::new(
+            Provider::Codex,
+            1,
+            "codex-session".to_string(),
+            PathBuf::from("/repo/triage"),
+            None,
+            "idle".to_string(),
+            0,
+            0,
+            None,
+        );
+        codex.total_tokens_in = 1_000;
+        codex.total_tokens_out = 200;
+        codex.total_tokens_cache_read = 700;
+        codex.latest_context_tokens = 900;
+        codex.context_window = Some(1_800);
+        codex.latest_model = Some("gpt-5.5".to_string());
+
+        let mut claude = Session::new(
+            Provider::Claude,
+            2,
+            "claude-session".to_string(),
+            PathBuf::from("/repo/other"),
+            None,
+            "idle".to_string(),
+            0,
+            0,
+            None,
+        );
+        claude.total_tokens_in = 9_000;
+
+        let rollup = live_codex_token_rollup(&[codex, claude]);
+
+        assert_eq!(rollup.session_count, 1);
+        assert_eq!(rollup.tokens_in, 1_000);
+        assert_eq!(rollup.tokens_out, 200);
+        assert_eq!(rollup.cache_read, 700);
+        assert_eq!(rollup.total_tokens, 1_200);
+        assert_eq!(rollup.top_cwds[0].cwd, "/repo/triage");
+        assert_eq!(rollup.models[0].model, "gpt-5.5");
+        assert_eq!(rollup.max_context.as_ref().unwrap().tokens, 900);
+    }
+}
+
 fn draw_cost_overlay(f: &mut Frame, area: Rect, app: &mut AppState) {
     use crate::cost_rollup::{format_usd, short_cwd};
     let dim = || Style::default().fg(Color::DarkGray);
     let bold = || Style::default().add_modifier(Modifier::BOLD);
+    let codex = live_codex_token_rollup(&app.sessions);
 
     // Pull the cached rollup (computes once per overlay-open within the TTL).
     // Clone the few small bits we render so the borrow ends before we touch
@@ -1672,6 +1847,115 @@ fn draw_cost_overlay(f: &mut Frame, area: Rect, app: &mut AppState) {
         }
     }
 
+    if codex.session_count > 0 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  live codex tokens (no dollar data)",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{:>8}", format_tokens(codex.total_tokens)), bold()),
+            Span::styled(" total", dim()),
+            Span::raw("  "),
+            Span::styled(
+                format!(
+                    "{} in · {} out · {} cache",
+                    format_tokens(codex.tokens_in),
+                    format_tokens(codex.tokens_out),
+                    format_tokens(codex.cache_read),
+                ),
+                dim(),
+            ),
+            Span::styled(
+                format!(
+                    "   ({} live session{})",
+                    codex.session_count,
+                    if codex.session_count == 1 { "" } else { "s" },
+                ),
+                dim(),
+            ),
+        ]));
+        if let Some(peak) = codex.max_context.as_ref() {
+            let pct = peak
+                .window
+                .filter(|window| *window > 0)
+                .map(|window| (peak.tokens as f64 / window as f64) * 100.0);
+            let pct_style = match pct {
+                Some(p) if p >= 95.0 => Style::default().fg(Color::Red),
+                Some(p) if p >= 80.0 => Style::default().fg(Color::Yellow),
+                _ => dim(),
+            };
+            let window = peak
+                .window
+                .map(format_tokens)
+                .unwrap_or_else(|| "?".to_string());
+            let session_id: String = peak.session_id.chars().take(8).collect();
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("max ctx ", dim()),
+                Span::styled(format!("{}/{}", format_tokens(peak.tokens), window), bold()),
+                Span::styled(
+                    pct.map(|p| format!(" ({p:.0}%)"))
+                        .unwrap_or_else(|| " (?%)".to_string()),
+                    pct_style,
+                ),
+                Span::styled("  ", dim()),
+                Span::styled(session_id, dim()),
+                Span::raw("  "),
+                Span::raw(short_cwd(&peak.cwd)),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  top live codex cwds",
+            Style::default().add_modifier(Modifier::BOLD),
+        )));
+        let codex_peak = codex
+            .top_cwds
+            .first()
+            .map(|c| c.total_tokens)
+            .unwrap_or(1)
+            .max(1);
+        for c in codex.top_cwds.iter().take(5) {
+            let filled = ((c.total_tokens as f64 / codex_peak as f64) * 24.0).round() as usize;
+            let bar: String = "█".repeat(filled);
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(format!("{:>8}", format_tokens(c.total_tokens)), bold()),
+                Span::raw("  "),
+                Span::styled(format!("{:>3} sess", c.session_count), dim()),
+                Span::raw("  "),
+                Span::raw(format!("{:<28}", short_cwd(&c.cwd))),
+                Span::styled(bar, Style::default().fg(Color::Cyan)),
+            ]));
+        }
+
+        if !codex.models.is_empty() {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  live codex by model",
+                Style::default().add_modifier(Modifier::BOLD),
+            )));
+            for m in codex.models.iter().take(5) {
+                let pct = if codex.total_tokens > 0 {
+                    100.0 * m.total_tokens as f64 / codex.total_tokens as f64
+                } else {
+                    0.0
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{:<12}", m.model), bold()),
+                    Span::raw("  "),
+                    Span::styled(format!("{:>8}", format_tokens(m.total_tokens)), bold()),
+                    Span::styled(format!("   {pct:>4.1}%"), dim()),
+                    Span::styled(format!("  {} sess", m.session_count), dim()),
+                ]));
+            }
+        }
+    }
+
     app.cost_overlay_total_lines = lines.len() as u16;
     let max_offset = app
         .cost_overlay_total_lines
@@ -1681,8 +1965,8 @@ fn draw_cost_overlay(f: &mut Frame, area: Rect, app: &mut AppState) {
     }
 
     let title = format!(
-        " cost  ·  {} sessions  ·  scanned {} ms ",
-        scanned_files, scan_duration_ms
+        " cost  ·  {} Claude sessions  ·  {} live Codex  ·  scanned {} ms ",
+        scanned_files, codex.session_count, scan_duration_ms
     );
     let block = Block::default()
         .borders(Borders::TOP)

@@ -142,7 +142,8 @@ Blocked Codex detection uses two signals together: the latest unfinished tool ca
 
 Known limits:
 
-- Codex rows do not participate in `triage cost`; that command is still Claude-transcript based.
+- The `$` overlay shows live Codex token/context usage, but Codex dollar cost is unavailable from local data.
+- The `triage cost` CLI command is still Claude-dollar based.
 - Codex approval routing depends on the visible native prompt, so it can only answer the live tmux pane.
 - Restart old triage panes after `cargo install --path .`; an already-running TUI keeps its old binary and in-memory state.
 
@@ -177,7 +178,7 @@ Without the hook installed, `h` falls back to `tmux` mode which sends keystrokes
 
 ## Cost & context-window tracking
 
-Detail pane shows approximate session cost (per-message `usage` × per-model rates, deduplicated by `message.id`) and context-window occupancy as `current / total (%)`.
+Detail pane shows approximate Claude session cost (per-message `usage` × per-model rates, deduplicated by `message.id`) and context-window occupancy as `current / total (%)`. Codex sessions show token usage and context occupancy, but not dollars.
 
 Context-window detection precedence:
 
@@ -188,7 +189,7 @@ Context-window detection precedence:
 5. Fleet-wide peak >210k → 1M (any sibling session's evidence)
 6. Default 200k
 
-Cost figures are approximate; cross-check against `/cost` for the canonical per-session total.
+Cost figures are approximate; cross-check Claude rows against `/cost` for the canonical per-session total. Codex local rollouts expose token counts, cached input tokens, and context windows, but not billable dollars.
 
 ## Configuration
 
