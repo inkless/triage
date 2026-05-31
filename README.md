@@ -1,12 +1,19 @@
 # triage
 
-A Rust TUI to **triage parallel Claude Code sessions across tmux panes** — sort by attention priority, optionally let a Sonnet auditor handle routine approvals so you don't babysit every prompt.
+A Rust TUI to **triage parallel Claude Code and Codex CLI sessions across tmux panes** — sort by attention priority, optionally let a Sonnet auditor handle routine approvals so you don't babysit every prompt.
 
-Reads files Claude Code already writes:
+Reads files the agents already write:
 
+Claude Code:
 - `~/.claude/sessions/<pid>.json` — discovery + `idle`/`busy` status
 - `~/.claude/projects/<encoded-cwd>/<sessionId>.jsonl` — recap, prompts, tool calls, per-message usage
-- `tmux list-panes -a` — joined via process-ancestor walk from the Claude PID
+
+Codex CLI:
+- `~/.codex/sessions/**/rollout-*.jsonl` — prompts, messages, tool calls, token counts
+- `~/.codex/state_5.sqlite` — native thread titles, agent labels, parent/child thread roots
+
+Shared:
+- `tmux list-panes -a` — joined via process-ancestor walk from the agent PID
 
 Different shape from [`agentop`](https://crates.io/crates/agentop) (process-centric, token/cost focused). `triage` is content-centric: the headline column is the recap, the detail pane shows what the agent is doing and why, and auto mode (off by default) routes safe tool approvals through an LLM auditor.
 
@@ -19,6 +26,8 @@ triage --probe      # print the joined session table once (no TUI)
 triage notify "..." # one-shot ntfy push using config.toml's [ntfy] block
 triage cost         # daily/weekly Claude spend rollup across all transcripts
 ```
+
+After reinstalling, restart any already-running `triage` TUI pane so it picks up the new binary and state-file behavior.
 
 The `notify` subcommand lets any agent, hook, or shell script ping the user's phone without re-implementing ntfy auth:
 
@@ -56,7 +65,7 @@ bind-key -n M-p run-shell "triage --jump-to-self --zoom"
 
 ## Optional: PreToolUse hook
 
-Install the PreToolUse hook so manual `a`/`d` and auto-mode verdicts route through Claude's clean approval channel instead of tmux send-keys:
+Install the PreToolUse hook so Claude manual `a`/`d` and auto-mode verdicts route through Claude's clean approval channel instead of tmux send-keys:
 
 ```bash
 triage --install-hooks         # idempotent merge into ~/.claude/settings.json
@@ -87,6 +96,7 @@ Filter & overlays:
   /                start filter (matches name + cwd, case-insensitive)
                    in edit mode: type to filter · ↑↓ navigate · ⏎ jump to selection
                                  Esc clear · ^W delete word · ^U clear line
+  R                rename selected row in triage only; ^U clears the old value while editing
   H                open / close audit-log overlay (auto-mode decision history)
   $                open / close cost overlay (cross-session spend rollup)
 
@@ -122,13 +132,27 @@ Toggle with `space`. Three zones:
 - **Body** — agent's latest text (Claude's reasoning, often the *why* before the next tool call), pending tool + full input, recap (`away_summary`), last user prompt.
 - **Stats footer** — auditor decision (when auto mode is on, with cost + duration), session cost + tokens + context-window % (yellow ≥80%, red ≥95%), event timing.
 
+## Codex support
+
+Codex sessions show up beside Claude rows with the `cx` provider label. Filter matches `cx`, `codex`, row name, and cwd.
+
+Triage discovers live Codex processes from `ps`, finds the active rollout jsonl held open by the process, and joins that process back to tmux. Titles come from Codex's native thread metadata when available. `R` creates a triage-local alias when the native title is too long; aliases are keyed by Codex's root thread id, so a renamed spawned-review session continues to label the parent row.
+
+Blocked Codex detection uses two signals together: the latest unfinished tool call must request escalation, and the visible tmux pane must show Codex's approval UI. Manual `a`/`d` and auto mode answer that visible prompt through tmux. Codex does not currently have a PreToolUse hook path like Claude, so triage validates the prompt is still present before sending keys; approve requires the `Yes` option to be selected.
+
+Known limits:
+
+- Codex rows do not participate in `triage cost`; that command is still Claude-transcript based.
+- Codex approval routing depends on the visible native prompt, so it can only answer the live tmux pane.
+- Restart old triage panes after `cargo install --path .`; an already-running TUI keeps its old binary and in-memory state.
+
 ## Auto mode
 
 Toggle with `A`. Off by default; persists across restart.
 
-When on, each refresh spawns `claude -p --model claude-sonnet-4-6 --tools "" --name triage-auditor` for any Blocked session with a captured tool_use. The auditor receives the session's recent recap + intent + tool + full tool_input and returns `APPROVE` / `DENY` / `WAIT` with a one-line reason.
+When on, each refresh spawns `claude -p --model claude-sonnet-4-6 --tools "" --name triage-auditor` for any Blocked Claude or Codex session with a captured tool request. The auditor is Claude Sonnet for both providers; triage does not spawn Codex as the reviewer. The auditor receives the session's recent recap + intent + tool + full tool input and returns `APPROVE` / `DENY` / `WAIT` with a one-line reason.
 
-- `APPROVE` / `DENY` route through the same machinery as manual `a`/`d` (hook decision file when available, tmux send-keys fallback).
+- `APPROVE` / `DENY` route through the same machinery as manual `a`/`d` (Claude hook decision file when available, tmux send-keys fallback; Codex visible-prompt routing).
 - `WAIT` surfaces the reason in the detail pane and leaves the prompt for human review.
 
 Decisions append to `~/.config/triage/auto-decisions.jsonl` (one JSON object per line, includes cost + duration). Press `H` for the audit-history overlay.
@@ -139,7 +163,7 @@ Per-call budget is `--max-budget-usd 1.00`. Typical Sonnet round-trip: 10–25s 
 
 ## Hook setup (optional)
 
-`a`/`d` in `hook` mode and auto mode both deliver decisions through a PreToolUse hook. The hook is a small bash script embedded in the binary; `--install-hooks` writes it to `~/.config/triage/hooks/triage-preuse.sh` and merges the path into `~/.claude/settings.json`. No source-repo dependency — `cargo install triage` users can delete their checkout and the hook keeps working.
+For Claude, `a`/`d` in `hook` mode and auto mode both deliver decisions through a PreToolUse hook. The hook is a small bash script embedded in the binary; `--install-hooks` writes it to `~/.config/triage/hooks/triage-preuse.sh` and merges the path into `~/.claude/settings.json`. No source-repo dependency — `cargo install triage` users can delete their checkout and the hook keeps working.
 
 ```bash
 triage --install-hooks         # idempotent install (also re-installs an updated hook on triage upgrade)
@@ -149,7 +173,7 @@ triage --uninstall-hooks       # remove from settings.json + delete the script f
 
 The hook is zero-cost when triage isn't running (single file-existence check + `kill -0`, ~3ms). With auto mode on, it waits up to 60s (vs the default 3s) for the auditor's verdict via a claim-file handshake. Re-running `--install-hooks` after a triage upgrade refreshes the on-disk script if its content changed.
 
-Without the hook installed, `h` falls back to `tmux` mode which sends keystrokes to the pane — works regardless of managed-policy settings.
+Without the hook installed, `h` falls back to `tmux` mode which sends keystrokes to Claude's pane — works regardless of managed-policy settings. Codex approval routing always uses the tmux path because there is no Codex hook integration yet.
 
 ## Cost & context-window tracking
 
@@ -195,10 +219,10 @@ The auditor system prompt lives separately at `~/.config/triage/auditor-prompt.m
 
 ## Design notes
 
-- **Discovery + tmux join.** Sessions JSON keyed by Claude PID. Tmux's `pane_pid` is the shell; walk the process tree upward (up to 8 hops) until an ancestor matches a `pane_pid`.
-- **Transcript pairing.** The active pane's session gets the jsonl with the newest qualifying user-text; remaining sessions pair greedily by mtime. Survives `/clear`.
-- **Mechanical extraction in the live path.** Recap is `away_summary` (Claude-generated, no LLM in triage). Auditor is opt-in and runs only on Blocked sessions.
-- **Hook is optional.** Triage works without any `~/.claude/settings.json` edits — the hook is needed only for clean approve/deny + auto-mode decision delivery.
+- **Discovery + tmux join.** Claude uses sessions JSON keyed by PID; Codex uses live process file handles into rollout jsonl files. Tmux's `pane_pid` is usually the shell, so triage walks the process tree upward until an ancestor matches a `pane_pid`.
+- **Transcript pairing.** Claude's active pane gets the jsonl with the newest qualifying user-text; remaining sessions pair greedily by mtime. Survives `/clear`. Codex rollouts are discovered from the live process directly.
+- **Mechanical extraction in the live path.** Claude recap is `away_summary`; Codex uses the latest rollout messages and native thread title metadata. The auditor is opt-in and runs only on Blocked sessions.
+- **Hook is optional.** Triage works without any `~/.claude/settings.json` edits — the hook is needed only for clean Claude approve/deny + auto-mode decision delivery.
 
 ## Status
 

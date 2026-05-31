@@ -2,7 +2,7 @@
 name = "triage"
 version = "0.1.0"
 edition = "2024"
-description = "TUI to monitor parallel Claude Code sessions across tmux panes — triage by attention priority"
+description = "TUI to monitor parallel Claude Code and Codex CLI sessions across tmux panes — triage by attention priority"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/inkless/triage"
 keywords = ["tui", "claude", "monitor", "tmux", "agent"]
