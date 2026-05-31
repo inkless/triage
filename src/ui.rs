@@ -310,6 +310,16 @@ impl AppState {
         );
     }
 
+    fn persist_state_replace_aliases(&self) {
+        persist::save_state_replace_aliases(
+            self.muted.iter(),
+            self.aliases.iter(),
+            self.approval_mode,
+            self.autonomous,
+            self.phone_push_enabled,
+        );
+    }
+
     pub fn start_rename_selected(&mut self) -> Option<()> {
         let s = self.selected_session()?;
         let key = AliasKey::for_session(s);
@@ -361,7 +371,7 @@ impl AppState {
             }
         }
         apply_aliases_to_sessions(&mut self.sessions, &self.aliases);
-        self.persist_state();
+        self.persist_state_replace_aliases();
         Some(msg)
     }
 

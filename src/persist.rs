@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -137,6 +138,7 @@ pub fn load_state() -> LoadedState {
     let Ok(state) = serde_json::from_slice::<PersistedState>(&bytes) else {
         return LoadedState::empty();
     };
+    let aliases = aliases_from_state(&state).into_iter().collect::<Vec<_>>();
     let mutes = state
         .mutes
         .into_iter()
@@ -149,24 +151,6 @@ pub fn load_state() -> LoadedState {
                 },
                 mute_at,
             )
-        })
-        .collect();
-    let codex_thread_roots = crate::codex::load_thread_roots_for_aliases();
-    let aliases = state
-        .aliases
-        .into_iter()
-        .filter(|a| !a.alias.trim().is_empty() && !a.session_id.is_empty())
-        .map(|a| {
-            let mut key = AliasKey {
-                provider: a.provider,
-                session_id: a.session_id,
-            };
-            if key.provider == Provider::Codex.label()
-                && let Some(root) = codex_thread_roots.get(&key.session_id)
-            {
-                key.session_id = root.clone();
-            }
-            (key, a.alias)
         })
         .collect();
     LoadedState {
@@ -220,6 +204,55 @@ pub fn save_state<'a, M, A>(
     M: IntoIterator<Item = (&'a MuteKey, &'a SystemTime)>,
     A: IntoIterator<Item = (&'a AliasKey, &'a String)>,
 {
+    save_state_with_alias_mode(
+        mutes_iter,
+        aliases_iter,
+        approval_mode,
+        autonomous,
+        phone_push_enabled,
+        AliasWriteMode::Merge,
+    );
+}
+
+/// Save state after an explicit rename edit. Unlike the normal save path,
+/// this replaces aliases so clearing an alias stays cleared.
+pub fn save_state_replace_aliases<'a, M, A>(
+    mutes_iter: M,
+    aliases_iter: A,
+    approval_mode: ApprovalMode,
+    autonomous: bool,
+    phone_push_enabled: bool,
+) where
+    M: IntoIterator<Item = (&'a MuteKey, &'a SystemTime)>,
+    A: IntoIterator<Item = (&'a AliasKey, &'a String)>,
+{
+    save_state_with_alias_mode(
+        mutes_iter,
+        aliases_iter,
+        approval_mode,
+        autonomous,
+        phone_push_enabled,
+        AliasWriteMode::Replace,
+    );
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum AliasWriteMode {
+    Merge,
+    Replace,
+}
+
+fn save_state_with_alias_mode<'a, M, A>(
+    mutes_iter: M,
+    aliases_iter: A,
+    approval_mode: ApprovalMode,
+    autonomous: bool,
+    phone_push_enabled: bool,
+    alias_write_mode: AliasWriteMode,
+) where
+    M: IntoIterator<Item = (&'a MuteKey, &'a SystemTime)>,
+    A: IntoIterator<Item = (&'a AliasKey, &'a String)>,
+{
     let mutes: Vec<PersistedMute> = mutes_iter
         .into_iter()
         .filter_map(|(k, t)| {
@@ -231,23 +264,23 @@ pub fn save_state<'a, M, A>(
             })
         })
         .collect();
-    let aliases: Vec<PersistedAlias> = aliases_iter
-        .into_iter()
-        .filter(|(_, alias)| !alias.trim().is_empty())
-        .map(|(key, alias)| PersistedAlias {
-            provider: key.provider.clone(),
-            session_id: key.session_id.clone(),
-            alias: alias.trim().to_string(),
-        })
-        .collect();
-    // Read existing pane_id and preserve. The full save path is for mutes /
-    // approval-mode / autonomous / phone-push; pane_id is owned by
-    // AliveGuard and we shouldn't accidentally overwrite it from this code
-    // path.
-    let existing_pane_id = fs::read(state_path())
+
+    // Read existing state once. Pane id is owned by AliveGuard. Aliases are
+    // normally merged from disk so a long-running older TUI snapshot cannot
+    // wipe aliases created by another triage instance when it saves an
+    // unrelated toggle or mute change.
+    let existing_state: PersistedState = fs::read(state_path())
         .ok()
-        .and_then(|b| serde_json::from_slice::<PersistedState>(&b).ok())
-        .and_then(|s| s.last_pane_id);
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let existing_pane_id = existing_state.last_pane_id.clone();
+    let codex_thread_roots = crate::codex::load_thread_roots_for_aliases();
+    let aliases = persisted_aliases_for_save(
+        &existing_state,
+        aliases_iter,
+        alias_write_mode,
+        &codex_thread_roots,
+    );
     let state = PersistedState {
         mutes,
         aliases,
@@ -264,4 +297,185 @@ pub fn save_state<'a, M, A>(
         let _ = fs::create_dir_all(parent);
     }
     let _ = fs::write(path, json);
+}
+
+fn aliases_from_state(state: &PersistedState) -> HashMap<AliasKey, String> {
+    let codex_thread_roots = crate::codex::load_thread_roots_for_aliases();
+    aliases_from_state_with_roots(state, &codex_thread_roots)
+}
+
+fn aliases_from_state_with_roots(
+    state: &PersistedState,
+    codex_thread_roots: &HashMap<String, String>,
+) -> HashMap<AliasKey, String> {
+    state
+        .aliases
+        .iter()
+        .filter(|a| !a.alias.trim().is_empty() && !a.session_id.is_empty())
+        .map(|a| {
+            let key =
+                canonical_alias_key(a.provider.clone(), a.session_id.clone(), codex_thread_roots);
+            (key, a.alias.trim().to_string())
+        })
+        .collect()
+}
+
+fn persisted_aliases_for_save<'a, A>(
+    existing_state: &PersistedState,
+    aliases_iter: A,
+    alias_write_mode: AliasWriteMode,
+    codex_thread_roots: &HashMap<String, String>,
+) -> Vec<PersistedAlias>
+where
+    A: IntoIterator<Item = (&'a AliasKey, &'a String)>,
+{
+    let mut alias_map = if alias_write_mode == AliasWriteMode::Merge {
+        aliases_from_state_with_roots(existing_state, codex_thread_roots)
+    } else {
+        HashMap::new()
+    };
+    alias_map.extend(
+        aliases_iter
+            .into_iter()
+            .filter(|(_, alias)| !alias.trim().is_empty())
+            .map(|(key, alias)| {
+                (
+                    canonical_alias_key(
+                        key.provider.clone(),
+                        key.session_id.clone(),
+                        codex_thread_roots,
+                    ),
+                    alias.trim().to_string(),
+                )
+            }),
+    );
+    alias_map
+        .into_iter()
+        .map(|(key, alias)| PersistedAlias {
+            provider: key.provider,
+            session_id: key.session_id,
+            alias,
+        })
+        .collect()
+}
+
+fn canonical_alias_key(
+    provider: String,
+    session_id: String,
+    codex_thread_roots: &HashMap<String, String>,
+) -> AliasKey {
+    let mut key = AliasKey {
+        provider,
+        session_id,
+    };
+    if key.provider == Provider::Codex.label()
+        && let Some(root) = codex_thread_roots.get(&key.session_id)
+    {
+        key.session_id = root.clone();
+    }
+    key
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alias(provider: &str, session_id: &str, alias: &str) -> PersistedAlias {
+        PersistedAlias {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+            alias: alias.to_string(),
+        }
+    }
+
+    fn alias_key(provider: &str, session_id: &str) -> AliasKey {
+        AliasKey {
+            provider: provider.to_string(),
+            session_id: session_id.to_string(),
+        }
+    }
+
+    fn alias_map(aliases: Vec<PersistedAlias>) -> HashMap<(String, String), String> {
+        aliases
+            .into_iter()
+            .map(|a| ((a.provider, a.session_id), a.alias))
+            .collect()
+    }
+
+    #[test]
+    fn merge_alias_save_preserves_existing_aliases() {
+        let existing_state = PersistedState {
+            aliases: vec![alias("cc", "old-session", "old alias")],
+            ..Default::default()
+        };
+        let key = alias_key("cx", "new-session");
+        let name = "new alias".to_string();
+
+        let aliases = persisted_aliases_for_save(
+            &existing_state,
+            [(&key, &name)],
+            AliasWriteMode::Merge,
+            &HashMap::new(),
+        );
+
+        let aliases = alias_map(aliases);
+        assert_eq!(
+            aliases.get(&("cc".to_string(), "old-session".to_string())),
+            Some(&"old alias".to_string())
+        );
+        assert_eq!(
+            aliases.get(&("cx".to_string(), "new-session".to_string())),
+            Some(&"new alias".to_string())
+        );
+    }
+
+    #[test]
+    fn replace_alias_save_drops_existing_aliases() {
+        let existing_state = PersistedState {
+            aliases: vec![alias("cc", "old-session", "old alias")],
+            ..Default::default()
+        };
+        let key = alias_key("cx", "new-session");
+        let name = "new alias".to_string();
+
+        let aliases = persisted_aliases_for_save(
+            &existing_state,
+            [(&key, &name)],
+            AliasWriteMode::Replace,
+            &HashMap::new(),
+        );
+
+        let aliases = alias_map(aliases);
+        assert!(!aliases.contains_key(&("cc".to_string(), "old-session".to_string())));
+        assert_eq!(
+            aliases.get(&("cx".to_string(), "new-session".to_string())),
+            Some(&"new alias".to_string())
+        );
+    }
+
+    #[test]
+    fn alias_save_canonicalizes_codex_children_to_roots() {
+        let mut roots = HashMap::new();
+        roots.insert("child".to_string(), "root".to_string());
+        let existing_state = PersistedState {
+            aliases: vec![alias("cx", "child", "existing alias")],
+            ..Default::default()
+        };
+        let key = alias_key("cx", "child");
+        let name = "new alias".to_string();
+
+        let aliases = persisted_aliases_for_save(
+            &existing_state,
+            [(&key, &name)],
+            AliasWriteMode::Merge,
+            &roots,
+        );
+
+        let aliases = alias_map(aliases);
+        assert_eq!(
+            aliases.get(&("cx".to_string(), "root".to_string())),
+            Some(&"new alias".to_string())
+        );
+        assert!(!aliases.contains_key(&("cx".to_string(), "child".to_string())));
+    }
 }
