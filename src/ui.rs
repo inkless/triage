@@ -74,6 +74,8 @@ pub struct AppState {
     /// the session table. Toggle with `H` (only effective when autonomous
     /// mode is on — there's no history to look at otherwise).
     pub audit_log_open: bool,
+    /// Full keybinding help view. Toggle with `?` from normal mode.
+    pub key_help_open: bool,
     /// Scroll offset into the audit log (0 = newest entry at top).
     pub audit_log_offset: u16,
     /// Total content-line count of the audit overlay (set by `draw_audit_log`
@@ -174,6 +176,7 @@ impl AppState {
             audit_rx,
             default_model: crate::approval::read_default_model(),
             audit_log_open: false,
+            key_help_open: false,
             audit_log_offset: 0,
             audit_log_total_lines: 0,
             pending_g: false,
@@ -543,6 +546,20 @@ pub fn apply_aliases_to_sessions(sessions: &mut [Session], aliases: &HashMap<Ali
 }
 
 pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
+    if app.key_help_open {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(5),
+                Constraint::Length(1),
+            ])
+            .split(f.area());
+        draw_header(f, chunks[0], app);
+        draw_key_help(f, chunks[1]);
+        draw_footer(f, chunks[2], app);
+        return;
+    }
     if app.spawn_picker_open {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -2194,6 +2211,61 @@ fn draw_cost_overlay(f: &mut Frame, area: Rect, app: &mut AppState) {
     f.render_widget(para, area);
 }
 
+fn draw_key_help(f: &mut Frame, area: Rect) {
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Common", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from("  Enter jump to selected pane     r reply     a/d approve or deny"),
+        Line::from("  / filter sessions              ? keys      q quit"),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Navigation", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from("  Up/Down or j/k move selection  gg top      G bottom"),
+        Line::from("  Space toggle detail            Esc closes overlays and edit modes"),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "Agent Controls",
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from("  h approval mode                A auto mode      p phone push"),
+        Line::from("  m mute                         w watch          R rename"),
+        Line::from("  N new agent"),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Views", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from("  H audit log                    $ cost overlay"),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("Input Modes", Style::default().add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from("  reply:  Enter send             Esc cancel       ^W word  ^U clear"),
+        Line::from("  filter: Enter jump             Esc clear        arrows navigate"),
+        Line::from("  rename: Enter save             Esc cancel       ^W word  ^U clear"),
+        Line::from("  new:    Enter launch           Esc/q cancel     Up/Down or j/k choose"),
+    ];
+
+    let block = Block::default().borders(Borders::TOP).title(Span::styled(
+        " keys  (?/Esc/q close) ",
+        Style::default().fg(Color::DarkGray),
+    ));
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 // Local copies of the day-second helpers (cost_rollup keeps them private to
 // the module since their main consumer is `cli_cost`; the overlay uses the
 // same arithmetic). Keeping them inline here avoids exposing more surface
@@ -2218,6 +2290,17 @@ fn days_from_civil_local(y: i64, m: u32, d: u32) -> i64 {
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
+    if app.key_help_open {
+        let hint = "  ?/Esc/q close keys  ·  ^C quit";
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
     if app.audit_log_open {
         let hint = if app.pending_g {
             "  g … press g again to jump to top, any other key cancels".to_string()
@@ -2300,33 +2383,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
             Style::default().fg(Color::Yellow),
         ))
     } else {
-        let mode = app.approval_mode.label();
-        let auto = if app.autonomous {
-            let n = app.audit_in_flight.len();
-            if n > 0 {
-                format!("AUTO·{n}")
-            } else {
-                "AUTO".to_string()
-            }
-        } else {
-            "auto:off".to_string()
-        };
-        // Phone-push indicator: only shown when off (the non-default state).
-        // ON is silent — same minimalism as autonomous's "auto:off" hint.
-        // Narrow mode skips the indicator to stay under the budget.
-        let phone_off_seg = if !app.phone_push_enabled {
-            " [phone:off]"
-        } else {
-            ""
-        };
         let hint = match LayoutMode::from_width(area.width) {
-            LayoutMode::Narrow => format!(" ⏎ a d h:{mode} A:{auto} q"),
-            LayoutMode::Medium => {
-                format!(" ⏎ jump  r reply  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  R rename  q")
+            LayoutMode::Narrow => " ⏎ r a/d / ? q".to_string(),
+            LayoutMode::Medium => " ⏎ jump  r reply  a/d approve  / filter  ? keys  q".to_string(),
+            LayoutMode::Wide => {
+                "  ⏎ jump  r reply  a/d approve  / filter  ? keys  q quit".to_string()
             }
-            LayoutMode::Wide => format!(
-                "  ⏎ jump  r reply  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  w watch  R rename  / filter  H log  $ cost  q quit"
-            ),
         };
         let style = if app.autonomous {
             Style::default().fg(Color::Magenta)

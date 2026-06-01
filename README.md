@@ -123,6 +123,7 @@ General:
   gg / G           jump to top / bottom
   ⏎                jump to selected session's tmux pane
   space            toggle detail panel
+  ?                show all keybindings
   q / Ctrl-C       quit
 
 Approve / deny / mute / watch:

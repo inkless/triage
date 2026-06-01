@@ -180,7 +180,7 @@ FLAGS:
 IN-TUI KEYBINDINGS:
   ⏎ jump · a/d approve/deny · h toggle approval mode · A toggle auto mode
   p toggle phone push · r reply · m mute · w watch · R rename · N new agent · / filter
-  H audit log · $ cost overlay · q quit
+  H audit log · $ cost overlay · ? keys · q quit
 
 DOCS:
   README:        https://github.com/inkless/triage
@@ -288,6 +288,18 @@ fn run(
 }
 
 fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
+    if app.key_help_open {
+        match code {
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Esc | KeyCode::Char('?') | KeyCode::Char('q') => {
+                app.key_help_open = false;
+                app.pending_g = false;
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     if app.reply_active {
         match code {
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
@@ -359,6 +371,10 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             }
             KeyCode::Enter => {
                 app.status_msg = Some(launch_new_agent_from_picker(app));
+            }
+            KeyCode::Char('?') => {
+                app.key_help_open = true;
+                app.pending_g = false;
             }
             KeyCode::Up | KeyCode::Char('k') => app.move_spawn_selection(-1),
             KeyCode::Down | KeyCode::Char('j') => app.move_spawn_selection(1),
@@ -441,6 +457,10 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                 app.cost_overlay_offset = 0;
                 app.pending_g = false;
             }
+            KeyCode::Char('?') => {
+                app.key_help_open = true;
+                app.pending_g = false;
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.cost_overlay_offset = app.cost_overlay_offset.saturating_sub(1);
             }
@@ -491,6 +511,10 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             KeyCode::Char('H') | KeyCode::Esc => {
                 app.audit_log_open = false;
                 app.audit_log_offset = 0;
+                app.pending_g = false;
+            }
+            KeyCode::Char('?') => {
+                app.key_help_open = true;
                 app.pending_g = false;
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -557,6 +581,10 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             }
         }
         KeyCode::Char('G') => app.select_last(),
+        KeyCode::Char('?') => {
+            app.key_help_open = true;
+            app.status_msg = None;
+        }
         KeyCode::Char(' ') => app.detail_open = !app.detail_open,
         KeyCode::Char('m') => {
             app.toggle_mute_selected();
