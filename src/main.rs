@@ -179,7 +179,7 @@ FLAGS:
 
 IN-TUI KEYBINDINGS:
   ⏎ jump · a/d approve/deny · h toggle approval mode · A toggle auto mode
-  p toggle phone push · m mute · w watch · R rename · N new agent · / filter
+  p toggle phone push · r reply · m mute · w watch · R rename · N new agent · / filter
   H audit log · $ cost overlay · q quit
 
 DOCS:
@@ -288,6 +288,36 @@ fn run(
 }
 
 fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
+    if app.reply_active {
+        match code {
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Esc => {
+                app.cancel_reply();
+                app.status_msg = Some("reply canceled".to_string());
+            }
+            KeyCode::Enter => {
+                app.status_msg = Some(send_reply(app));
+            }
+            KeyCode::Char('w') if mods.contains(KeyModifiers::CONTROL) => {
+                delete_prev_word(&mut app.reply_buffer);
+            }
+            KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+                app.reply_buffer.clear();
+            }
+            KeyCode::Char('h') if mods.contains(KeyModifiers::CONTROL) => {
+                app.reply_buffer.pop();
+            }
+            KeyCode::Backspace => {
+                app.reply_buffer.pop();
+            }
+            KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
+                app.reply_buffer.push(c);
+            }
+            _ => {}
+        }
+        return true;
+    }
+
     if app.rename_active {
         match code {
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
@@ -602,12 +632,32 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             app.pending_g = false;
         }
         KeyCode::Char('r') => {
-            app.status_msg = Some("refreshing…".to_string());
+            if app.start_reply_selected().is_some() {
+                app.status_msg = None;
+            } else {
+                app.status_msg = Some("no tmux pane for reply target".to_string());
+            }
         }
         KeyCode::Enter => return jump_to_selected(app),
         _ => {}
     }
     true
+}
+
+fn send_reply(app: &mut AppState) -> String {
+    if app.reply_buffer.trim().is_empty() {
+        return "reply is empty".to_string();
+    }
+    let Some(target) = app.reply_target.clone() else {
+        app.cancel_reply();
+        return "no reply target".to_string();
+    };
+    let body = app.reply_buffer.clone();
+    app.cancel_reply();
+    match agent_comm::send_user_reply(&target, &body) {
+        Ok(msg) => msg,
+        Err(e) => format!("reply failed: {e}"),
+    }
 }
 
 fn launch_new_agent_from_picker(app: &mut AppState) -> String {

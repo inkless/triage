@@ -131,6 +131,7 @@ Approve / deny / mute / watch:
   h                cycle approve mode: hook ↔ tmux
   A                toggle autonomous mode (off → on)
   p                toggle ntfy phone push (on by default; Mac banners unaffected)
+  r                reply to selected agent with a one-line user message
   m                mute / unmute selected session
   w                watch / unwatch selected session — sticky; fires a "finished" banner on every work → done transition until toggled off
   N                pick a known cwd and launch a new configured agent in a new tmux window

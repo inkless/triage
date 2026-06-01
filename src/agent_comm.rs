@@ -171,15 +171,37 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
     let body = validate_body(&body)?;
     let formatted = format_message(&sender, &body);
 
+    deliver_message(selector, &sender, &formatted, args.dry_run)
+}
+
+pub fn send_user_reply(selector: &str, body: &str) -> Result<String, String> {
+    let body = format_user_reply(body).map_err(|e| e.message)?;
+    deliver_message(selector, "user", &body, false).map_err(|e| e.message)
+}
+
+fn format_user_reply(body: &str) -> Result<String, CliError> {
+    let body = validate_body(body)?;
+    if body.contains('\n') {
+        return Err(CliError::usage("reply must be a single line"));
+    }
+    Ok(body)
+}
+
+fn deliver_message(
+    selector: &str,
+    sender: &str,
+    message: &str,
+    dry_run: bool,
+) -> Result<String, CliError> {
     let sessions = load_snapshot();
     let target = resolve_target(&sessions, selector)?;
     let gate = evaluate_send_gate(target);
     if !gate.can_send {
-        let _ = append_message_audit(&AuditEntry::denied(&sender, selector, target, &gate.reason));
+        let _ = append_message_audit(&AuditEntry::denied(sender, selector, target, &gate.reason));
         return Err(CliError::denied(gate.reason));
     }
 
-    if args.dry_run {
+    if dry_run {
         return Ok(format!(
             "dry-run: would send to {} ({})",
             target_id(target),
@@ -191,10 +213,10 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
         .pane
         .as_ref()
         .ok_or_else(|| CliError::denied("target has no tmux pane"))?;
-    tmux::paste_text_and_enter(&pane.pane_id, &formatted)
+    tmux::paste_text_and_enter(&pane.pane_id, message)
         .map_err(|e| CliError::delivery(format!("send failed: {e}")))?;
 
-    if let Err(e) = append_message_audit(&AuditEntry::sent(&sender, selector, target, &formatted)) {
+    if let Err(e) = append_message_audit(&AuditEntry::sent(sender, selector, target, message)) {
         eprintln!("warning: failed to append agent-message audit: {e}");
     }
 
@@ -756,5 +778,20 @@ mod tests {
         let formatted = format_message("TRI-112", "hello\nthere");
 
         assert_eq!(formatted, "[triage message from TRI-112]\nhello\nthere");
+    }
+
+    #[test]
+    fn user_reply_keeps_raw_text_without_peer_prefix() {
+        let formatted = format_user_reply("hello agent\n").unwrap();
+
+        assert_eq!(formatted, "hello agent");
+    }
+
+    #[test]
+    fn user_reply_rejects_multiline_body() {
+        let err = format_user_reply("hello\nthere").unwrap_err();
+
+        assert_eq!(err.code, 2);
+        assert_eq!(err.message, "reply must be a single line");
     }
 }

@@ -107,6 +107,11 @@ pub struct AppState {
     pub rename_active: bool,
     pub rename_key: Option<AliasKey>,
     pub rename_buffer: String,
+    /// True while composing a one-line user reply to the selected agent.
+    pub reply_active: bool,
+    pub reply_target: Option<String>,
+    pub reply_target_label: String,
+    pub reply_buffer: String,
     /// When true, triage exits cleanly after a successful `Enter` jump. Set
     /// by `--exit-on-jump`. Designed for the tmux popup launch pattern: the
     /// popup closes when triage exits, so a single keypress (`Enter`) both
@@ -182,6 +187,10 @@ impl AppState {
             rename_active: false,
             rename_key: None,
             rename_buffer: String::new(),
+            reply_active: false,
+            reply_target: None,
+            reply_target_label: String::new(),
+            reply_buffer: String::new(),
             exit_on_jump: false,
             zoom_on_jump: false,
             last_pane_width: 0,
@@ -343,6 +352,30 @@ impl AppState {
         self.rename_active = false;
         self.rename_key = None;
         self.rename_buffer.clear();
+    }
+
+    pub fn start_reply_selected(&mut self) -> Option<()> {
+        let (target, label) = {
+            let s = self.selected_session()?;
+            let pane = s.pane.as_ref()?;
+            (pane.pane_id.clone(), target_label(s))
+        };
+        self.reply_active = true;
+        self.reply_target = Some(target);
+        self.reply_target_label = label;
+        self.reply_buffer.clear();
+        self.audit_log_open = false;
+        self.cost_overlay_open = false;
+        self.filter_active = false;
+        self.pending_g = false;
+        Some(())
+    }
+
+    pub fn cancel_reply(&mut self) {
+        self.reply_active = false;
+        self.reply_target = None;
+        self.reply_target_label.clear();
+        self.reply_buffer.clear();
     }
 
     pub fn start_spawn_picker(&mut self) {
@@ -603,7 +636,17 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
         Span::raw("   "),
         Span::styled(counts, Style::default().fg(Color::DarkGray)),
     ];
-    if app.rename_active {
+    if app.reply_active {
+        spans.push(Span::raw("   "));
+        spans.push(Span::styled(
+            format!("reply to {}: ", app.reply_target_label),
+            Style::default().fg(Color::DarkGray),
+        ));
+        spans.push(Span::styled(
+            format!("{}_", app.reply_buffer),
+            Style::default().fg(Color::Yellow),
+        ));
+    } else if app.rename_active {
         let cursor = "_";
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
@@ -1778,6 +1821,8 @@ fn context_rank_peak(peak: &LiveCodexContextPeak) -> u64 {
 mod tests {
     use std::path::PathBuf;
 
+    use crate::models::Pane;
+
     use super::*;
 
     #[test]
@@ -1823,6 +1868,42 @@ mod tests {
         assert_eq!(rollup.top_cwds[0].cwd, "/repo/triage");
         assert_eq!(rollup.models[0].model, "gpt-5.5");
         assert_eq!(rollup.max_context.as_ref().unwrap().tokens, 900);
+    }
+
+    #[test]
+    fn start_reply_selected_records_pane_target_and_label() {
+        let mut app = AppState::new();
+        let mut session = Session::new(
+            Provider::Claude,
+            1,
+            "sid".to_string(),
+            PathBuf::from("/repo/triage"),
+            Some("agent-triage".to_string()),
+            "idle".to_string(),
+            0,
+            0,
+            None,
+        );
+        session.pane = Some(Pane {
+            target: "main:1.0".to_string(),
+            tmux_session: "main".to_string(),
+            window_name: "triage-work".to_string(),
+            pane_id: "%42".to_string(),
+            pid: 123,
+            tty: "/dev/ttys001".to_string(),
+            current_command: "claude".to_string(),
+            cwd: PathBuf::from("/repo/triage"),
+            active: true,
+        });
+        app.sessions.push(session);
+        app.selected.select(Some(0));
+
+        assert!(app.start_reply_selected().is_some());
+
+        assert!(app.reply_active);
+        assert_eq!(app.reply_target.as_deref(), Some("%42"));
+        assert_eq!(app.reply_target_label, "cc agent-triage");
+        assert!(app.reply_buffer.is_empty());
     }
 }
 
@@ -2180,6 +2261,17 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         );
         return;
     }
+    if app.reply_active {
+        let hint = "  reply  ·  ↵ send  ·  Esc cancel  ·  ^W word  ·  ^U clear";
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
     if app.filter_active {
         let hint = "  type to filter  ·  ↑↓ nav  ·  ↵ keep  ·  Esc clear  ·  ^W word  ·  ^U line";
         f.render_widget(
@@ -2230,10 +2322,10 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         let hint = match LayoutMode::from_width(area.width) {
             LayoutMode::Narrow => format!(" ⏎ a d h:{mode} A:{auto} q"),
             LayoutMode::Medium => {
-                format!(" ⏎ jump  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  R rename  w  q")
+                format!(" ⏎ jump  r reply  a/d  h [{mode}]  A [{auto}]{phone_off_seg}  R rename  q")
             }
             LayoutMode::Wide => format!(
-                "  ⏎ jump  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  w watch  R rename  / filter  H log  $ cost  q quit"
+                "  ⏎ jump  r reply  a/d approve/deny  h [{mode}]  A [{auto}]  p phone{phone_off_seg}  m mute  w watch  R rename  / filter  H log  $ cost  q quit"
             ),
         };
         let style = if app.autonomous {
@@ -2268,6 +2360,16 @@ fn session_matches_filter(s: &Session, q: &str) -> bool {
         }
     }
     s.cwd.to_string_lossy().to_lowercase().contains(q)
+}
+
+fn target_label(s: &Session) -> String {
+    let label = s
+        .name
+        .clone()
+        .or_else(|| s.pane.as_ref().and_then(useful_window_name))
+        .or_else(|| s.cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| s.cwd.display().to_string());
+    format!("{} {}", s.provider.label(), label)
 }
 
 /// Return `Pane.window_name` only when it carries user intent. Skip when:
