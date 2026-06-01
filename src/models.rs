@@ -334,22 +334,6 @@ pub enum ApprovalMode {
     Tmux,
 }
 
-impl ApprovalMode {
-    pub fn label(self) -> &'static str {
-        match self {
-            ApprovalMode::Hook => "hook",
-            ApprovalMode::Tmux => "tmux",
-        }
-    }
-
-    pub fn toggled(self) -> Self {
-        match self {
-            ApprovalMode::Hook => ApprovalMode::Tmux,
-            ApprovalMode::Tmux => ApprovalMode::Hook,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttentionState {
     Error,

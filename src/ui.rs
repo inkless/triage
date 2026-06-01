@@ -41,7 +41,8 @@ pub struct AppState {
     /// (e.g. into `Blocked`) so we can fire a desktop notification once per
     /// transition rather than on every refresh while the session stays blocked.
     pub last_states: HashMap<u32, AttentionState>,
-    /// Which mechanism `a`/`d` use to deliver an approval. Toggled with `h`.
+    /// Which mechanism Claude `a`/`d` use to deliver an approval. Configured
+    /// via `[approval].mode`; Codex approvals always use the tmux path.
     pub approval_mode: ApprovalMode,
     /// Autonomous mode (T-56). Toggle with `A`. When on, the refresh loop
     /// spawns a `claude -p` auditor for each `waiting` session and routes
@@ -166,7 +167,7 @@ impl AppState {
             muted,
             watched: HashSet::new(),
             last_states: HashMap::new(),
-            approval_mode: loaded.approval_mode,
+            approval_mode: ApprovalMode::default(),
             autonomous: loaded.autonomous,
             phone_push_enabled: loaded.phone_push_enabled,
             audit_in_flight: HashMap::new(),
@@ -254,11 +255,6 @@ impl AppState {
         }
     }
 
-    pub fn toggle_approval_mode(&mut self) {
-        self.approval_mode = self.approval_mode.toggled();
-        self.persist_state();
-    }
-
     pub fn toggle_autonomous(&mut self) {
         self.autonomous = !self.autonomous;
         if !self.autonomous {
@@ -317,7 +313,6 @@ impl AppState {
         persist::save_state(
             self.muted.iter(),
             self.aliases.iter(),
-            self.approval_mode,
             self.autonomous,
             self.phone_push_enabled,
         );
@@ -327,7 +322,6 @@ impl AppState {
         persist::save_state_replace_aliases(
             self.muted.iter(),
             self.aliases.iter(),
-            self.approval_mode,
             self.autonomous,
             self.phone_push_enabled,
         );
@@ -704,11 +698,6 @@ fn header_status_spans(app: &AppState, width: u16) -> Vec<Span<'static>> {
             phone_mode_label_parts(app.phone_push_enabled, width),
             phone_mode_style(app.phone_push_enabled),
         ),
-        Span::styled(separator, Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            approval_mode_label_parts(app.approval_mode, width),
-            approval_mode_style(app.approval_mode),
-        ),
     ]
 }
 
@@ -759,14 +748,6 @@ fn phone_mode_label_parts(phone_push_enabled: bool, width: u16) -> String {
     }
 }
 
-fn approval_mode_label_parts(approval_mode: ApprovalMode, width: u16) -> String {
-    let mode = LayoutMode::from_width(width);
-    match mode {
-        LayoutMode::Narrow => approval_mode.label().to_string(),
-        LayoutMode::Medium | LayoutMode::Wide => format!("{} mode", approval_mode.label()),
-    }
-}
-
 fn auto_mode_style(app: &AppState) -> Style {
     if app.autonomous {
         if app.audit_in_flight.is_empty() {
@@ -790,15 +771,6 @@ fn phone_mode_style(phone_push_enabled: bool) -> Style {
         Style::default()
             .fg(Color::Yellow)
             .add_modifier(Modifier::BOLD)
-    }
-}
-
-fn approval_mode_style(approval_mode: ApprovalMode) -> Style {
-    match approval_mode {
-        ApprovalMode::Hook => Style::default().fg(Color::DarkGray),
-        ApprovalMode::Tmux => Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
     }
 }
 
@@ -1258,7 +1230,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
     let mut lines: Vec<Line> = Vec::new();
 
     // ── HEADER ────────────────────────────────────────────────────
-    // Single line, no labels. State (colored) · pane · uptime · mode.
+    // Single line, no labels. State (colored) · pane · model · uptime.
     // Drop pid / session_id / status — all debug-tier; can be recovered by
     // grepping transcripts. State is the canonical "what's this row doing"
     // signal; status is redundant.
@@ -1312,12 +1284,6 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
     }
     header.push(sep());
     header.push(Span::styled(uptime, dim()));
-    header.push(sep());
-    let mode_label = match s.provider {
-        Provider::Claude => format!("{} mode", app.approval_mode.label()),
-        Provider::Codex => "codex".to_string(),
-    };
-    header.push(Span::styled(mode_label, dim()));
     if s.muted {
         header.push(sep());
         header.push(Span::styled("[muted]", yellow()));
@@ -2004,20 +1970,6 @@ mod tests {
     }
 
     #[test]
-    fn approval_mode_label_shows_delivery_mode() {
-        assert_eq!(approval_mode_label_parts(ApprovalMode::Hook, 40), "hook");
-        assert_eq!(approval_mode_label_parts(ApprovalMode::Tmux, 40), "tmux");
-        assert_eq!(
-            approval_mode_label_parts(ApprovalMode::Hook, 120),
-            "hook mode"
-        );
-        assert_eq!(
-            approval_mode_label_parts(ApprovalMode::Tmux, 120),
-            "tmux mode"
-        );
-    }
-
-    #[test]
     fn start_reply_selected_records_pane_target_and_label() {
         let mut app = AppState::new();
         let mut session = Session::new(
@@ -2364,8 +2316,8 @@ fn draw_key_help(f: &mut Frame, area: Rect) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from("  h approval mode                A auto mode      p phone push"),
-        Line::from("  m mute                         w watch          R rename"),
+        Line::from("  A auto mode                    p phone push     m mute"),
+        Line::from("  w watch                        R rename"),
         Line::from("  N new agent"),
         Line::from(""),
         Line::from(vec![

@@ -178,7 +178,7 @@ FLAGS:
   --force-new               spawn a new TUI instance even if one is already alive
 
 IN-TUI KEYBINDINGS:
-  ⏎ jump · a/d approve/deny · h toggle approval mode · A toggle auto mode
+  ⏎ jump · a/d approve/deny · A toggle auto mode
   p toggle phone push · r reply · m mute · w watch · R rename · N new agent · / filter
   H audit log · $ cost overlay · ? keys · q quit
 
@@ -252,6 +252,7 @@ fn run(
 ) -> io::Result<()> {
     let mut app = AppState::new();
     app.config = config::Config::load();
+    app.approval_mode = app.config.approval_mode;
     app.exit_on_jump = exit_on_jump;
     app.zoom_on_jump = zoom_on_jump;
     let refresh_interval = Duration::from_secs(app.config.thresholds.refresh_seconds.max(1));
@@ -616,10 +617,6 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         }
         KeyCode::Char('a') => app.status_msg = Some(deliver_approve(app)),
         KeyCode::Char('d') => app.status_msg = Some(deliver_deny(app)),
-        KeyCode::Char('h') => {
-            app.toggle_approval_mode();
-            app.status_msg = Some(format!("approve mode: {}", app.approval_mode.label()));
-        }
         KeyCode::Char('A') => {
             app.toggle_autonomous();
             app.status_msg = Some(format!(

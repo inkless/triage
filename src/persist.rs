@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{ApprovalMode, Provider, Session};
+use crate::models::{Provider, Session};
 
 /// Stable identity for a Claude session that survives a triage restart.
 /// We can't use pid (recycled by the OS) or sessionId (rewritten by `/clear`),
@@ -78,10 +78,6 @@ struct PersistedState {
     /// Claude/Codex/tmux state; they are display aliases owned by triage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     aliases: Vec<PersistedAlias>,
-    /// Optional for backward-compat with state.json files written before the
-    /// approval-mode toggle existed. Missing → use `ApprovalMode::default()`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    approval_mode: Option<ApprovalMode>,
     /// Autonomous-mode toggle (T-56). Off by default; explicit opt-in only.
     #[serde(default)]
     autonomous: bool,
@@ -113,7 +109,6 @@ fn state_path() -> PathBuf {
 pub struct LoadedState {
     pub mutes: Vec<(MuteKey, SystemTime)>,
     pub aliases: Vec<(AliasKey, String)>,
-    pub approval_mode: ApprovalMode,
     pub autonomous: bool,
     pub phone_push_enabled: bool,
 }
@@ -123,7 +118,6 @@ impl LoadedState {
         Self {
             mutes: Vec::new(),
             aliases: Vec::new(),
-            approval_mode: ApprovalMode::default(),
             autonomous: false,
             phone_push_enabled: true,
         }
@@ -156,7 +150,6 @@ pub fn load_state() -> LoadedState {
     LoadedState {
         mutes,
         aliases,
-        approval_mode: state.approval_mode.unwrap_or_default(),
         autonomous: state.autonomous,
         phone_push_enabled: state.phone_push_enabled,
     }
@@ -197,7 +190,6 @@ pub fn save_last_pane_id(pane_id: &str) {
 pub fn save_state<'a, M, A>(
     mutes_iter: M,
     aliases_iter: A,
-    approval_mode: ApprovalMode,
     autonomous: bool,
     phone_push_enabled: bool,
 ) where
@@ -207,7 +199,6 @@ pub fn save_state<'a, M, A>(
     save_state_with_alias_mode(
         mutes_iter,
         aliases_iter,
-        approval_mode,
         autonomous,
         phone_push_enabled,
         AliasWriteMode::Merge,
@@ -219,7 +210,6 @@ pub fn save_state<'a, M, A>(
 pub fn save_state_replace_aliases<'a, M, A>(
     mutes_iter: M,
     aliases_iter: A,
-    approval_mode: ApprovalMode,
     autonomous: bool,
     phone_push_enabled: bool,
 ) where
@@ -229,7 +219,6 @@ pub fn save_state_replace_aliases<'a, M, A>(
     save_state_with_alias_mode(
         mutes_iter,
         aliases_iter,
-        approval_mode,
         autonomous,
         phone_push_enabled,
         AliasWriteMode::Replace,
@@ -245,7 +234,6 @@ enum AliasWriteMode {
 fn save_state_with_alias_mode<'a, M, A>(
     mutes_iter: M,
     aliases_iter: A,
-    approval_mode: ApprovalMode,
     autonomous: bool,
     phone_push_enabled: bool,
     alias_write_mode: AliasWriteMode,
@@ -284,7 +272,6 @@ fn save_state_with_alias_mode<'a, M, A>(
     let state = PersistedState {
         mutes,
         aliases,
-        approval_mode: Some(approval_mode),
         autonomous,
         phone_push_enabled,
         last_pane_id: existing_pane_id,

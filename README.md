@@ -118,8 +118,8 @@ triage --uninstall-hooks       # remove
 ## Keys
 
 The main header shows behavior-changing modes persistently, e.g.
-`AUTO on · phone off · tmux mode`. Auto mode includes the in-flight auditor
-count as `AUTO on · N audits` while auditor workers are running.
+`AUTO on · phone off`. Auto mode includes the in-flight auditor count as
+`AUTO on · N audits` while auditor workers are running.
 
 ```
 General:
@@ -133,7 +133,6 @@ General:
 Approve / deny / mute / watch:
   a                approve (selected session must be paused on a permission prompt)
   d                deny
-  h                cycle approve mode: hook ↔ tmux
   A                toggle autonomous mode (off → on)
   p                toggle ntfy phone push (on by default; Mac banners unaffected)
   r                reply to selected agent with a one-line user message
@@ -177,7 +176,7 @@ Default sort order, highest-attention first:
 
 Toggle with `space`. Three zones:
 
-- **Header** — `state · pane · model (1M) · uptime · approve mode`.
+- **Header** — `state · pane · model (1M) · uptime`.
 - **Body** — agent's latest text (Claude's reasoning, often the *why* before the next tool call), pending tool + full input, recap (`away_summary`), last user prompt.
 - **Stats footer** — auditor decision (when auto mode is on, with cost + duration), session cost + tokens + context-window % (yellow ≥80%, red ≥95%), event timing.
 
@@ -261,6 +260,9 @@ terminal_bundle = "net.kovidgoyal.kitty"   # override click-to-jump sender
 
 [model]
 context_window = 1000000   # bypass auto-detect (use the 1M window)
+
+[approval]
+mode = "hook"  # "hook" or "tmux"; Claude only. Codex approvals always use tmux.
 
 [new_agent]
 provider = "claude"   # "claude" or "codex"; defaults to claude

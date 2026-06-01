@@ -10,6 +10,8 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
+use crate::models::ApprovalMode;
+
 /// Default mobile-width threshold for auto-zoom-on-jump. iPhone ~30–80,
 /// iPad portrait ~120, iPad landscape ~200, desktop ~200+. 140 catches iPad
 /// portrait without false-positive on a narrow desktop split-screen.
@@ -23,6 +25,7 @@ pub struct Config {
     pub notifications: NotificationsConfig,
     pub model: ModelConfig,
     pub new_agent: NewAgentConfig,
+    pub approval_mode: ApprovalMode,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -121,6 +124,8 @@ struct DiskConfig {
     model: Option<DiskModel>,
     #[serde(default)]
     new_agent: Option<DiskNewAgent>,
+    #[serde(default)]
+    approval: Option<DiskApproval>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -151,6 +156,12 @@ struct DiskNewAgent {
     command: Option<String>,
     #[serde(default)]
     window_name: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DiskApproval {
+    #[serde(default)]
+    mode: Option<String>,
 }
 
 impl Config {
@@ -261,7 +272,26 @@ impl From<DiskConfig> for Config {
                 cfg.new_agent.window_name = window_name;
             }
         }
+        if let Some(a) = d.approval
+            && let Some(mode) = a.mode
+        {
+            match parse_approval_mode(&mode) {
+                Some(mode) => cfg.approval_mode = mode,
+                None => eprintln!(
+                    "[warn] unknown [approval].mode {:?}; using default",
+                    mode.trim()
+                ),
+            }
+        }
         cfg
+    }
+}
+
+fn parse_approval_mode(value: &str) -> Option<ApprovalMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "hook" => Some(ApprovalMode::Hook),
+        "tmux" => Some(ApprovalMode::Tmux),
+        _ => None,
     }
 }
 
@@ -333,5 +363,27 @@ mod tests {
 
         assert_eq!(cfg.new_agent.provider, NewAgentProvider::Codex);
         assert_eq!(cfg.new_agent.command, "codex --model gpt-5");
+    }
+
+    #[test]
+    fn approval_mode_defaults_to_hook() {
+        let cfg = Config::default();
+
+        assert_eq!(cfg.approval_mode, ApprovalMode::Hook);
+    }
+
+    #[test]
+    fn approval_mode_can_be_configured() {
+        let disk: DiskConfig = toml::from_str(
+            r#"
+            [approval]
+            mode = "tmux"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = Config::from(disk);
+
+        assert_eq!(cfg.approval_mode, ApprovalMode::Tmux);
     }
 }
