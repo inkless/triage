@@ -25,6 +25,7 @@ triage              # launch the TUI
 triage --probe      # print the joined session table once (no TUI)
 triage agents --json # list peer agents and guarded send status
 triage send --to '%42' --message "can you check this?" # message a live agent
+triage launch --cwd "$PWD" --provider codex # launch a new detached agent window
 triage notify "..." # one-shot ntfy push using config.toml's [ntfy] block
 triage cost         # daily/weekly Claude spend rollup across all transcripts
 ```
@@ -60,6 +61,25 @@ agent's terminal may queue the submitted line until its next input slot. The
 message body is pasted through an internal tmux buffer and submitted with a
 separate Enter, so agents can use either one-line text or a file/stdin body
 without caring about the transport.
+
+`launch` is the reusable tmux/process primitive behind the TUI's `N` shortcut
+and future mb-work fleet launch integration:
+
+```bash
+triage launch --cwd /path/to/repo --provider claude --window-name agent-TRI-114
+triage launch --cwd /path/to/repo --provider claude \
+  --append-system-prompt /tmp/system-prompt.md \
+  --after-boot "Please pick up TRI-114 and report status through triage send."
+triage launch --cwd /path/to/repo --provider codex --command "codex --model gpt-5"
+```
+
+The CLI form creates the new tmux window detached and prints the launched pane
+id. `--provider` selects the configured default command (`claude` or `codex`);
+`--command` overrides it and can infer the provider when omitted.
+`--append-system-prompt` is applied only for Claude by expanding the file
+contents at launch time, while Codex ignores it. `--after-boot` waits for the
+agent shell to settle, presses Enter once, then pastes and submits the text via
+the same tmux buffer path used by `triage send`.
 
 `cargo build` auto-builds the macOS notification helper (`triage-notify.app`) under `scripts/triage-notify/` via `build.rs`, then stages a copy to `~/.config/triage/triage-notify.app`. The staged location is what the cargo-installed binary at `~/.cargo/bin/triage` finds at runtime — without it, notifications fall back to `osascript` which shows a "Show" button that routes to Script Editor. Build manually if needed:
 
@@ -243,8 +263,8 @@ window_name = "agent-{provider}-{cwd_basename}"
 ```
 
 Pressing `N` in the TUI opens a cwd picker built from current triage sessions,
-then runs `[new_agent].command` in a new tmux window with `-c <cwd>`. If there
-are no sessions yet, the picker offers `$HOME`.
+then runs the same launch path in a new attached tmux window with `-c <cwd>`.
+If there are no sessions yet, the picker offers `$HOME`.
 
 **Security**: `chmod 600 ~/.config/triage/config.toml`. Triage refuses to load and warns if perms allow group/other read — the `[ntfy].token` field would otherwise be leakable.
 

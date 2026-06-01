@@ -84,6 +84,14 @@ pub enum NewAgentProvider {
 }
 
 impl NewAgentProvider {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "claude" | "cc" | "claude-code" => Some(NewAgentProvider::Claude),
+            "codex" | "cx" => Some(NewAgentProvider::Codex),
+            _ => None,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             NewAgentProvider::Claude => "claude",
@@ -224,7 +232,7 @@ impl From<DiskConfig> for Config {
         }
         if let Some(a) = d.new_agent {
             let explicit_provider = a.provider.and_then(|p| {
-                let parsed = parse_new_agent_provider(&p);
+                let parsed = NewAgentProvider::parse(&p);
                 if parsed.is_none() {
                     eprintln!(
                         "[warn] unknown [new_agent].provider {:?}; using default",
@@ -261,15 +269,7 @@ fn infer_new_agent_provider_from_command(command: &str) -> Option<NewAgentProvid
     let first = command.split_whitespace().next()?;
     let binary = PathBuf::from(first);
     let name = binary.file_name().and_then(|n| n.to_str()).unwrap_or(first);
-    parse_new_agent_provider(name)
-}
-
-fn parse_new_agent_provider(value: &str) -> Option<NewAgentProvider> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "claude" | "cc" | "claude-code" => Some(NewAgentProvider::Claude),
-        "codex" | "cx" => Some(NewAgentProvider::Codex),
-        _ => None,
-    }
+    NewAgentProvider::parse(name)
 }
 
 #[cfg(test)]

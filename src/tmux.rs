@@ -6,6 +6,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::models::Pane;
@@ -347,21 +349,37 @@ pub fn send_keys(target: &str, keys: &[&str]) -> std::io::Result<()> {
     }
 }
 
-pub fn new_window(name: &str, cwd: &Path, command: &str) -> std::io::Result<()> {
+pub fn new_window(
+    name: &str,
+    cwd: &Path,
+    command: &str,
+    detached: bool,
+) -> std::io::Result<String> {
     let command = command_in_cwd(cwd, command);
-    let status = Command::new("tmux")
-        .args(["new-window", "-c"])
+    let mut tmux = Command::new("tmux");
+    tmux.args(["new-window", "-P", "-F", "#{pane_id}"]);
+    if detached {
+        tmux.arg("-d");
+    }
+    let output = tmux
+        .arg("-c")
         .arg(cwd)
         .args(["-n", name])
         .arg(command)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!(
-            "tmux new-window exited {status}"
-        )))
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(std::io::Error::other(if stderr.is_empty() {
+            format!("tmux new-window exited {}", output.status)
+        } else {
+            stderr
+        }));
     }
+    let pane_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if pane_id.is_empty() {
+        return Err(std::io::Error::other("tmux new-window returned no pane id"));
+    }
+    Ok(pane_id)
 }
 
 fn command_in_cwd(cwd: &Path, command: &str) -> String {
@@ -372,11 +390,18 @@ fn command_in_cwd(cwd: &Path, command: &str) -> String {
     )
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) fn shell_quote(value: &str) -> String {
     if value.is_empty() {
         return "''".to_string();
     }
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+pub fn send_after_boot(target: &str, text: &str, settle: Duration) -> std::io::Result<()> {
+    thread::sleep(settle);
+    send_keys(target, &["Enter"])?;
+    thread::sleep(Duration::from_millis(300));
+    paste_text_and_enter(target, text)
 }
 
 /// Paste literal text into a pane through a tmux buffer, then submit it with

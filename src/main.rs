@@ -57,6 +57,9 @@ fn main() -> io::Result<()> {
     if args.get(1).map(String::as_str) == Some("send") {
         std::process::exit(agent_comm::cli_send(&args[2..]));
     }
+    if args.get(1).map(String::as_str) == Some("launch") {
+        std::process::exit(spawn_agent::cli_launch(&args[2..]));
+    }
     // Top-level help. Runs after subcommand dispatch so `triage send --help`
     // and friends reach their own usage handlers, while `triage --help` still
     // cannot accidentally launch the TUI.
@@ -158,6 +161,7 @@ SUBCOMMANDS:
                             daily/weekly Claude spend across every transcript
   agents [--json]           list peer Claude/Codex agents and safe send status
   send --to TARGET ...      send a guarded message to a live agent pane
+  launch --cwd PATH ...     launch a configured Claude/Codex agent tmux window
 
 FLAGS:
   --help, -h, help          print this message and exit
@@ -613,10 +617,11 @@ fn launch_new_agent_from_picker(app: &mut AppState) -> String {
     };
     let provider = app.config.new_agent.provider.name();
     match spawn_agent::launch(&app.config.new_agent, &cwd) {
-        Ok(window_name) => {
+        Ok(outcome) => {
             app.cancel_spawn_picker();
             format!(
-                "launched {provider} in window {window_name} ({})",
+                "launched {provider} in window {} ({})",
+                outcome.window_name,
                 cwd.display()
             )
         }
