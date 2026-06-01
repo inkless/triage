@@ -14,6 +14,10 @@ use crate::models::Pane;
 
 /// Returns a map of pane_pid → Pane.
 pub fn list_panes() -> HashMap<u32, Pane> {
+    list_panes_checked().unwrap_or_default()
+}
+
+pub fn list_panes_checked() -> Result<HashMap<u32, Pane>, String> {
     let mut map = HashMap::new();
     let out = Command::new("tmux")
         .args([
@@ -22,10 +26,15 @@ pub fn list_panes() -> HashMap<u32, Pane> {
             "-F",
             "#{session_name}|#{window_index}.#{pane_index}|#{pane_pid}|#{pane_tty}|#{pane_current_command}|#{pane_current_path}|#{?pane_active,1,0}|#{pane_id}|#{window_name}",
         ])
-        .output();
-    let Ok(out) = out else { return map };
+        .output()
+        .map_err(|e| format!("tmux list-panes failed: {e}"))?;
     if !out.status.success() {
-        return map;
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let detail = stderr.trim();
+        if detail.is_empty() {
+            return Err(format!("tmux list-panes exited {}", out.status));
+        }
+        return Err(format!("tmux list-panes exited {}: {detail}", out.status));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     for line in text.lines() {
@@ -58,7 +67,7 @@ pub fn list_panes() -> HashMap<u32, Pane> {
             },
         );
     }
-    map
+    Ok(map)
 }
 
 /// One-shot snapshot of pid → ppid for the whole system. Consumers walk the

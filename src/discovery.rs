@@ -21,6 +21,8 @@ struct RawSession {
     updated_at: u64,
     #[serde(rename = "waitingFor", default)]
     waiting_for: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
 }
 
 pub fn sessions_dir() -> PathBuf {
@@ -53,7 +55,7 @@ pub fn discover_live_sessions() -> Vec<Session> {
         if raw.name.as_deref() == Some(crate::auditor::AUDITOR_NAME) {
             continue;
         }
-        out.push(Session::new(
+        let mut session = Session::new(
             Provider::Claude,
             raw.pid,
             raw.session_id,
@@ -63,7 +65,9 @@ pub fn discover_live_sessions() -> Vec<Session> {
             raw.started_at,
             raw.updated_at,
             raw.waiting_for,
-        ));
+        );
+        session.cli_version = raw.version;
+        out.push(session);
     }
     out
 }

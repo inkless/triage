@@ -63,6 +63,13 @@ impl CliError {
             message: msg.into(),
         }
     }
+
+    fn runtime(msg: impl Into<String>) -> Self {
+        Self {
+            code: 1,
+            message: msg.into(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -106,7 +113,7 @@ fn run_agents(args: &[String]) -> Result<(), CliError> {
         return Ok(());
     }
     let args = parse_agents_args(args)?;
-    let mut sessions = load_snapshot();
+    let mut sessions = load_snapshot()?;
     snapshot::sort_sessions(&mut sessions);
     let current_pane = (!args.include_self).then(current_tmux_pane_id).flatten();
 
@@ -193,7 +200,7 @@ fn deliver_message(
     message: &str,
     dry_run: bool,
 ) -> Result<String, CliError> {
-    let sessions = load_snapshot();
+    let sessions = load_snapshot()?;
     let target = resolve_target(&sessions, selector)?;
     let gate = evaluate_send_gate(target);
     if !gate.can_send {
@@ -318,17 +325,20 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, CliError> {
     Ok(out)
 }
 
-fn load_snapshot() -> Vec<Session> {
+fn load_snapshot() -> Result<Vec<Session>, CliError> {
+    let panes = tmux::list_panes_checked()
+        .map_err(|e| CliError::runtime(format!("tmux discovery unavailable: {e}")))?;
     let loaded = persist::load_state();
     let aliases: HashMap<AliasKey, String> = loaded.aliases.into_iter().collect();
     let mut digest_cache = transcript::DigestCache::new();
     let mut codex_cache = codex::CodexDigestCache::new();
-    snapshot::discover_sessions(
+    Ok(snapshot::discover_sessions_with_panes(
         SystemTime::now(),
         &mut digest_cache,
         &mut codex_cache,
         &aliases,
-    )
+        panes,
+    ))
 }
 
 fn resolve_target<'a>(sessions: &'a [Session], selector: &str) -> Result<&'a Session, CliError> {

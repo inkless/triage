@@ -62,6 +62,11 @@ pub struct Session {
     /// (e.g. `"approve Bash"`). This is Claude Code's own canonical signal that
     /// the session is paused on a permission prompt.
     pub waiting_for: Option<String>,
+    /// Provider CLI version recorded by the session source. Claude writes this
+    /// into `~/.claude/sessions/*.json`; tmux often exposes the same value as
+    /// `pane_current_command`, which gives us a safe fallback join signal when
+    /// the process-parent walk is unavailable.
+    pub cli_version: Option<String>,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
 
@@ -152,6 +157,7 @@ impl Session {
             name,
             status,
             waiting_for,
+            cli_version: None,
             started_at_ms,
             updated_at_ms,
             pane: None,
