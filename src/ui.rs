@@ -648,8 +648,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
         Span::raw("   "),
         Span::styled(counts, Style::default().fg(Color::DarkGray)),
         Span::raw("   "),
-        Span::styled(auto_mode_label(app, area.width), auto_mode_style(app)),
     ];
+    spans.extend(header_status_spans(app, area.width));
     if app.reply_active {
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
@@ -688,8 +688,28 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn auto_mode_label(app: &AppState, width: u16) -> String {
-    auto_mode_label_parts(app.autonomous, app.audit_in_flight.len(), width)
+fn header_status_spans(app: &AppState, width: u16) -> Vec<Span<'static>> {
+    let mode = LayoutMode::from_width(width);
+    let separator = match mode {
+        LayoutMode::Narrow => " ",
+        LayoutMode::Medium | LayoutMode::Wide => " · ",
+    };
+    vec![
+        Span::styled(
+            auto_mode_label_parts(app.autonomous, app.audit_in_flight.len(), width),
+            auto_mode_style(app),
+        ),
+        Span::styled(separator, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            phone_mode_label_parts(app.phone_push_enabled, width),
+            phone_mode_style(app.phone_push_enabled),
+        ),
+        Span::styled(separator, Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            approval_mode_label_parts(app.approval_mode, width),
+            approval_mode_style(app.approval_mode),
+        ),
+    ]
 }
 
 fn auto_mode_label_parts(autonomous: bool, in_flight: usize, width: u16) -> String {
@@ -729,6 +749,24 @@ fn auto_mode_label_parts(autonomous: bool, in_flight: usize, width: u16) -> Stri
     }
 }
 
+fn phone_mode_label_parts(phone_push_enabled: bool, width: u16) -> String {
+    let mode = LayoutMode::from_width(width);
+    match (mode, phone_push_enabled) {
+        (LayoutMode::Narrow, true) => "ph:on".to_string(),
+        (LayoutMode::Narrow, false) => "ph:off".to_string(),
+        (_, true) => "phone on".to_string(),
+        (_, false) => "phone off".to_string(),
+    }
+}
+
+fn approval_mode_label_parts(approval_mode: ApprovalMode, width: u16) -> String {
+    let mode = LayoutMode::from_width(width);
+    match mode {
+        LayoutMode::Narrow => approval_mode.label().to_string(),
+        LayoutMode::Medium | LayoutMode::Wide => format!("{} mode", approval_mode.label()),
+    }
+}
+
 fn auto_mode_style(app: &AppState) -> Style {
     if app.autonomous {
         if app.audit_in_flight.is_empty() {
@@ -742,6 +780,25 @@ fn auto_mode_style(app: &AppState) -> Style {
         }
     } else {
         Style::default().fg(Color::DarkGray)
+    }
+}
+
+fn phone_mode_style(phone_push_enabled: bool) -> Style {
+    if phone_push_enabled {
+        Style::default().fg(Color::DarkGray)
+    } else {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    }
+}
+
+fn approval_mode_style(approval_mode: ApprovalMode) -> Style {
+    match approval_mode {
+        ApprovalMode::Hook => Style::default().fg(Color::DarkGray),
+        ApprovalMode::Tmux => Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     }
 }
 
@@ -1936,6 +1993,28 @@ mod tests {
         assert_eq!(auto_mode_label_parts(true, 0, 120), "AUTO on");
         assert_eq!(auto_mode_label_parts(true, 1, 120), "AUTO on · 1 audit");
         assert_eq!(auto_mode_label_parts(true, 2, 120), "AUTO on · 2 audits");
+    }
+
+    #[test]
+    fn phone_mode_label_shows_on_and_off() {
+        assert_eq!(phone_mode_label_parts(true, 40), "ph:on");
+        assert_eq!(phone_mode_label_parts(false, 40), "ph:off");
+        assert_eq!(phone_mode_label_parts(true, 120), "phone on");
+        assert_eq!(phone_mode_label_parts(false, 120), "phone off");
+    }
+
+    #[test]
+    fn approval_mode_label_shows_delivery_mode() {
+        assert_eq!(approval_mode_label_parts(ApprovalMode::Hook, 40), "hook");
+        assert_eq!(approval_mode_label_parts(ApprovalMode::Tmux, 40), "tmux");
+        assert_eq!(
+            approval_mode_label_parts(ApprovalMode::Hook, 120),
+            "hook mode"
+        );
+        assert_eq!(
+            approval_mode_label_parts(ApprovalMode::Tmux, 120),
+            "tmux mode"
+        );
     }
 
     #[test]

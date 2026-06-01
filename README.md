@@ -117,8 +117,9 @@ triage --uninstall-hooks       # remove
 
 ## Keys
 
-The main header shows auto mode persistently as `AUTO off`, `AUTO on`, or
-`AUTO on · N audits` while auditor workers are in flight.
+The main header shows behavior-changing modes persistently, e.g.
+`AUTO on · phone off · tmux mode`. Auto mode includes the in-flight auditor
+count as `AUTO on · N audits` while auditor workers are running.
 
 ```
 General:
