@@ -22,6 +22,7 @@ pub struct Config {
     pub thresholds: Thresholds,
     pub notifications: NotificationsConfig,
     pub model: ModelConfig,
+    pub new_agent: NewAgentConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -58,6 +59,46 @@ pub struct ModelConfig {
     pub context_window: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct NewAgentConfig {
+    pub provider: NewAgentProvider,
+    pub command: String,
+    pub window_name: String,
+}
+
+impl Default for NewAgentConfig {
+    fn default() -> Self {
+        let provider = NewAgentProvider::Claude;
+        Self {
+            provider,
+            command: provider.default_command().to_string(),
+            window_name: "agent-{provider}-{cwd_basename}".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewAgentProvider {
+    Claude,
+    Codex,
+}
+
+impl NewAgentProvider {
+    pub fn name(self) -> &'static str {
+        match self {
+            NewAgentProvider::Claude => "claude",
+            NewAgentProvider::Codex => "codex",
+        }
+    }
+
+    pub fn default_command(self) -> &'static str {
+        match self {
+            NewAgentProvider::Claude => "claude",
+            NewAgentProvider::Codex => "codex",
+        }
+    }
+}
+
 /// On-disk shape (TOML deserialization target). Each section optional; merged
 /// into `Config` via `From`.
 #[derive(Debug, Default, Deserialize)]
@@ -70,6 +111,8 @@ struct DiskConfig {
     notifications: Option<DiskNotifications>,
     #[serde(default)]
     model: Option<DiskModel>,
+    #[serde(default)]
+    new_agent: Option<DiskNewAgent>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -90,6 +133,16 @@ struct DiskNotifications {
 struct DiskModel {
     #[serde(default)]
     context_window: Option<u64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DiskNewAgent {
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    command: Option<String>,
+    #[serde(default)]
+    window_name: Option<String>,
 }
 
 impl Config {
@@ -169,6 +222,116 @@ impl From<DiskConfig> for Config {
         if let Some(m) = d.model {
             cfg.model.context_window = m.context_window;
         }
+        if let Some(a) = d.new_agent {
+            let explicit_provider = a.provider.and_then(|p| {
+                let parsed = parse_new_agent_provider(&p);
+                if parsed.is_none() {
+                    eprintln!(
+                        "[warn] unknown [new_agent].provider {:?}; using default",
+                        p.trim()
+                    );
+                }
+                parsed
+            });
+            if let Some(provider) = explicit_provider {
+                cfg.new_agent.provider = provider;
+                cfg.new_agent.command = provider.default_command().to_string();
+            }
+            if let Some(command) = a.command.map(|c| c.trim().to_string())
+                && !command.is_empty()
+            {
+                if explicit_provider.is_none()
+                    && let Some(provider) = infer_new_agent_provider_from_command(&command)
+                {
+                    cfg.new_agent.provider = provider;
+                }
+                cfg.new_agent.command = command;
+            }
+            if let Some(window_name) = a.window_name.map(|n| n.trim().to_string())
+                && !window_name.is_empty()
+            {
+                cfg.new_agent.window_name = window_name;
+            }
+        }
         cfg
+    }
+}
+
+fn infer_new_agent_provider_from_command(command: &str) -> Option<NewAgentProvider> {
+    let first = command.split_whitespace().next()?;
+    let binary = PathBuf::from(first);
+    let name = binary.file_name().and_then(|n| n.to_str()).unwrap_or(first);
+    parse_new_agent_provider(name)
+}
+
+fn parse_new_agent_provider(value: &str) -> Option<NewAgentProvider> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "claude" | "cc" | "claude-code" => Some(NewAgentProvider::Claude),
+        "codex" | "cx" => Some(NewAgentProvider::Codex),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_agent_defaults_to_claude() {
+        let cfg = Config::default();
+
+        assert_eq!(cfg.new_agent.provider, NewAgentProvider::Claude);
+        assert_eq!(cfg.new_agent.command, "claude");
+    }
+
+    #[test]
+    fn new_agent_provider_sets_default_command() {
+        let disk: DiskConfig = toml::from_str(
+            r#"
+            [new_agent]
+            provider = "codex"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = Config::from(disk);
+
+        assert_eq!(cfg.new_agent.provider, NewAgentProvider::Codex);
+        assert_eq!(cfg.new_agent.command, "codex");
+    }
+
+    #[test]
+    fn new_agent_command_overrides_provider_default() {
+        let disk: DiskConfig = toml::from_str(
+            r#"
+            [new_agent]
+            provider = "codex"
+            command = "codex --model gpt-5"
+            window_name = "cx-{cwd_basename}"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = Config::from(disk);
+
+        assert_eq!(cfg.new_agent.provider, NewAgentProvider::Codex);
+        assert_eq!(cfg.new_agent.command, "codex --model gpt-5");
+        assert_eq!(cfg.new_agent.window_name, "cx-{cwd_basename}");
+    }
+
+    #[test]
+    fn new_agent_provider_can_be_inferred_from_command() {
+        let disk: DiskConfig = toml::from_str(
+            r#"
+            [new_agent]
+            command = "codex --model gpt-5"
+            "#,
+        )
+        .unwrap();
+
+        let cfg = Config::from(disk);
+
+        assert_eq!(cfg.new_agent.provider, NewAgentProvider::Codex);
+        assert_eq!(cfg.new_agent.command, "codex --model gpt-5");
     }
 }

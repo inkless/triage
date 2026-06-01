@@ -134,6 +134,10 @@ pub struct AppState {
     /// Loaded once at startup (config file + env overrides). Read-only
     /// after this point.
     pub config: Config,
+    /// `N` picker state for launching a configured agent in a new tmux
+    /// window from one of the known session working directories.
+    pub spawn_picker_open: bool,
+    pub spawn_picker_selected: usize,
 }
 
 impl AppState {
@@ -183,6 +187,8 @@ impl AppState {
             last_pane_width: 0,
             last_client_width: 0,
             config: Config::default(),
+            spawn_picker_open: false,
+            spawn_picker_selected: 0,
         }
     }
 
@@ -339,6 +345,52 @@ impl AppState {
         self.rename_buffer.clear();
     }
 
+    pub fn start_spawn_picker(&mut self) {
+        let choices = self.spawn_cwd_choices();
+        let selected_cwd = self.selected_session().map(|s| s.cwd.clone());
+        self.spawn_picker_selected = selected_cwd
+            .and_then(|cwd| choices.iter().position(|choice| *choice == cwd))
+            .unwrap_or(0);
+        self.spawn_picker_open = true;
+        self.audit_log_open = false;
+        self.cost_overlay_open = false;
+        self.filter_active = false;
+        self.pending_g = false;
+    }
+
+    pub fn cancel_spawn_picker(&mut self) {
+        self.spawn_picker_open = false;
+        self.spawn_picker_selected = 0;
+    }
+
+    pub fn spawn_cwd_choices(&self) -> Vec<std::path::PathBuf> {
+        crate::spawn_agent::cwd_choices(&self.sessions)
+    }
+
+    pub fn selected_spawn_cwd(&self) -> Option<std::path::PathBuf> {
+        let choices = self.spawn_cwd_choices();
+        choices.get(self.spawn_picker_selected).cloned()
+    }
+
+    pub fn move_spawn_selection(&mut self, delta: i32) {
+        let len = self.spawn_cwd_choices().len();
+        if len == 0 {
+            self.spawn_picker_selected = 0;
+            return;
+        }
+        let cur = self.spawn_picker_selected.min(len - 1) as i32;
+        self.spawn_picker_selected = (cur + delta).rem_euclid(len as i32) as usize;
+    }
+
+    pub fn clamp_spawn_selection(&mut self) {
+        let len = self.spawn_cwd_choices().len();
+        if len == 0 {
+            self.spawn_picker_selected = 0;
+        } else if self.spawn_picker_selected >= len {
+            self.spawn_picker_selected = len - 1;
+        }
+    }
+
     pub fn commit_rename_selected(&mut self) -> Option<String> {
         let keys_to_clear = self
             .selected_session()
@@ -439,6 +491,9 @@ impl AppState {
         } else if self.selected.selected().is_none() {
             self.selected.select(Some(0));
         }
+        if self.spawn_picker_open {
+            self.clamp_spawn_selection();
+        }
     }
 }
 
@@ -455,6 +510,20 @@ pub fn apply_aliases_to_sessions(sessions: &mut [Session], aliases: &HashMap<Ali
 }
 
 pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
+    if app.spawn_picker_open {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(5),
+                Constraint::Length(1),
+            ])
+            .split(f.area());
+        draw_header(f, chunks[0], app);
+        draw_spawn_picker(f, chunks[1], app);
+        draw_footer(f, chunks[2], app);
+        return;
+    }
     if app.audit_log_open {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -665,6 +734,72 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
         .block(Block::default().borders(Borders::TOP));
 
     f.render_stateful_widget(table, area, &mut app.selected);
+}
+
+fn draw_spawn_picker(f: &mut Frame, area: Rect, app: &mut AppState) {
+    app.clamp_spawn_selection();
+    let choices = app.spawn_cwd_choices();
+    let selected = app
+        .spawn_picker_selected
+        .min(choices.len().saturating_sub(1));
+    let provider = app.config.new_agent.provider.name();
+    let command = app.config.new_agent.command.as_str();
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(3)])
+        .split(area);
+
+    let intro = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("New {provider} agent"),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("   "),
+            Span::styled(
+                format!("command: {command}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "Choose a working directory from current triage sessions.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    f.render_widget(Paragraph::new(intro), chunks[0]);
+
+    let capacity = chunks[1].height.saturating_sub(2).max(1) as usize;
+    let offset = selected.saturating_sub(capacity.saturating_sub(1));
+    let path_width = chunks[1].width.saturating_sub(10).max(10) as usize;
+    let rows = choices
+        .iter()
+        .enumerate()
+        .skip(offset)
+        .take(capacity)
+        .map(|(i, cwd)| {
+            let style = if i == selected {
+                Style::default().add_modifier(Modifier::REVERSED)
+            } else {
+                Style::default()
+            };
+            Row::new(vec![
+                Cell::from(format!("{}/{}", i + 1, choices.len())),
+                Cell::from(shorten_path(&cwd.display().to_string(), path_width)),
+            ])
+            .style(style)
+        })
+        .collect::<Vec<_>>();
+
+    let table = Table::new(rows, vec![Constraint::Length(8), Constraint::Min(10)])
+        .header(
+            Row::new(vec![Cell::from("#"), Cell::from("CWD")]).style(
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        )
+        .block(Block::default().borders(Borders::TOP));
+    f.render_widget(table, chunks[1]);
 }
 
 fn build_row(
@@ -2028,6 +2163,17 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint,
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
+    if app.spawn_picker_open {
+        let hint = "  ↑↓/j/k choose cwd  ·  ↵ launch  ·  Esc/q cancel  ·  ^C quit";
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                hint.to_string(),
                 Style::default().fg(Color::DarkGray),
             ))),
             area,

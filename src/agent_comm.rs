@@ -101,6 +101,10 @@ struct AgentRow {
 }
 
 fn run_agents(args: &[String]) -> Result<(), CliError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!("{}", agents_usage(""));
+        return Ok(());
+    }
     let args = parse_agents_args(args)?;
     let mut sessions = load_snapshot();
     snapshot::sort_sessions(&mut sessions);
@@ -154,6 +158,9 @@ fn run_agents(args: &[String]) -> Result<(), CliError> {
 }
 
 fn run_send(args: &[String]) -> Result<String, CliError> {
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        return Ok(send_usage(""));
+    }
     let args = parse_send_args(args)?;
     let selector = args
         .to

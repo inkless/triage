@@ -131,6 +131,8 @@ fn session_preview(session: &Session) -> String {
 ///
 /// Errors are reported to stderr; the function returns a non-zero `io::Error`
 /// on any failure (missing config, empty message, curl non-zero, curl missing).
+const NOTIFY_USAGE: &str = "usage: triage notify [--title T] [--tags T] <message...>";
+
 pub fn cli_notify(args: &[String]) -> io::Result<()> {
     let mut title: Option<String> = None;
     let mut tags: Option<String> = None;
@@ -139,6 +141,10 @@ pub fn cli_notify(args: &[String]) -> io::Result<()> {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "--help" | "-h" => {
+                println!("{NOTIFY_USAGE}");
+                return Ok(());
+            }
             "--title" => {
                 title = Some(
                     args.get(i + 1)
@@ -174,9 +180,7 @@ pub fn cli_notify(args: &[String]) -> io::Result<()> {
     };
 
     if message.is_empty() {
-        return Err(io::Error::other(
-            "usage: triage notify [--title T] [--tags T] <message...>",
-        ));
+        return Err(io::Error::other(NOTIFY_USAGE));
     }
 
     let cfg = Config::load();

@@ -10,6 +10,7 @@ mod models;
 mod notify_os;
 mod persist;
 mod snapshot;
+mod spawn_agent;
 mod tmux;
 mod transcript;
 mod ui;
@@ -38,16 +39,6 @@ const WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
-    // Top-level help. Must come before any other dispatch so an agent or
-    // human running `triage --help` doesn't accidentally launch the TUI.
-    if args
-        .iter()
-        .skip(1)
-        .any(|a| a == "--help" || a == "-h" || a == "help")
-    {
-        print_top_level_help();
-        return Ok(());
-    }
     // One-shot subcommand: `triage notify [flags] <message...>` posts to
     // ntfy using the config's [ntfy] block. Detected by positional argv[1]
     // (not a flag) so it doesn't collide with `--notify` style flags
@@ -65,6 +56,17 @@ fn main() -> io::Result<()> {
     }
     if args.get(1).map(String::as_str) == Some("send") {
         std::process::exit(agent_comm::cli_send(&args[2..]));
+    }
+    // Top-level help. Runs after subcommand dispatch so `triage send --help`
+    // and friends reach their own usage handlers, while `triage --help` still
+    // cannot accidentally launch the TUI.
+    if args
+        .iter()
+        .skip(1)
+        .any(|a| a == "--help" || a == "-h" || a == "help")
+    {
+        print_top_level_help();
+        return Ok(());
     }
     if args.iter().any(|a| a == "--probe") {
         return probe();
@@ -173,7 +175,7 @@ FLAGS:
 
 IN-TUI KEYBINDINGS:
   ⏎ jump · a/d approve/deny · h toggle approval mode · A toggle auto mode
-  p toggle phone push · m mute · w watch · R rename · / filter (name + cwd)
+  p toggle phone push · m mute · w watch · R rename · N new agent · / filter
   H audit log · $ cost overlay · q quit
 
 DOCS:
@@ -308,6 +310,32 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             }
             KeyCode::Char(c) if !mods.contains(KeyModifiers::CONTROL) => {
                 app.rename_buffer.push(c);
+            }
+            _ => {}
+        }
+        return true;
+    }
+
+    if app.spawn_picker_open {
+        match code {
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Esc | KeyCode::Char('q') => {
+                app.cancel_spawn_picker();
+                app.status_msg = Some("new agent canceled".to_string());
+            }
+            KeyCode::Enter => {
+                app.status_msg = Some(launch_new_agent_from_picker(app));
+            }
+            KeyCode::Up | KeyCode::Char('k') => app.move_spawn_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.move_spawn_selection(1),
+            KeyCode::PageUp => app.move_spawn_selection(-10),
+            KeyCode::PageDown => app.move_spawn_selection(10),
+            KeyCode::Home => app.spawn_picker_selected = 0,
+            KeyCode::End => {
+                let len = app.spawn_cwd_choices().len();
+                if len > 0 {
+                    app.spawn_picker_selected = len - 1;
+                }
             }
             _ => {}
         }
@@ -520,6 +548,10 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                 app.status_msg = Some("no session selected".to_string());
             }
         }
+        KeyCode::Char('N') => {
+            app.start_spawn_picker();
+            app.status_msg = None;
+        }
         KeyCode::Char('a') => app.status_msg = Some(deliver_approve(app)),
         KeyCode::Char('d') => app.status_msg = Some(deliver_deny(app)),
         KeyCode::Char('h') => {
@@ -572,6 +604,27 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         _ => {}
     }
     true
+}
+
+fn launch_new_agent_from_picker(app: &mut AppState) -> String {
+    let Some(cwd) = app.selected_spawn_cwd() else {
+        app.cancel_spawn_picker();
+        return "no working directory selected".to_string();
+    };
+    let provider = app.config.new_agent.provider.name();
+    match spawn_agent::launch(&app.config.new_agent, &cwd) {
+        Ok(window_name) => {
+            app.cancel_spawn_picker();
+            format!(
+                "launched {provider} in window {window_name} ({})",
+                cwd.display()
+            )
+        }
+        Err(e) => {
+            app.cancel_spawn_picker();
+            format!("launch failed: {e}")
+        }
+    }
 }
 
 /// Approve via whichever path is wired: in Hook mode, prefer the hook decision

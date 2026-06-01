@@ -113,6 +113,7 @@ Approve / deny / mute / watch:
   p                toggle ntfy phone push (on by default; Mac banners unaffected)
   m                mute / unmute selected session
   w                watch / unwatch selected session — sticky; fires a "finished" banner on every work → done transition until toggled off
+  N                pick a known cwd and launch a new configured agent in a new tmux window
 
 Filter & overlays:
   /                start filter (matches name + cwd, case-insensitive)
@@ -234,7 +235,16 @@ terminal_bundle = "net.kovidgoyal.kitty"   # override click-to-jump sender
 
 [model]
 context_window = 1000000   # bypass auto-detect (use the 1M window)
+
+[new_agent]
+provider = "claude"   # "claude" or "codex"; defaults to claude
+command = "claude"    # optional override; provider default is "claude" / "codex"
+window_name = "agent-{provider}-{cwd_basename}"
 ```
+
+Pressing `N` in the TUI opens a cwd picker built from current triage sessions,
+then runs `[new_agent].command` in a new tmux window with `-c <cwd>`. If there
+are no sessions yet, the picker offers `$HOME`.
 
 **Security**: `chmod 600 ~/.config/triage/config.toml`. Triage refuses to load and warns if perms allow group/other read — the `[ntfy].token` field would otherwise be leakable.
 

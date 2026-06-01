@@ -3,6 +3,7 @@ use std::fs::{self, OpenOptions};
 use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -344,6 +345,38 @@ pub fn send_keys(target: &str, keys: &[&str]) -> std::io::Result<()> {
             "tmux send-keys exited {status}"
         )))
     }
+}
+
+pub fn new_window(name: &str, cwd: &Path, command: &str) -> std::io::Result<()> {
+    let command = command_in_cwd(cwd, command);
+    let status = Command::new("tmux")
+        .args(["new-window", "-c"])
+        .arg(cwd)
+        .args(["-n", name])
+        .arg(command)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "tmux new-window exited {status}"
+        )))
+    }
+}
+
+fn command_in_cwd(cwd: &Path, command: &str) -> String {
+    format!(
+        "cd {} && {}",
+        shell_quote(&cwd.display().to_string()),
+        command
+    )
+}
+
+fn shell_quote(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Paste literal text into a pane through a tmux buffer, then submit it with
@@ -735,6 +768,23 @@ fn is_chip_header(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn new_window_command_explicitly_enters_cwd() {
+        assert_eq!(
+            command_in_cwd(Path::new("/tmp/my project"), "claude"),
+            "cd '/tmp/my project' && claude"
+        );
+    }
+
+    #[test]
+    fn shell_quote_handles_single_quotes() {
+        assert_eq!(
+            command_in_cwd(Path::new("/tmp/it's ok"), "codex"),
+            "cd '/tmp/it'\\''s ok' && codex"
+        );
+    }
 
     #[test]
     fn detects_codex_command_approval_prompt() {
