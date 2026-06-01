@@ -117,6 +117,9 @@ triage --uninstall-hooks       # remove
 
 ## Keys
 
+The main header shows auto mode persistently as `AUTO off`, `AUTO on`, or
+`AUTO on · N audits` while auditor workers are in flight.
+
 ```
 General:
   ↑↓ / j k         move selection

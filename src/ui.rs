@@ -647,6 +647,8 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
         Span::styled("triage", Style::default().add_modifier(Modifier::BOLD)),
         Span::raw("   "),
         Span::styled(counts, Style::default().fg(Color::DarkGray)),
+        Span::raw("   "),
+        Span::styled(auto_mode_label(app, area.width), auto_mode_style(app)),
     ];
     if app.reply_active {
         spans.push(Span::raw("   "));
@@ -684,6 +686,63 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
     spans.push(Span::raw("   "));
     spans.push(Span::styled(dims, Style::default().fg(Color::DarkGray)));
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn auto_mode_label(app: &AppState, width: u16) -> String {
+    auto_mode_label_parts(app.autonomous, app.audit_in_flight.len(), width)
+}
+
+fn auto_mode_label_parts(autonomous: bool, in_flight: usize, width: u16) -> String {
+    let mode = LayoutMode::from_width(width);
+    if autonomous {
+        match mode {
+            LayoutMode::Narrow => {
+                if in_flight > 0 {
+                    format!("A:on·{in_flight}")
+                } else {
+                    "A:on".to_string()
+                }
+            }
+            LayoutMode::Medium => {
+                if in_flight > 0 {
+                    format!("AUTO on·{in_flight}")
+                } else {
+                    "AUTO on".to_string()
+                }
+            }
+            LayoutMode::Wide => {
+                if in_flight > 0 {
+                    format!(
+                        "AUTO on · {in_flight} audit{}",
+                        if in_flight == 1 { "" } else { "s" }
+                    )
+                } else {
+                    "AUTO on".to_string()
+                }
+            }
+        }
+    } else {
+        match mode {
+            LayoutMode::Narrow => "A:off".to_string(),
+            LayoutMode::Medium | LayoutMode::Wide => "AUTO off".to_string(),
+        }
+    }
+}
+
+fn auto_mode_style(app: &AppState) -> Style {
+    if app.autonomous {
+        if app.audit_in_flight.is_empty() {
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        }
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
 }
 
 /// Terminal-width tiers. Picked once per draw based on `area.width`.
@@ -1865,6 +1924,21 @@ mod tests {
     }
 
     #[test]
+    fn auto_mode_label_is_compact_on_narrow_widths() {
+        assert_eq!(auto_mode_label_parts(false, 0, 40), "A:off");
+        assert_eq!(auto_mode_label_parts(true, 0, 40), "A:on");
+        assert_eq!(auto_mode_label_parts(true, 2, 40), "A:on·2");
+    }
+
+    #[test]
+    fn auto_mode_label_shows_audit_count_on_wide_widths() {
+        assert_eq!(auto_mode_label_parts(false, 0, 120), "AUTO off");
+        assert_eq!(auto_mode_label_parts(true, 0, 120), "AUTO on");
+        assert_eq!(auto_mode_label_parts(true, 1, 120), "AUTO on · 1 audit");
+        assert_eq!(auto_mode_label_parts(true, 2, 120), "AUTO on · 2 audits");
+    }
+
+    #[test]
     fn start_reply_selected_records_pane_target_and_label() {
         let mut app = AppState::new();
         let mut session = Session::new(
@@ -2367,12 +2441,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
                 "  ⏎ jump  r reply  a/d approve  / filter  ? keys  q quit".to_string()
             }
         };
-        let style = if app.autonomous {
-            Style::default().fg(Color::Magenta)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        Line::from(Span::styled(hint, style))
+        Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
     };
     f.render_widget(Paragraph::new(line), area);
 }
