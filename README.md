@@ -23,6 +23,8 @@ Different shape from [`agentop`](https://crates.io/crates/agentop) (process-cent
 cargo install --path .
 triage              # launch the TUI
 triage --probe      # print the joined session table once (no TUI)
+triage agents --json # list peer agents and guarded send status
+triage send --to '%42' --message "can you check this?" # message a live agent
 triage notify "..." # one-shot ntfy push using config.toml's [ntfy] block
 triage cost         # daily/weekly Claude spend rollup across all transcripts
 ```
@@ -38,6 +40,26 @@ git log --oneline -3 | triage notify --title "shipped" - # stdin
 ```
 
 Blocks until curl confirms the POST (5s timeout); exit status reflects the outcome. Requires an `[ntfy]` block in `~/.config/triage/config.toml` (see [Configuration](#configuration)).
+
+The `agents` / `send` subcommands are for agent-to-agent coordination through
+triage's existing tmux/session snapshot. When run from inside tmux, `agents`
+omits the caller's own pane by default; pass `--include-self` for a full
+inventory/debug view.
+
+```bash
+triage agents --json
+triage send --to '%42' --from TRI-106 --message "Can you check whether your branch touched codex.rs?"
+triage send --to '%42' --from TRI-106 --file /tmp/question.md
+printf '%s\n' "short message" | triage send --to '%42' --from TRI-106 -
+```
+
+`send` recomputes a fresh snapshot, refuses ambiguous/no-pane/unknown targets,
+and denies delivery when the target is on a visible Claude/Codex permission
+prompt. Working sessions are allowed when no prompt is visible; the receiving
+agent's terminal may queue the submitted line until its next input slot. The
+message body is pasted through an internal tmux buffer and submitted with a
+separate Enter, so agents can use either one-line text or a file/stdin body
+without caring about the transport.
 
 `cargo build` auto-builds the macOS notification helper (`triage-notify.app`) under `scripts/triage-notify/` via `build.rs`, then stages a copy to `~/.config/triage/triage-notify.app`. The staged location is what the cargo-installed binary at `~/.cargo/bin/triage` finds at runtime — without it, notifications fall back to `osascript` which shows a "Show" button that routes to Script Editor. Build manually if needed:
 

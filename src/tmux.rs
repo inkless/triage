@@ -1,6 +1,11 @@
 use std::collections::HashMap;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::models::Pane;
 
@@ -339,6 +344,78 @@ pub fn send_keys(target: &str, keys: &[&str]) -> std::io::Result<()> {
             "tmux send-keys exited {status}"
         )))
     }
+}
+
+/// Paste literal text into a pane through a tmux buffer, then submit it with
+/// Enter. Used for both one-line and multiline agent messages so callers do
+/// not need to know transport details.
+pub fn paste_text_and_enter(target: &str, text: &str) -> std::io::Result<()> {
+    let nonce = buffer_nonce();
+    let buffer_name = format!("triage-msg-{nonce}");
+    let temp_dir = triage_temp_dir();
+    fs::create_dir_all(&temp_dir)?;
+    #[cfg(unix)]
+    {
+        let _ = fs::set_permissions(&temp_dir, fs::Permissions::from_mode(0o700));
+    }
+    let temp_file = temp_dir.join(format!("{buffer_name}.txt"));
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    {
+        let mut file = options.open(&temp_file)?;
+        file.write_all(text.as_bytes())?;
+    }
+
+    let load_result = Command::new("tmux")
+        .args(["load-buffer", "-b", &buffer_name])
+        .arg(&temp_file)
+        .status();
+    let _ = fs::remove_file(&temp_file);
+    let status = load_result?;
+    if !status.success() {
+        return Err(std::io::Error::other(format!(
+            "tmux load-buffer exited {status}"
+        )));
+    }
+
+    let paste_status = Command::new("tmux")
+        .args(["paste-buffer", "-d", "-p", "-b", &buffer_name, "-t", target])
+        .status()?;
+    if !paste_status.success() {
+        let _ = Command::new("tmux")
+            .args(["delete-buffer", "-b", &buffer_name])
+            .status();
+        return Err(std::io::Error::other(format!(
+            "tmux paste-buffer exited {paste_status}"
+        )));
+    }
+
+    send_keys(target, &["Enter"])
+}
+
+fn buffer_nonce() -> String {
+    let pid = std::process::id();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{pid}-{nanos}")
+}
+
+fn triage_temp_dir() -> PathBuf {
+    std::env::var_os("TMPDIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            std::env::var_os("HOME")
+                .map(|h| PathBuf::from(h).join(".config/triage/tmp"))
+                .unwrap_or_else(|| PathBuf::from("/tmp"))
+        })
+        .join("triage")
 }
 
 /// Capture the visible pane content plus 200 lines of scrollback. Used as a

@@ -1,3 +1,4 @@
+mod agent_comm;
 mod approval;
 mod auditor;
 mod classifier;
@@ -8,6 +9,7 @@ mod discovery;
 mod models;
 mod notify_os;
 mod persist;
+mod snapshot;
 mod tmux;
 mod transcript;
 mod ui;
@@ -57,6 +59,12 @@ fn main() -> io::Result<()> {
     // sessions on disk. One-shot scan; no persistence. See cost_rollup.rs.
     if args.get(1).map(String::as_str) == Some("cost") {
         return cost_rollup::cli_cost(&args[2..]);
+    }
+    if args.get(1).map(String::as_str) == Some("agents") {
+        std::process::exit(agent_comm::cli_agents(&args[2..]));
+    }
+    if args.get(1).map(String::as_str) == Some("send") {
+        std::process::exit(agent_comm::cli_send(&args[2..]));
     }
     if args.iter().any(|a| a == "--probe") {
         return probe();
@@ -146,6 +154,8 @@ SUBCOMMANDS:
   notify <msg> [...]        post a one-shot ntfy push using ~/.config/triage/config.toml
   cost [--by day|cwd|session|model] [--days N] [--top N] [--json]
                             daily/weekly Claude spend across every transcript
+  agents [--json]           list peer Claude/Codex agents and safe send status
+  send --to TARGET ...      send a guarded message to a live agent pane
 
 FLAGS:
   --help, -h, help          print this message and exit
@@ -175,84 +185,28 @@ DOCS:
 
 fn probe() -> io::Result<()> {
     let now = SystemTime::now();
-    let mut sessions = discovery::discover_live_sessions();
-    let panes = tmux::list_panes();
-    // Resolve panes before pairing so assign_transcripts can see which session
-    // is in the currently-focused tmux pane.
-    let ppid_map = tmux::build_ppid_map();
-    for s in &mut sessions {
-        s.pane = tmux::find_owning_pane(s.pid, &panes, &ppid_map, 8);
-    }
-    let mut cache = transcript::DigestCache::new();
-    transcript::assign_transcripts(&mut sessions, &mut cache);
-    for s in &mut sessions {
-        transcript::enrich(s, now, &mut cache);
-    }
-    let claude_count = sessions.len();
-    let mut codex_cache = codex::CodexDigestCache::new();
-    let mut codex_sessions = codex::discover_live_sessions(&panes, &ppid_map, &mut codex_cache);
-    let codex_count = codex_sessions.len();
-    sessions.append(&mut codex_sessions);
+    let panes = tmux::list_panes().len();
     let loaded_state = persist::load_state();
     let aliases = loaded_state.aliases.into_iter().collect();
-    ui::apply_aliases_to_sessions(&mut sessions, &aliases);
+    let mut digest_cache = transcript::DigestCache::new();
+    let mut codex_cache = codex::CodexDigestCache::new();
+    let sessions = snapshot::discover_sessions(now, &mut digest_cache, &mut codex_cache, &aliases);
+    let claude_count = sessions
+        .iter()
+        .filter(|s| s.provider == models::Provider::Claude)
+        .count();
+    let codex_count = sessions
+        .iter()
+        .filter(|s| s.provider == models::Provider::Codex)
+        .count();
     println!(
         "# discovered {} live sessions ({} Claude, {} Codex), {} tmux panes\n",
         sessions.len(),
         claude_count,
         codex_count,
-        panes.len()
+        panes
     );
-    for s in &mut sessions {
-        if s.provider == models::Provider::Claude
-            && s.status == "waiting"
-            && s.last_tool_use.is_none()
-            && let Some(pane) = &s.pane
-            && let Some(content) = tmux::capture_pane(&pane.target)
-            && let Some(brief) = tmux::parse_pending_brief(&content)
-        {
-            let name = s
-                .waiting_for
-                .as_deref()
-                .and_then(|w| w.strip_prefix("approve "))
-                .unwrap_or("?")
-                .to_string();
-            s.last_tool_use = Some((name, brief));
-        }
-    }
-    // Deterministic Blocked scan: for any busy session whose cheaper
-    // signals haven't already flagged it, capture the pane tail and look
-    // for the `❯ 1. Yes` + `Esc to cancel` anchor that only the live
-    // permission UI prints. Catches the cc-gh-warn case where Claude is on
-    // its native permission prompt and sessions JSON never wrote
-    // status=waiting. We don't gate on `last_tool_use` or transcript age:
-    // a pending tool_use is exactly what a permission prompt looks like at
-    // the transcript level, so excluding those would miss the case. The
-    // strict anchor keeps the false-positive risk negligible.
-    for s in &mut sessions {
-        if s.provider == models::Provider::Claude
-            && s.status == "busy"
-            && s.pending_approvals.is_empty()
-            && let Some(pane) = &s.pane
-            && let Some(content) = tmux::capture_pane_tail(&pane.target, 15)
-            && tmux::has_pending_permission_prompt(&content)
-        {
-            s.pane_blocked = true;
-        }
-    }
-    for s in &mut sessions {
-        if s.provider == models::Provider::Codex
-            && s.status == "busy"
-            && s.approval_prompt_pending
-            && let Some(pane) = &s.pane
-            && let Some(content) = tmux::capture_pane_tail(&pane.target, 40)
-            && tmux::has_codex_permission_prompt(&content)
-        {
-            s.pane_blocked = true;
-        }
-    }
-    for s in &mut sessions {
-        s.state = classifier::classify(s, now);
+    for s in &sessions {
         let pane = s
             .pane
             .as_ref()
@@ -732,87 +686,13 @@ fn refresh(app: &mut AppState) {
     // width was wrong (laptop split-screen produces narrow pane on a
     // wide-client terminal).
     app.last_client_width = tmux::current_client_width().unwrap_or(0);
-    let mut sessions = discovery::discover_live_sessions();
-    let panes = tmux::list_panes();
-
     let now = SystemTime::now();
-    let ppid_map = tmux::build_ppid_map();
-    for s in &mut sessions {
-        s.pane = tmux::find_owning_pane(s.pid, &panes, &ppid_map, 8);
-    }
-    transcript::assign_transcripts(&mut sessions, &mut app.digest_cache);
-    for s in &mut sessions {
-        transcript::enrich(s, now, &mut app.digest_cache);
-    }
-    let mut codex_sessions = codex::discover_live_sessions(&panes, &ppid_map, &mut app.codex_cache);
-    sessions.append(&mut codex_sessions);
-    // For sessions paused at a permission prompt, the pending tool_use isn't
-    // yet in the JSONL — Claude only flushes tool_use+tool_result together
-    // after the round-trip completes. Capture the pane and pull the brief
-    // from the prompt UI directly. Tool name comes from sessions JSON
-    // `waitingFor` ("approve Bash" → "Bash").
-    for s in &mut sessions {
-        if s.provider == models::Provider::Claude
-            && s.status == "waiting"
-            && s.last_tool_use.is_none()
-            && let Some(pane) = &s.pane
-            && let Some(content) = tmux::capture_pane(&pane.target)
-            && let Some(brief) = tmux::parse_pending_brief(&content)
-        {
-            let name = s
-                .waiting_for
-                .as_deref()
-                .and_then(|w| w.strip_prefix("approve "))
-                .unwrap_or("?")
-                .to_string();
-            s.last_tool_use = Some((name, brief));
-        }
-    }
-    // Pending approvals attach before classify so genuinely waiting sessions
-    // can render the hook-captured tool input in the headline/detail.
-    let pending = approval::read_pending();
-    approval::attach_to_sessions(pending, &mut sessions);
-    // Deterministic Blocked scan: for any busy session whose cheaper
-    // signals haven't already flagged it (no status=waiting, no hook
-    // pending file), capture the pane tail and look for the `❯ 1. Yes` +
-    // `Esc to cancel` anchor that only the live permission UI prints.
-    // Catches cases where Claude is on its native permission prompt and
-    // sessions JSON never wrote status=waiting. No `last_tool_use` or time
-    // gate: a pending tool_use is exactly what a permission prompt looks
-    // like at the transcript level, so excluding those would miss the
-    // case. The strict anchor keeps the false-positive risk negligible.
-    for s in &mut sessions {
-        if s.provider == models::Provider::Claude
-            && s.status == "busy"
-            && s.pending_approvals.is_empty()
-            && let Some(pane) = &s.pane
-            && let Some(content) = tmux::capture_pane_tail(&pane.target, 15)
-            && tmux::has_pending_permission_prompt(&content)
-        {
-            s.pane_blocked = true;
-        }
-    }
-    // Codex has no `status=waiting` or hook decision-file path. Mark it
-    // Blocked only when the rollout says the latest unfinished tool requested
-    // approval AND the visible pane shows Codex's approval UI. A pending
-    // approval-shaped tool call alone may also be an already-approved
-    // long-running command, so pane evidence is required.
-    for s in &mut sessions {
-        if s.provider == models::Provider::Codex
-            && s.status == "busy"
-            && s.approval_prompt_pending
-            && let Some(pane) = &s.pane
-            && let Some(content) = tmux::capture_pane_tail(&pane.target, 40)
-            && tmux::has_codex_permission_prompt(&content)
-        {
-            s.pane_blocked = true;
-        }
-    }
-    for s in &mut sessions {
-        s.state = classifier::classify(s, now);
-    }
-    app.digest_cache.evict_missing();
-    app.codex_cache.evict_missing();
+    let mut sessions = snapshot::discover_sessions(
+        now,
+        &mut app.digest_cache,
+        &mut app.codex_cache,
+        &app.aliases,
+    );
 
     // Auto-unmute any session whose user-text timestamp has advanced past the
     // mute-at time. The user typing in a muted pane is the strongest possible
@@ -839,19 +719,13 @@ fn refresh(app: &mut AppState) {
         s.muted = app.muted.contains_key(&key);
         s.watched = app.watched.contains(&key);
     }
-    ui::apply_aliases_to_sessions(&mut sessions, &app.aliases);
     if app.muted.len() != mute_count_before {
         app.persist_state();
     }
 
     drive_autonomous(app, &sessions);
 
-    sessions.sort_by(|a, b| {
-        a.muted
-            .cmp(&b.muted) // unmuted first
-            .then_with(|| a.state.priority().cmp(&b.state.priority()))
-            .then_with(|| a.cwd.cmp(&b.cwd))
-    });
+    snapshot::sort_sessions(&mut sessions);
 
     // Fire macOS notifications when a session enters an actionable state for
     // the first time we've seen this pid. "Actionable" means Claude itself is
