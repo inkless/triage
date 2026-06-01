@@ -186,6 +186,129 @@ impl Session {
     }
 }
 
+/// User-facing label for a live session. Keep this shared between the TUI and
+/// `triage agents` so humans and agents see the same target names.
+pub fn session_display_label(s: &Session) -> String {
+    s.name
+        .clone()
+        .or_else(|| s.pane.as_ref().and_then(useful_window_name))
+        .or_else(|| {
+            s.pane
+                .as_ref()
+                .map(|p| p.tmux_session.as_str())
+                .filter(|n| !n.is_empty() && !n.chars().all(|c| c.is_ascii_digit()))
+                .map(|n| n.to_string())
+        })
+        .or_else(|| s.cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| s.cwd.display().to_string())
+}
+
+/// Return `Pane.window_name` only when it carries user intent. Skip when:
+/// - empty
+/// - tmux's automatic-rename has set it to the foreground command
+/// - it's a terminal-emitted tab ID like `2.1.139`
+/// - it's a bracketed tmux marker like `[tmux]`
+/// - it's a known shell/editor/tool residue from automatic rename
+pub fn useful_window_name(pane: &Pane) -> Option<String> {
+    let name = pane.window_name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    if name == pane.current_command {
+        return None;
+    }
+    if name.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return None;
+    }
+    if name.starts_with('[') && name.ends_with(']') {
+        return None;
+    }
+    if is_auto_rename_residue(name) {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+fn is_auto_rename_residue(name: &str) -> bool {
+    matches!(
+        name,
+        // shells
+        "fish" | "bash" | "zsh" | "sh" | "dash" | "ksh" | "tcsh"
+        // multiplexers / nested terminal
+        | "tmux" | "screen"
+        // editors
+        | "nvim" | "vim" | "vi" | "nano" | "emacs" | "helix" | "hx"
+        // common interpreters / CLIs
+        | "claude" | "node" | "python" | "python3" | "ruby" | "go"
+        | "irb" | "pry" | "ipython" | "psql" | "redis-cli" | "mysql"
+        // network / file tools
+        | "ssh" | "scp" | "rsync" | "git" | "lazygit" | "gh"
+        // monitors / pagers
+        | "top" | "htop" | "btop" | "less" | "more" | "cat" | "tail"
+        // build tools
+        | "make" | "cargo" | "pnpm" | "npm" | "yarn" | "bun"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn session(name: Option<&str>, window_name: &str, tmux_session: &str) -> Session {
+        let mut s = Session::new(
+            Provider::Claude,
+            123,
+            "sid".to_string(),
+            PathBuf::from("/tmp/project"),
+            name.map(str::to_string),
+            "idle".to_string(),
+            0,
+            0,
+            None,
+        );
+        s.pane = Some(Pane {
+            target: "main:1.0".to_string(),
+            tmux_session: tmux_session.to_string(),
+            window_name: window_name.to_string(),
+            pane_id: "%42".to_string(),
+            pid: 123,
+            tty: "/dev/ttys001".to_string(),
+            current_command: "claude".to_string(),
+            cwd: PathBuf::from("/tmp/project"),
+            active: false,
+        });
+        s
+    }
+
+    #[test]
+    fn display_label_prefers_provider_name() {
+        let s = session(Some("agent-name"), "tmux-name", "tmux-session");
+
+        assert_eq!(session_display_label(&s), "agent-name");
+    }
+
+    #[test]
+    fn display_label_uses_tmux_window_name() {
+        let s = session(None, "agent-ACDC-21", "acdc-hub");
+
+        assert_eq!(session_display_label(&s), "agent-ACDC-21");
+    }
+
+    #[test]
+    fn display_label_skips_auto_window_name_and_uses_tmux_session() {
+        let s = session(None, "2.1.158", "acdc-hub");
+
+        assert_eq!(session_display_label(&s), "acdc-hub");
+    }
+
+    #[test]
+    fn display_label_skips_numeric_tmux_session() {
+        let s = session(None, "fish", "1");
+
+        assert_eq!(session_display_label(&s), "project");
+    }
+}
+
 /// How `a`/`d` deliver an approve/deny when a session is at a permission
 /// prompt. Two distinct mechanisms exist and we don't auto-fall-back between
 /// them — the user picks explicitly so behavior is predictable.

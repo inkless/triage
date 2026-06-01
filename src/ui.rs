@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use crate::auditor::Verdict;
 use crate::classifier::idle_age;
 use crate::config::Config;
-use crate::models::{ApprovalMode, AttentionState, Provider, Session};
+use crate::models::{ApprovalMode, AttentionState, Provider, Session, session_display_label};
 use crate::persist::{self, AliasKey, MuteKey};
 use crate::transcript::DigestCache;
 
@@ -303,12 +303,7 @@ impl AppState {
             cwd: s.cwd.clone(),
             started_at_ms: s.started_at_ms,
         };
-        let label = s
-            .name
-            .clone()
-            .or_else(|| s.pane.as_ref().and_then(useful_window_name))
-            .or_else(|| s.cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| "session".to_string());
+        let label = session_display_label(s);
         let now_watching = if self.watched.remove(&key) {
             false
         } else {
@@ -874,25 +869,7 @@ fn build_row(
         .map(format_duration)
         .unwrap_or_else(|| "—".to_string());
 
-    // Order: Claude `/rename` (most deliberate, session-specific) → tmux
-    // window name (user-set per-window label) → tmux session name
-    // (workspace-level) → cwd basename (default). Numeric tmux session
-    // names ("0", "1", …) and auto-renamed window names (==current_command,
-    // or terminal tab IDs like `2.1.139`) are skipped because they tell
-    // rows apart worse than the cwd basename.
-    let session_label = s
-        .name
-        .clone()
-        .or_else(|| s.pane.as_ref().and_then(useful_window_name))
-        .or_else(|| {
-            s.pane
-                .as_ref()
-                .map(|p| p.tmux_session.as_str())
-                .filter(|n| !n.is_empty() && !n.chars().all(|c| c.is_ascii_digit()))
-                .map(|n| n.to_string())
-        })
-        .or_else(|| s.cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| "?".to_string());
+    let session_label = session_display_label(s);
     let provider_label = s.provider.label();
 
     let cwd_short = shorten_path(&s.cwd.to_string_lossy(), 24);
@@ -2425,71 +2402,5 @@ fn session_matches_filter(s: &Session, q: &str) -> bool {
 }
 
 fn target_label(s: &Session) -> String {
-    let label = s
-        .name
-        .clone()
-        .or_else(|| s.pane.as_ref().and_then(useful_window_name))
-        .or_else(|| s.cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| s.cwd.display().to_string());
-    format!("{} {}", s.provider.label(), label)
-}
-
-/// Return `Pane.window_name` only when it carries user intent. Skip when:
-/// - empty
-/// - tmux's automatic-rename has set it to the foreground command
-///   (window_name == current_command) — `nvim`, `fish`, `claude`, etc.
-/// - it's a terminal-emitted tab ID like `2.1.139` (all chars are digits or
-///   dots). These show up under iTerm/Kitty / some shell prompts when the
-///   user hasn't named the window themselves.
-/// - it's a `[bracketed]` marker (tmux uses `[tmux]` for nested instances,
-///   never user intent).
-/// - it's a known shell / editor / common-utility name that tmux's
-///   automatic-rename leaves in place after auto-rename gets disabled by a
-///   later `rename-window`. The `automatic_rename` flag is unreliable as a
-///   filter (stays off after manual rename even though the stale name was
-///   originally auto-derived), so we denylist the common offenders.
-fn useful_window_name(pane: &crate::models::Pane) -> Option<String> {
-    let name = pane.window_name.trim();
-    if name.is_empty() {
-        return None;
-    }
-    if name == pane.current_command {
-        return None;
-    }
-    if name.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return None;
-    }
-    if name.starts_with('[') && name.ends_with(']') {
-        return None;
-    }
-    if is_auto_rename_residue(name) {
-        return None;
-    }
-    Some(name.to_string())
-}
-
-/// Common shells / editors / utilities that tmux's automatic-rename
-/// historically set the window name to. We skip these as labels because
-/// they reflect what was running in the pane, not what the user wants the
-/// row to be called. The list is intentionally a small allowlist of "I've
-/// seen this auto-rename to a row label" rather than a sweeping catch-all.
-fn is_auto_rename_residue(name: &str) -> bool {
-    matches!(
-        name,
-        // shells
-        "fish" | "bash" | "zsh" | "sh" | "dash" | "ksh" | "tcsh"
-        // multiplexers / nested terminal
-        | "tmux" | "screen"
-        // editors
-        | "nvim" | "vim" | "vi" | "nano" | "emacs" | "helix" | "hx"
-        // common interpreters / CLIs
-        | "claude" | "node" | "python" | "python3" | "ruby" | "go"
-        | "irb" | "pry" | "ipython" | "psql" | "redis-cli" | "mysql"
-        // network / file tools
-        | "ssh" | "scp" | "rsync" | "git" | "lazygit" | "gh"
-        // monitors / pagers
-        | "top" | "htop" | "btop" | "less" | "more" | "cat" | "tail"
-        // build tools
-        | "make" | "cargo" | "pnpm" | "npm" | "yarn" | "bun"
-    )
+    format!("{} {}", s.provider.label(), session_display_label(s))
 }

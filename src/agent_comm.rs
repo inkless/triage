@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use crate::models::{AttentionState, Provider, Session};
+use crate::models::{AttentionState, Provider, Session, session_display_label};
 use crate::persist::{self, AliasKey};
 use crate::{codex, snapshot, tmux, transcript};
 
@@ -361,7 +361,7 @@ fn selector_matches(s: &Session, selector: &str) -> bool {
     if format!("{}:{}", s.provider.label(), s.session_id) == selector {
         return true;
     }
-    s.name.as_deref() == Some(selector)
+    s.name.as_deref() == Some(selector) || session_display_label(s) == selector
 }
 
 #[derive(Debug, Clone)]
@@ -416,7 +416,7 @@ fn agent_row(s: &Session) -> AgentRow {
     AgentRow {
         id: target_id(s),
         provider: s.provider.label().to_string(),
-        name: display_name(s),
+        name: session_display_label(s),
         cwd: s.cwd.display().to_string(),
         state: attention_state_name(s.state).to_string(),
         can_receive: gate.can_send,
@@ -445,14 +445,7 @@ fn target_id(s: &Session) -> String {
 }
 
 fn target_label(s: &Session) -> String {
-    format!("{} {}", s.provider.label(), display_name(s))
-}
-
-fn display_name(s: &Session) -> String {
-    s.name
-        .clone()
-        .or_else(|| s.cwd.file_name().map(|n| n.to_string_lossy().into_owned()))
-        .unwrap_or_else(|| s.cwd.display().to_string())
+    format!("{} {}", s.provider.label(), session_display_label(s))
 }
 
 fn attention_state_name(state: AttentionState) -> &'static str {
@@ -625,7 +618,7 @@ impl AuditEntry {
             selector: selector.to_string(),
             target_id: target_id(target),
             target_provider: target.provider.label().to_string(),
-            target_name: display_name(target),
+            target_name: session_display_label(target),
             target_cwd: target.cwd.display().to_string(),
             verdict: verdict.to_string(),
             deny_reason: deny_reason.map(str::to_string),

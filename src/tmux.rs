@@ -93,13 +93,13 @@ pub fn find_owning_pane(
     max_hops: usize,
 ) -> Option<Pane> {
     let mut cur = pid;
-    for _ in 0..max_hops {
+    for _ in 0..=max_hops {
+        if let Some(pane) = pane_pids.get(&cur) {
+            return Some(pane.clone());
+        }
         let ppid = *ppid_map.get(&cur)?;
         if ppid <= 1 {
             return None;
-        }
-        if let Some(pane) = pane_pids.get(&ppid) {
-            return Some(pane.clone());
         }
         cur = ppid;
     }
@@ -809,6 +809,27 @@ mod tests {
             command_in_cwd(Path::new("/tmp/it's ok"), "codex"),
             "cd '/tmp/it'\\''s ok' && codex"
         );
+    }
+
+    #[test]
+    fn find_owning_pane_matches_direct_pane_pid() {
+        let pane = Pane {
+            target: "main:1.0".to_string(),
+            tmux_session: "main".to_string(),
+            window_name: "agent-ACDC-21".to_string(),
+            pane_id: "%311".to_string(),
+            pid: 98644,
+            tty: "/dev/ttys001".to_string(),
+            current_command: "2.1.158".to_string(),
+            cwd: PathBuf::from("/tmp/project"),
+            active: false,
+        };
+        let mut panes = HashMap::new();
+        panes.insert(pane.pid, pane);
+
+        let found = find_owning_pane(98644, &panes, &HashMap::new(), 8).unwrap();
+
+        assert_eq!(found.pane_id, "%311");
     }
 
     #[test]
