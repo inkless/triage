@@ -265,29 +265,91 @@ enum LocatedTriage {
 }
 
 fn locate_triage(panes: &HashMap<u32, Pane>) -> Option<LocatedTriage> {
-    let record = crate::approval::read_alive_record()?;
-    let alive = unsafe { libc::kill(record.pid as i32, 0) } == 0;
+    if let Some(record) = crate::approval::read_alive_record() {
+        let alive = crate::discovery::pid_alive(record.pid);
+        let recorded = record
+            .pane_id
+            .as_deref()
+            .and_then(|pane_id| pane_by_id(panes, pane_id));
 
-    if let Some(pane_id) = &record.pane_id
-        && let Some(pane) = panes.values().find(|p| &p.pane_id == pane_id).cloned()
-    {
-        return Some(if alive {
-            LocatedTriage::Live(pane)
-        } else {
-            LocatedTriage::PaneStale(pane)
-        });
-    }
+        if alive {
+            let ppid_map = build_ppid_map();
+            if let Some(pane) = find_owning_pane(record.pid, panes, &ppid_map, 8) {
+                return Some(LocatedTriage::Live(pane));
+            }
+            if let Some(pane) = recorded.clone().filter(is_triage_pane) {
+                return Some(LocatedTriage::Live(pane));
+            }
+            if let Some(live) = locate_visible_triage_pane(panes, record.pane_id.as_deref()) {
+                return Some(LocatedTriage::Live(live));
+            }
+            return recorded.map(LocatedTriage::PaneStale);
+        }
 
-    // No recorded pane id (legacy `.alive`, or non-tmux launch), or the
-    // pane is gone. If the process is alive, fall back to ppid walk to
-    // locate its pane via the process tree.
-    if alive {
-        let ppid_map = build_ppid_map();
-        if let Some(pane) = find_owning_pane(record.pid, panes, &ppid_map, 8) {
-            return Some(LocatedTriage::Live(pane));
+        if let Some(pane) = recorded {
+            if is_triage_pane(&pane) {
+                return Some(LocatedTriage::Live(pane));
+            }
+            if let Some(live) = locate_visible_triage_pane(panes, Some(&pane.pane_id)) {
+                return Some(LocatedTriage::Live(live));
+            }
+            return Some(LocatedTriage::PaneStale(pane));
         }
     }
+
+    locate_recorded_or_visible_triage(panes)
+}
+
+fn locate_recorded_or_visible_triage(panes: &HashMap<u32, Pane>) -> Option<LocatedTriage> {
+    let recorded_pane_id = crate::persist::read_last_pane_id();
+    locate_recorded_or_visible_triage_with_pane_id(panes, recorded_pane_id.as_deref())
+}
+
+fn locate_recorded_or_visible_triage_with_pane_id(
+    panes: &HashMap<u32, Pane>,
+    recorded_pane_id: Option<&str>,
+) -> Option<LocatedTriage> {
+    // Without `.alive`, only attach to panes tmux currently reports as
+    // running triage. Do not respawn a stale recorded pane here: the user may
+    // have quit triage and reused that shell for unrelated work.
+    let recorded = recorded_pane_id.and_then(|pane_id| pane_by_id(panes, pane_id));
+    if let Some(pane) = recorded.clone().filter(is_triage_pane) {
+        return Some(LocatedTriage::Live(pane));
+    }
+    if let Some(pane) =
+        locate_visible_triage_pane(panes, recorded.as_ref().map(|p| p.pane_id.as_str()))
+    {
+        return Some(LocatedTriage::Live(pane));
+    }
     None
+}
+
+fn locate_visible_triage_pane(
+    panes: &HashMap<u32, Pane>,
+    skip_pane_id: Option<&str>,
+) -> Option<Pane> {
+    let mut matches = panes
+        .values()
+        .filter(|pane| skip_pane_id != Some(pane.pane_id.as_str()))
+        .filter(|pane| is_triage_pane(pane))
+        .cloned()
+        .collect::<Vec<_>>();
+    (matches.len() == 1).then(|| matches.remove(0))
+}
+
+fn pane_by_id(panes: &HashMap<u32, Pane>, pane_id: &str) -> Option<Pane> {
+    panes.values().find(|pane| pane.pane_id == pane_id).cloned()
+}
+
+fn is_triage_pane(pane: &Pane) -> bool {
+    command_basename(&pane.current_command) == "triage"
+}
+
+fn command_basename(command: &str) -> &str {
+    Path::new(command)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(command)
 }
 
 /// Switch tmux focus to the given pane target (`session:window.pane`). When
@@ -820,6 +882,20 @@ mod tests {
         );
     }
 
+    fn pane(pid: u32, pane_id: &str, current_command: &str) -> Pane {
+        Pane {
+            target: format!("main:1.{pid}"),
+            tmux_session: "main".to_string(),
+            window_name: "triage".to_string(),
+            pane_id: pane_id.to_string(),
+            pid,
+            tty: "/dev/ttys001".to_string(),
+            current_command: current_command.to_string(),
+            cwd: PathBuf::from("/tmp/project"),
+            active: false,
+        }
+    }
+
     #[test]
     fn find_owning_pane_matches_direct_pane_pid() {
         let pane = Pane {
@@ -839,6 +915,55 @@ mod tests {
         let found = find_owning_pane(98644, &panes, &HashMap::new(), 8).unwrap();
 
         assert_eq!(found.pane_id, "%311");
+    }
+
+    #[test]
+    fn recorded_triage_pane_is_live() {
+        let mut panes = HashMap::new();
+        panes.insert(10, pane(10, "%10", "fish"));
+        panes.insert(11, pane(11, "%11", "triage"));
+
+        let located = locate_recorded_or_visible_triage_with_pane_id(&panes, Some("%11"));
+
+        match located {
+            Some(LocatedTriage::Live(pane)) => assert_eq!(pane.pane_id, "%11"),
+            _ => panic!("expected recorded triage pane to be live"),
+        }
+    }
+
+    #[test]
+    fn visible_triage_pane_wins_over_stale_record() {
+        let mut panes = HashMap::new();
+        panes.insert(10, pane(10, "%10", "fish"));
+        panes.insert(11, pane(11, "%11", "triage"));
+
+        let located = locate_recorded_or_visible_triage_with_pane_id(&panes, Some("%10"));
+
+        match located {
+            Some(LocatedTriage::Live(pane)) => assert_eq!(pane.pane_id, "%11"),
+            _ => panic!("expected visible triage pane to be live"),
+        }
+    }
+
+    #[test]
+    fn stale_recorded_pane_without_alive_record_is_not_respawned() {
+        let mut panes = HashMap::new();
+        panes.insert(10, pane(10, "%10", "fish"));
+
+        let located = locate_recorded_or_visible_triage_with_pane_id(&panes, Some("%10"));
+
+        assert!(located.is_none());
+    }
+
+    #[test]
+    fn visible_triage_lookup_requires_unique_match() {
+        let mut panes = HashMap::new();
+        panes.insert(10, pane(10, "%10", "triage"));
+        panes.insert(11, pane(11, "%11", "/usr/local/bin/triage"));
+
+        let located = locate_visible_triage_pane(&panes, None);
+
+        assert!(located.is_none());
     }
 
     #[test]
