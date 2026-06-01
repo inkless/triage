@@ -265,91 +265,65 @@ enum LocatedTriage {
 }
 
 fn locate_triage(panes: &HashMap<u32, Pane>) -> Option<LocatedTriage> {
-    if let Some(record) = crate::approval::read_alive_record() {
-        let alive = crate::discovery::pid_alive(record.pid);
-        let recorded = record
-            .pane_id
-            .as_deref()
-            .and_then(|pane_id| pane_by_id(panes, pane_id));
-
-        if alive {
-            let ppid_map = build_ppid_map();
-            if let Some(pane) = find_owning_pane(record.pid, panes, &ppid_map, 8) {
-                return Some(LocatedTriage::Live(pane));
-            }
-            if let Some(pane) = recorded.clone().filter(is_triage_pane) {
-                return Some(LocatedTriage::Live(pane));
-            }
-            if let Some(live) = locate_visible_triage_pane(panes, record.pane_id.as_deref()) {
-                return Some(LocatedTriage::Live(live));
-            }
-            return recorded.map(LocatedTriage::PaneStale);
-        }
-
-        if let Some(pane) = recorded {
-            if is_triage_pane(&pane) {
-                return Some(LocatedTriage::Live(pane));
-            }
-            if let Some(live) = locate_visible_triage_pane(panes, Some(&pane.pane_id)) {
-                return Some(LocatedTriage::Live(live));
-            }
-            return Some(LocatedTriage::PaneStale(pane));
-        }
-    }
-
-    locate_recorded_or_visible_triage(panes)
+    let record = crate::approval::read_alive_record()?;
+    let alive = crate::discovery::pid_alive(record.pid);
+    // The ppid walk is only consulted when triage is alive; skip the (cheap but
+    // not free) system-wide `ps` snapshot when we already know it's dead.
+    let ppid_map = if alive {
+        build_ppid_map()
+    } else {
+        HashMap::new()
+    };
+    locate_triage_from_record(&record, alive, panes, &ppid_map)
 }
 
-fn locate_recorded_or_visible_triage(panes: &HashMap<u32, Pane>) -> Option<LocatedTriage> {
-    let recorded_pane_id = crate::persist::read_last_pane_id();
-    locate_recorded_or_visible_triage_with_pane_id(panes, recorded_pane_id.as_deref())
-}
-
-fn locate_recorded_or_visible_triage_with_pane_id(
+/// Resolve which tmux pane (if any) hosts the recorded triage instance, using
+/// only the authoritative signals from `.alive`: the recorded pid and pane id.
+///
+/// We deliberately do **not** match panes by `pane_current_command == "triage"`.
+/// That heuristic briefly matches the very pane a fresh `triage` is launched
+/// from (the new process is already foreground there before `.alive` is
+/// rewritten), so the silent-attach probe resolved to its own pane and exited
+/// before the TUI started — the TRI-123 regression. Pid + pane_id can only ever
+/// point at an *already-running* instance, never the launching pane, so the
+/// self-attach failure mode is impossible by construction here.
+///
+/// When `.alive` is missing entirely (clean exit, or a crash that skipped
+/// `AliveGuard`'s cleanup), we return `None` and the caller launches fresh —
+/// we don't try to rediscover an orphaned instance.
+fn locate_triage_from_record(
+    record: &crate::approval::AliveRecord,
+    alive: bool,
     panes: &HashMap<u32, Pane>,
-    recorded_pane_id: Option<&str>,
+    ppid_map: &HashMap<u32, u32>,
 ) -> Option<LocatedTriage> {
-    // Without `.alive`, only attach to panes tmux currently reports as
-    // running triage. Do not respawn a stale recorded pane here: the user may
-    // have quit triage and reused that shell for unrelated work.
-    let recorded = recorded_pane_id.and_then(|pane_id| pane_by_id(panes, pane_id));
-    if let Some(pane) = recorded.clone().filter(is_triage_pane) {
+    // Primary: walk the process tree from triage's pid to its pane. Robust
+    // against tmux window renumbering and a stale/absent recorded pane_id.
+    if alive && let Some(pane) = find_owning_pane(record.pid, panes, ppid_map, 8) {
         return Some(LocatedTriage::Live(pane));
     }
-    if let Some(pane) =
-        locate_visible_triage_pane(panes, recorded.as_ref().map(|p| p.pane_id.as_str()))
-    {
-        return Some(LocatedTriage::Live(pane));
-    }
-    None
-}
 
-fn locate_visible_triage_pane(
-    panes: &HashMap<u32, Pane>,
-    skip_pane_id: Option<&str>,
-) -> Option<Pane> {
-    let mut matches = panes
-        .values()
-        .filter(|pane| skip_pane_id != Some(pane.pane_id.as_str()))
-        .filter(|pane| is_triage_pane(pane))
-        .cloned()
-        .collect::<Vec<_>>();
-    (matches.len() == 1).then(|| matches.remove(0))
+    // Fallback: the recorded pane_id. If triage is alive but the pid walk
+    // missed it (e.g. a ppid chain deeper than the hop budget), reuse the
+    // recorded pane; if the process is gone but its pane survives, report it
+    // stale so the caller respawns in place rather than spawning a duplicate.
+    if let Some(pane) = record
+        .pane_id
+        .as_deref()
+        .and_then(|pane_id| pane_by_id(panes, pane_id))
+    {
+        return Some(if alive {
+            LocatedTriage::Live(pane)
+        } else {
+            LocatedTriage::PaneStale(pane)
+        });
+    }
+
+    None
 }
 
 fn pane_by_id(panes: &HashMap<u32, Pane>, pane_id: &str) -> Option<Pane> {
     panes.values().find(|pane| pane.pane_id == pane_id).cloned()
-}
-
-fn is_triage_pane(pane: &Pane) -> bool {
-    command_basename(&pane.current_command) == "triage"
-}
-
-fn command_basename(command: &str) -> &str {
-    Path::new(command)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(command)
 }
 
 /// Switch tmux focus to the given pane target (`session:window.pane`). When
@@ -917,53 +891,86 @@ mod tests {
         assert_eq!(found.pane_id, "%311");
     }
 
-    #[test]
-    fn recorded_triage_pane_is_live() {
-        let mut panes = HashMap::new();
-        panes.insert(10, pane(10, "%10", "fish"));
-        panes.insert(11, pane(11, "%11", "triage"));
-
-        let located = locate_recorded_or_visible_triage_with_pane_id(&panes, Some("%11"));
-
-        match located {
-            Some(LocatedTriage::Live(pane)) => assert_eq!(pane.pane_id, "%11"),
-            _ => panic!("expected recorded triage pane to be live"),
+    fn alive_record(pid: u32, pane_id: Option<&str>) -> crate::approval::AliveRecord {
+        crate::approval::AliveRecord {
+            pid,
+            pane_id: pane_id.map(str::to_string),
         }
     }
 
     #[test]
-    fn visible_triage_pane_wins_over_stale_record() {
+    fn locates_live_triage_by_pid_walk() {
+        // triage (pid 11) is recorded; the pid walk finds the pane that hosts
+        // it directly, independent of its recorded pane_id or current command.
         let mut panes = HashMap::new();
         panes.insert(10, pane(10, "%10", "fish"));
         panes.insert(11, pane(11, "%11", "triage"));
+        let record = alive_record(11, Some("%11"));
 
-        let located = locate_recorded_or_visible_triage_with_pane_id(&panes, Some("%10"));
+        let located = locate_triage_from_record(&record, true, &panes, &HashMap::new());
 
         match located {
-            Some(LocatedTriage::Live(pane)) => assert_eq!(pane.pane_id, "%11"),
-            _ => panic!("expected visible triage pane to be live"),
+            Some(LocatedTriage::Live(p)) => assert_eq!(p.pane_id, "%11"),
+            _ => panic!("expected live triage located by pid"),
         }
     }
 
     #[test]
-    fn stale_recorded_pane_without_alive_record_is_not_respawned() {
+    fn falls_back_to_recorded_pane_id_when_pid_walk_misses() {
+        // pid 999 isn't a pane pid and the ppid map is empty, so the walk
+        // misses; the recorded pane_id still resolves the live instance.
         let mut panes = HashMap::new();
-        panes.insert(10, pane(10, "%10", "fish"));
+        panes.insert(11, pane(11, "%11", "fish")); // command name is irrelevant now
+        let record = alive_record(999, Some("%11"));
 
-        let located = locate_recorded_or_visible_triage_with_pane_id(&panes, Some("%10"));
+        let located = locate_triage_from_record(&record, true, &panes, &HashMap::new());
 
-        assert!(located.is_none());
+        match located {
+            Some(LocatedTriage::Live(p)) => assert_eq!(p.pane_id, "%11"),
+            _ => panic!("expected fallback to recorded pane_id"),
+        }
     }
 
     #[test]
-    fn visible_triage_lookup_requires_unique_match() {
+    fn dead_pid_with_surviving_pane_is_stale() {
         let mut panes = HashMap::new();
-        panes.insert(10, pane(10, "%10", "triage"));
-        panes.insert(11, pane(11, "%11", "/usr/local/bin/triage"));
+        panes.insert(11, pane(11, "%11", "fish"));
+        let record = alive_record(11, Some("%11"));
 
-        let located = locate_visible_triage_pane(&panes, None);
+        let located = locate_triage_from_record(&record, false, &panes, &HashMap::new());
 
-        assert!(located.is_none());
+        match located {
+            Some(LocatedTriage::PaneStale(p)) => assert_eq!(p.pane_id, "%11"),
+            _ => panic!("expected stale recorded pane for respawn"),
+        }
+    }
+
+    #[test]
+    fn dead_pid_with_no_pane_is_none() {
+        let panes = HashMap::new();
+        let record = alive_record(11, Some("%11"));
+
+        assert!(locate_triage_from_record(&record, false, &panes, &HashMap::new()).is_none());
+    }
+
+    // TRI-123: a fresh `triage` launch must never attach to its own launching
+    // pane. With pid+pane_id resolution this is structural, not a special case:
+    // `.alive` only ever names an *already-running* instance, so the launching
+    // pane (a different pid, a different pane than the recorded one) can't match
+    // — even though it reports `triage` as its current command.
+    #[test]
+    fn does_not_attach_to_launching_pane() {
+        let mut panes = HashMap::new();
+        // %366 is the pane we're launching from: it shows `triage` (this very
+        // process) but its pid (366) is not the recorded instance.
+        panes.insert(366, pane(366, "%366", "triage"));
+        // No recorded instance is alive and no recorded pane survives.
+        let record = alive_record(999, Some("%999"));
+
+        assert!(locate_triage_from_record(&record, false, &panes, &HashMap::new()).is_none());
+        // Even if we (wrongly) believed it alive, the pid walk over an empty
+        // ppid map and the missing pane_id still refuse to match %366.
+        assert!(locate_triage_from_record(&record, true, &panes, &HashMap::new()).is_none());
     }
 
     #[test]
