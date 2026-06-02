@@ -120,6 +120,21 @@ fn main() -> io::Result<()> {
     let zoom_on_jump = exit_on_jump || args.iter().any(|a| a == "--zoom-on-jump");
     let force_new = args.iter().any(|a| a == "--force-new");
 
+    // Everything reaching here should be a bare `triage` launch, optionally
+    // carrying one of the launch-mode flags. A leftover positional
+    // (`triage foo`) or an unknown flag (`triage --prob`) is a typo or a
+    // mistyped subcommand — error out with a usage hint instead of silently
+    // launching the TUI, which would mask the mistake and look like the
+    // argument was accepted.
+    let unknown = unrecognized_launch_args(&args);
+    if !unknown.is_empty() {
+        eprintln!("triage: unrecognized argument(s): {}", unknown.join(" "));
+        eprintln!(
+            "Run `triage --help` for usage, or `triage` with no arguments to launch the TUI."
+        );
+        std::process::exit(2);
+    }
+
     // Silent attach: typing `triage` (no special flags) when one's already
     // running just switches the user to it and exits 0. Skipped when:
     //   - --force-new (explicit "I want a second instance, e.g. for debug")
@@ -143,6 +158,25 @@ fn main() -> io::Result<()> {
     let result = run(&mut terminal, exit_on_jump, zoom_on_jump);
     restore_terminal()?;
     result
+}
+
+/// Recognized flags for the bare-`triage` TUI-launch path. `--jump-to-self`,
+/// `--zoom`, `--probe`, `--audit`, the hook-install flags, and every
+/// subcommand are dispatched and returned earlier in `main`, so the only valid
+/// residue at launch time is these launch-mode flags.
+const LAUNCH_FLAGS: &[&str] = &["--exit-on-jump", "--zoom-on-jump", "--force-new"];
+
+/// Args beyond argv[0] that aren't recognized launch-mode flags. Non-empty
+/// means the user typed something we don't understand (a typo, or a mistyped
+/// subcommand like `triage send-msg`), and we should error rather than fall
+/// through to launching the TUI. Must be called only after all subcommands and
+/// one-shot flags have already been dispatched out of `main`.
+fn unrecognized_launch_args(args: &[String]) -> Vec<String> {
+    args.iter()
+        .skip(1)
+        .filter(|a| !LAUNCH_FLAGS.contains(&a.as_str()))
+        .cloned()
+        .collect()
 }
 
 fn print_top_level_help() {
@@ -1255,4 +1289,45 @@ fn jump_to_selected(app: &mut AppState) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unrecognized_launch_args;
+
+    fn argv(parts: &[&str]) -> Vec<String> {
+        std::iter::once("triage")
+            .chain(parts.iter().copied())
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[test]
+    fn bare_launch_has_no_unknown_args() {
+        assert!(unrecognized_launch_args(&argv(&[])).is_empty());
+    }
+
+    #[test]
+    fn launch_flags_are_recognized() {
+        assert!(unrecognized_launch_args(&argv(&["--force-new"])).is_empty());
+        assert!(unrecognized_launch_args(&argv(&["--zoom-on-jump", "--exit-on-jump"])).is_empty());
+    }
+
+    #[test]
+    fn stray_positional_is_unrecognized() {
+        assert_eq!(unrecognized_launch_args(&argv(&["bogus"])), vec!["bogus"]);
+    }
+
+    #[test]
+    fn unknown_flag_is_unrecognized() {
+        assert_eq!(unrecognized_launch_args(&argv(&["--prob"])), vec!["--prob"]);
+    }
+
+    #[test]
+    fn reports_only_the_unknown_args_alongside_valid_flags() {
+        assert_eq!(
+            unrecognized_launch_args(&argv(&["--force-new", "oops"])),
+            vec!["oops"]
+        );
+    }
 }
