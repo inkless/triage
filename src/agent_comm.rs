@@ -108,6 +108,14 @@ struct AgentRow {
 }
 
 fn run_agents(args: &[String]) -> Result<(), CliError> {
+    // `triage agents whoami [--json]` — introspect the caller's own row, which
+    // the plain listing deliberately omits. Lets an agent learn how triage
+    // sees it (pane id/target to use as a `--from` token, resolved name,
+    // state) rather than just the bare $TMUX_PANE. Checked before the shared
+    // --help so `agents whoami --help` reaches the subcommand's own usage.
+    if args.first().map(String::as_str) == Some("whoami") {
+        return run_whoami(&args[1..]);
+    }
     if args.iter().any(|a| a == "--help" || a == "-h") {
         println!("{}", agents_usage(""));
         return Ok(());
@@ -161,6 +169,80 @@ fn run_agents(args: &[String]) -> Result<(), CliError> {
         }
     }
 
+    Ok(())
+}
+
+fn run_whoami(args: &[String]) -> Result<(), CliError> {
+    let mut json = false;
+    for a in args {
+        match a.as_str() {
+            "--json" => json = true,
+            "--help" | "-h" => {
+                println!("usage: triage agents whoami [--json]");
+                return Ok(());
+            }
+            other => {
+                return Err(CliError::usage(format!(
+                    "unknown arg {other:?}\nusage: triage agents whoami [--json]"
+                )));
+            }
+        }
+    }
+
+    let pane_id = current_tmux_pane_id()
+        .ok_or_else(|| CliError::usage("not running inside a tmux pane (TMUX_PANE is unset)"))?;
+
+    // The caller's own session is the one paired to this pane.
+    let mut sessions = load_snapshot()?;
+    snapshot::sort_sessions(&mut sessions);
+    let row = sessions
+        .iter()
+        .find(|s| s.pane.as_ref().is_some_and(|p| p.pane_id == pane_id))
+        .map(agent_row);
+
+    if json {
+        let value = match &row {
+            Some(row) => serde_json::to_value(row),
+            // Pane is real but triage doesn't track an agent session here
+            // (e.g. a plain shell, or a session it couldn't pair). Still report
+            // the pane so the caller has a usable identity.
+            None => serde_json::to_value(serde_json::json!({
+                "pane_id": pane_id,
+                "tracked": false,
+            })),
+        }
+        .map_err(|e| CliError::runtime(format!("failed to render JSON: {e}")))?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value)
+                .map_err(|e| CliError::runtime(format!("failed to render JSON: {e}")))?
+        );
+        return Ok(());
+    }
+
+    match row {
+        Some(row) => {
+            let target = row.pane_target.as_deref().unwrap_or("?");
+            println!(
+                "pane:     {} ({})",
+                row.pane_id.as_deref().unwrap_or(&pane_id),
+                target
+            );
+            println!("agent:    {} {} {:?}", row.provider, row.state, row.name);
+            println!("cwd:      {}", row.cwd);
+            println!("session:  {}", row.session_id);
+            if let Some(headline) = row.headline {
+                println!(
+                    "headline: {}",
+                    truncate_chars(&headline.replace('\n', " "), 100)
+                );
+            }
+        }
+        None => {
+            println!("pane:     {pane_id}");
+            println!("(no agent session tracked on this pane)");
+        }
+    }
     Ok(())
 }
 
@@ -669,7 +751,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 fn agents_usage(prefix: impl Into<String>) -> String {
     let prefix = prefix.into();
-    let usage = "usage: triage agents [--json] [--include-self] [--provider cc|cx] [--cwd PATH]";
+    let usage = "usage: triage agents [--json] [--include-self] [--provider cc|cx] [--cwd PATH]\n       triage agents whoami [--json]";
     if prefix.is_empty() {
         usage.to_string()
     } else {

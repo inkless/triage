@@ -194,6 +194,7 @@ SUBCOMMANDS:
   cost [--by day|cwd|session|model] [--days N] [--top N] [--json]
                             daily/weekly Claude spend across every transcript
   agents [--json]           list peer Claude/Codex agents and safe send status
+  agents whoami [--json]    show how triage sees the calling pane (your own row)
   send --to TARGET ...      send a guarded message to a live agent pane
   launch --cwd PATH ...     launch a configured Claude/Codex agent tmux window
 
