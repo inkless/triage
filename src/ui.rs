@@ -877,11 +877,50 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
     };
 
     let headline_width = (area.width as usize).saturating_sub(fixed).max(1);
-    let rows: Vec<Row> = visible
+    let mut rows: Vec<Row> = visible
         .iter()
         .enumerate()
         .map(|(i, s)| build_row(s, now, headline_width, layout, Some(i) == selected_idx))
         .collect();
+
+    // Thin rule between the pinned block (which sorts to the top) and the rest,
+    // shown only when both groups are present. Pinned rows are contiguous at
+    // the front, so the boundary is just the count of leading pinned rows.
+    //
+    // The divider is a render-only Row: `app.selected` stays a logical index
+    // into `visible`, and we translate to the divider-shifted visual space on a
+    // throwaway TableState here. That keeps navigation / jump / selection
+    // (which all index `visible`) oblivious to the extra row.
+    let pin_count = visible.iter().take_while(|s| s.pinned).count();
+    let show_divider = pin_count > 0 && pin_count < visible.len();
+    let mut render_state = app.selected;
+    if show_divider {
+        let col_widths: Vec<usize> = widths
+            .iter()
+            .map(|c| match c {
+                Constraint::Length(n) => *n as usize,
+                _ => headline_width,
+            })
+            .collect();
+        let divider_cells: Vec<Cell> = col_widths
+            .iter()
+            .map(|w| Cell::from("─".repeat(*w)).style(Style::default().fg(Color::DarkGray)))
+            .collect();
+        rows.insert(
+            pin_count,
+            Row::new(divider_cells).height(1).bottom_margin(1),
+        );
+
+        if let Some(sel) = render_state.selected()
+            && sel >= pin_count
+        {
+            render_state.select(Some(sel + 1));
+        }
+        let off = render_state.offset();
+        if off >= pin_count {
+            *render_state.offset_mut() = off + 1;
+        }
+    }
 
     let header = Row::new(header_cells).style(
         Style::default()
@@ -903,7 +942,17 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
         .highlight_symbol("▌ ")
         .block(Block::default().borders(Borders::TOP));
 
-    f.render_stateful_widget(table, area, &mut app.selected);
+    f.render_stateful_widget(table, area, &mut render_state);
+
+    // Persist the (possibly auto-scrolled) offset back into the logical state,
+    // undoing the divider shift so the next frame starts from the right place.
+    let voff = render_state.offset();
+    let loff = if show_divider && voff > pin_count {
+        voff - 1
+    } else {
+        voff
+    };
+    *app.selected.offset_mut() = loff;
 }
 
 fn draw_spawn_picker(f: &mut Frame, area: Rect, app: &mut AppState) {
@@ -1057,18 +1106,15 @@ fn build_row(
     // them. The state glyph still shows its label but in a muted color.
     // Watched rows append `·w` to the state label so the user can see the
     // arm-state in the column they're already scanning for state changes.
-    let (mut state_label, state_color) = if s.muted {
+    // Pinned rows are set apart by a divider rule in the table (drawn in
+    // draw_table) rather than a per-row glyph, so no pin marker here.
+    let (state_label, state_color) = if s.muted {
         ("muted".to_string(), Color::DarkGray)
     } else if s.watched {
         (format!("{state_str}·w"), color)
     } else {
         (state_str, color)
     };
-    // Pinned rows get a leading `*` in the state column so the reason they're
-    // floating at the top is visible where the eye already scans for state.
-    if s.pinned {
-        state_label = format!("*{state_label}");
-    }
     let row_style = if s.muted {
         Style::default().fg(Color::DarkGray)
     } else {
