@@ -473,11 +473,17 @@ fn evaluate_send_gate(s: &Session) -> GateResult {
     if s.pane_blocked {
         return blocked("target has a visible permission prompt");
     }
-    if let Some(content) = tmux::capture_pane_tail(&pane.pane_id, 80)
-        && (tmux::has_pending_permission_prompt(&content)
-            || tmux::has_codex_permission_prompt(&content))
-    {
-        return blocked("target has a visible permission prompt");
+    if let Some(content) = tmux::capture_pane_tail(&pane.pane_id, 80) {
+        if tmux::has_pending_permission_prompt(&content)
+            || tmux::has_codex_permission_prompt(&content)
+        {
+            return blocked("target has a visible permission prompt");
+        }
+        // Draft text in the composer means the user is mid-typing — a paste
+        // would land on their draft and submit the mangled result.
+        if tmux::has_draft_input(&content) {
+            return blocked("target has unsent text in its input box (user may be typing)");
+        }
     }
 
     // Everything past the prompt checks is reachable. The only genuine

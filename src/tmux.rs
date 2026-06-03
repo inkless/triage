@@ -612,6 +612,27 @@ pub fn has_codex_permission_prompt(pane: &str) -> bool {
     false
 }
 
+/// Best-effort: does the target's Claude composer hold draft text the user is
+/// mid-typing? Sending into it would paste onto their draft and submit the
+/// mangled result. Claude Code renders the input line as `❯ <draft>` (the
+/// marker is U+276F followed by a space/NBSP) at the bottom of the pane, with
+/// an empty composer showing a bare `❯`. We scan from the bottom for the first
+/// such line — that's the composer — and report whether anything non-blank
+/// follows the marker.
+///
+/// Heuristic and Claude-specific: Codex's composer differs and isn't detected
+/// (returns false), and we err toward false (allow the send) on any layout we
+/// don't recognize rather than block on uncertainty.
+pub fn has_draft_input(pane: &str) -> bool {
+    for line in pane.lines().rev() {
+        if let Some(rest) = line.trim_start().strip_prefix('❯') {
+            let rest = rest.trim_matches(|c: char| c == '\u{a0}' || c.is_whitespace());
+            return !rest.is_empty();
+        }
+    }
+    false
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodexPromptChoice {
     Yes,
@@ -971,6 +992,34 @@ mod tests {
         // Even if we (wrongly) believed it alive, the pid walk over an empty
         // ppid map and the missing pane_id still refuse to match %366.
         assert!(locate_triage_from_record(&record, true, &panes, &HashMap::new()).is_none());
+    }
+
+    #[test]
+    fn draft_input_detected_when_composer_has_text() {
+        // Mirrors a real capture: rule border, the `❯ <draft>` composer line
+        // (marker U+276F + NBSP), then the bottom border + status lines.
+        let pane =
+            "──────────────\n❯\u{a0}leave it to the coordinator\n──────────────\n  [Opus] ux";
+        assert!(has_draft_input(pane));
+    }
+
+    #[test]
+    fn empty_composer_is_not_draft() {
+        let pane = "──────────────\n❯\u{a0}\n──────────────\n  [Opus] ux";
+        assert!(!has_draft_input(pane));
+    }
+
+    #[test]
+    fn draft_uses_bottom_most_composer_line() {
+        // An earlier `❯`-prefixed line in scrollback must not shadow the live
+        // (empty) composer at the bottom.
+        let pane = "❯\u{a0}an old prompt from history\nassistant replied\n──────\n❯\u{a0}\n──────";
+        assert!(!has_draft_input(pane));
+    }
+
+    #[test]
+    fn no_composer_marker_is_not_draft() {
+        assert!(!has_draft_input("just some output\nno prompt here"));
     }
 
     #[test]
