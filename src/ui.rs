@@ -290,6 +290,10 @@ impl AppState {
             started_at_ms: s.started_at_ms,
         };
         if self.muted.remove(&key).is_none() {
+            // Mute and pin are mutually exclusive opposites — muting a pinned
+            // row clears the pin so it sinks to the bottom rather than staying
+            // floated at the top.
+            self.pinned.remove(&key);
             self.muted.insert(key, SystemTime::now());
         }
         self.persist_state();
@@ -327,6 +331,8 @@ impl AppState {
         let now_pinned = if self.pinned.remove(&key) {
             false
         } else {
+            // Pinning clears any mute — they're mutually exclusive opposites.
+            self.muted.remove(&key);
             self.pinned.insert(key);
             true
         };

@@ -897,7 +897,9 @@ fn refresh(app: &mut AppState) {
         };
         s.muted = app.muted.contains_key(&key);
         s.watched = app.watched.contains(&key);
-        s.pinned = app.pinned.contains(&key);
+        // Pin and mute are mutually exclusive; toggles enforce it, but guard
+        // here too so any legacy state.json with both set honors mute-wins.
+        s.pinned = app.pinned.contains(&key) && !s.muted;
     }
     if app.muted.len() != mute_count_before {
         app.persist_state();
