@@ -19,6 +19,7 @@ mod watcher;
 use std::io;
 use std::time::{Duration, Instant, SystemTime};
 
+use clap::{Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -37,109 +38,173 @@ const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// applies as the upper bound when nothing is changing.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
 
+/// Top-level CLI. A bare `triage` (no subcommand, no mode flag) launches the
+/// TUI; everything else is a one-shot. The mode flags are kept as flags (rather
+/// than promoted to subcommands) so existing invocations wired into tmux
+/// bindings and internal spawn strings — `triage --jump-to-self`,
+/// `triage --zoom-on-jump` — keep working unchanged.
+#[derive(Parser, Debug)]
+#[command(
+    name = "triage",
+    version,
+    about = "TUI to monitor parallel Claude Code sessions across tmux panes",
+    after_help = AFTER_HELP,
+    group = clap::ArgGroup::new("hook_action").args(["install_hooks", "uninstall_hooks"]).multiple(true)
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    /// print joined session table (non-TUI smoke test)
+    #[arg(long)]
+    probe: bool,
+    /// install triage's PreToolUse hook into ~/.claude/settings.json
+    #[arg(long)]
+    install_hooks: bool,
+    /// remove triage's PreToolUse hook entries
+    #[arg(long)]
+    uninstall_hooks: bool,
+    /// print manual hook-install instructions
+    #[arg(long)]
+    install_hooks_hint: bool,
+    /// with --install-hooks / --uninstall-hooks: show changes without writing
+    #[arg(long, requires = "hook_action")]
+    dry_run: bool,
+    /// feed the given session pid's pending tool_use to the auditor
+    #[arg(long, value_name = "PID")]
+    audit: Option<u32>,
+    /// print the auditor prompt to stdout
+    #[arg(long)]
+    audit_prompt: bool,
+    /// focus an existing triage pane (tmux-binding entrypoint)
+    #[arg(long)]
+    jump_to_self: bool,
+    /// with --jump-to-self: zoom the target pane (mobile)
+    #[arg(long, requires = "jump_to_self")]
+    zoom: bool,
+    /// exit cleanly after a successful Enter jump (popup-launch mode)
+    #[arg(long)]
+    exit_on_jump: bool,
+    /// force zoom-on-jump regardless of pane width
+    #[arg(long)]
+    zoom_on_jump: bool,
+    /// spawn a new TUI instance even if one is already alive
+    #[arg(long)]
+    force_new: bool,
+}
+
+/// One-shot subcommands. Each captures its remaining args verbatim and hands
+/// them to the module's own parser — clap owns top-level routing, `--help`, and
+/// unknown-input rejection; the subcommands keep their established flag parsing
+/// (and their own `--help`) untouched. `disable_help_flag` lets `--help` pass
+/// through to those handlers rather than being intercepted here.
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Post a one-shot ntfy push using ~/.config/triage/config.toml
+    #[command(disable_help_flag = true)]
+    Notify {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Daily/weekly Claude spend across every transcript
+    #[command(disable_help_flag = true)]
+    Cost {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// List peer agents, or `whoami` to introspect the calling pane
+    #[command(disable_help_flag = true)]
+    Agents {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Send a guarded message to a live agent pane
+    #[command(disable_help_flag = true)]
+    Send {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Launch a configured Claude/Codex agent tmux window
+    #[command(disable_help_flag = true)]
+    Launch {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+}
+
+const AFTER_HELP: &str = "\
+With no subcommand, triage launches the TUI (or silent-attaches to a running
+instance in the current tmux session).
+
+In-TUI keybindings:
+  ⏎ jump · a/d approve/deny · A toggle auto mode
+  p toggle phone push · r reply · m mute · w watch · R rename · N new agent · / filter
+  H audit log · $ cost overlay · ? keys · q quit
+
+Docs:
+  README:      https://github.com/inkless/triage
+  config file: ~/.config/triage/config.toml (optional)";
+
 fn main() -> io::Result<()> {
-    let args: Vec<String> = std::env::args().collect();
-    // One-shot subcommand: `triage notify [flags] <message...>` posts to
-    // ntfy using the config's [ntfy] block. Detected by positional argv[1]
-    // (not a flag) so it doesn't collide with `--notify` style flags
-    // elsewhere. Blocking call; exit status reflects curl outcome.
-    if args.get(1).map(String::as_str) == Some("notify") {
-        return notify_os::cli_notify(&args[2..]);
+    let cli = Cli::parse();
+
+    // One-shot subcommands: clap routed them; their own parsers handle flags.
+    if let Some(command) = cli.command {
+        match command {
+            Command::Notify { args } => return notify_os::cli_notify(&args),
+            Command::Cost { args } => return cost_rollup::cli_cost(&args),
+            Command::Agents { args } => std::process::exit(agent_comm::cli_agents(&args)),
+            Command::Send { args } => std::process::exit(agent_comm::cli_send(&args)),
+            Command::Launch { args } => std::process::exit(spawn_agent::cli_launch(&args)),
+        }
     }
-    // `triage cost [flags]` — daily/weekly Claude spend across all
-    // sessions on disk. One-shot scan; no persistence. See cost_rollup.rs.
-    if args.get(1).map(String::as_str) == Some("cost") {
-        return cost_rollup::cli_cost(&args[2..]);
-    }
-    if args.get(1).map(String::as_str) == Some("agents") {
-        std::process::exit(agent_comm::cli_agents(&args[2..]));
-    }
-    if args.get(1).map(String::as_str) == Some("send") {
-        std::process::exit(agent_comm::cli_send(&args[2..]));
-    }
-    if args.get(1).map(String::as_str) == Some("launch") {
-        std::process::exit(spawn_agent::cli_launch(&args[2..]));
-    }
-    // Top-level help. Runs after subcommand dispatch so `triage send --help`
-    // and friends reach their own usage handlers, while `triage --help` still
-    // cannot accidentally launch the TUI.
-    if args
-        .iter()
-        .skip(1)
-        .any(|a| a == "--help" || a == "-h" || a == "help")
-    {
-        print_top_level_help();
-        return Ok(());
-    }
-    if args.iter().any(|a| a == "--probe") {
+
+    // One-shot mode flags, dispatched in the original precedence order
+    // (probe first, then the hook actions, audit, and the jump entrypoint).
+    if cli.probe {
         return probe();
     }
-    if args.iter().any(|a| a == "--install-hooks-hint") {
+    if cli.install_hooks_hint {
         approval::print_install_hint();
         return Ok(());
     }
-    if args.iter().any(|a| a == "--install-hooks") {
-        let dry = args.iter().any(|a| a == "--dry-run");
-        approval::install_hooks(dry)?;
+    if cli.install_hooks {
+        approval::install_hooks(cli.dry_run)?;
         return Ok(());
     }
-    if args.iter().any(|a| a == "--uninstall-hooks") {
-        let dry = args.iter().any(|a| a == "--dry-run");
-        approval::uninstall_hooks(dry)?;
+    if cli.uninstall_hooks {
+        approval::uninstall_hooks(cli.dry_run)?;
         return Ok(());
     }
-    // T-56 spike: feed the selected session's pending tool_use to a
-    // separate `claude -p` and print the auditor's verdict. No actual
-    // approve/deny — just exercising the prompt + parse path.
-    if let Some(idx) = args.iter().position(|a| a == "--audit") {
-        let pid = args
-            .get(idx + 1)
-            .and_then(|s| s.parse::<u32>().ok())
-            .ok_or_else(|| io::Error::other("usage: triage --audit <pid>"))?;
+    // T-56 spike: feed the selected session's pending tool_use to a separate
+    // `claude -p` and print the auditor's verdict. No actual approve/deny.
+    if let Some(pid) = cli.audit {
         return auditor::audit(pid);
     }
-    if args.iter().any(|a| a == "--audit-prompt") {
+    if cli.audit_prompt {
         auditor::print_prompt();
         return Ok(());
     }
     // Tmux-binding entrypoint: focus an existing triage pane or spawn one.
-    // Skips all discovery / transcript / watcher init so the focus switch
-    // is essentially just tmux subprocess overhead (<30ms cold).
-    // `--zoom` additionally `resize-pane -Z`s the triage pane so it fills
-    // the screen — designed for the mobile binding (M-/) where pane
-    // multitasking on a phone is unworkable.
-    if args.iter().any(|a| a == "--jump-to-self") {
-        let zoom = args.iter().any(|a| a == "--zoom");
-        return tmux::jump_to_self(zoom);
+    // Skips all discovery / transcript / watcher init so the focus switch is
+    // essentially just tmux subprocess overhead (<30ms cold). `--zoom`
+    // additionally `resize-pane -Z`s the triage pane so it fills the screen —
+    // for the mobile binding (M-/) where pane multitasking is unworkable.
+    if cli.jump_to_self {
+        return tmux::jump_to_self(cli.zoom);
     }
 
-    let exit_on_jump = args.iter().any(|a| a == "--exit-on-jump");
+    let exit_on_jump = cli.exit_on_jump;
     // Per-launch only — not persisted. Mobile users either launch their
-    // long-lived triage with this flag (and accept that desktop also
-    // zooms on Enter), or rely on the auto-detect path inside Enter.
-    let zoom_on_jump = exit_on_jump || args.iter().any(|a| a == "--zoom-on-jump");
-    let force_new = args.iter().any(|a| a == "--force-new");
-
-    // Everything reaching here should be a bare `triage` launch, optionally
-    // carrying one of the launch-mode flags. A leftover positional
-    // (`triage foo`) or an unknown flag (`triage --prob`) is a typo or a
-    // mistyped subcommand — error out with a usage hint instead of silently
-    // launching the TUI, which would mask the mistake and look like the
-    // argument was accepted.
-    let unknown = unrecognized_launch_args(&args);
-    if !unknown.is_empty() {
-        eprintln!("triage: unrecognized argument(s): {}", unknown.join(" "));
-        eprintln!(
-            "Run `triage --help` for usage, or `triage` with no arguments to launch the TUI."
-        );
-        std::process::exit(2);
-    }
+    // long-lived triage with this flag (and accept that desktop also zooms on
+    // Enter), or rely on the auto-detect path inside Enter.
+    let zoom_on_jump = exit_on_jump || cli.zoom_on_jump;
+    let force_new = cli.force_new;
 
     // Silent attach: typing `triage` (no special flags) when one's already
     // running just switches the user to it and exits 0. Skipped when:
     //   - --force-new (explicit "I want a second instance, e.g. for debug")
-    //   - --exit-on-jump (popup-launch context — caller is already
-    //     handling lifecycle)
+    //   - --exit-on-jump (popup-launch context — caller handles lifecycle)
     //   - we're not inside tmux (no pane to switch to)
     if !force_new
         && !exit_on_jump
@@ -158,70 +223,6 @@ fn main() -> io::Result<()> {
     let result = run(&mut terminal, exit_on_jump, zoom_on_jump);
     restore_terminal()?;
     result
-}
-
-/// Recognized flags for the bare-`triage` TUI-launch path. `--jump-to-self`,
-/// `--zoom`, `--probe`, `--audit`, the hook-install flags, and every
-/// subcommand are dispatched and returned earlier in `main`, so the only valid
-/// residue at launch time is these launch-mode flags.
-const LAUNCH_FLAGS: &[&str] = &["--exit-on-jump", "--zoom-on-jump", "--force-new"];
-
-/// Args beyond argv[0] that aren't recognized launch-mode flags. Non-empty
-/// means the user typed something we don't understand (a typo, or a mistyped
-/// subcommand like `triage send-msg`), and we should error rather than fall
-/// through to launching the TUI. Must be called only after all subcommands and
-/// one-shot flags have already been dispatched out of `main`.
-fn unrecognized_launch_args(args: &[String]) -> Vec<String> {
-    args.iter()
-        .skip(1)
-        .filter(|a| !LAUNCH_FLAGS.contains(&a.as_str()))
-        .cloned()
-        .collect()
-}
-
-fn print_top_level_help() {
-    println!(
-        r#"triage — TUI to monitor parallel Claude Code sessions across tmux panes
-
-USAGE:
-  triage                    launch the TUI (or silent-attach to a running
-                            instance in the current tmux session)
-  triage <subcommand>       one-shot subcommand
-  triage <flag>             one-shot flag operation
-
-SUBCOMMANDS:
-  notify <msg> [...]        post a one-shot ntfy push using ~/.config/triage/config.toml
-  cost [--by day|cwd|session|model] [--days N] [--top N] [--json]
-                            daily/weekly Claude spend across every transcript
-  agents [--json]           list peer Claude/Codex agents and safe send status
-  agents whoami [--json]    show how triage sees the calling pane (your own row)
-  send --to TARGET ...      send a guarded message to a live agent pane
-  launch --cwd PATH ...     launch a configured Claude/Codex agent tmux window
-
-FLAGS:
-  --help, -h, help          print this message and exit
-  --probe                   print joined session table (non-TUI smoke test)
-  --install-hooks           install triage's PreToolUse hook into ~/.claude/settings.json
-  --uninstall-hooks         remove triage's PreToolUse hook entries
-  --install-hooks-hint      print manual install instructions
-  --dry-run                 (with install/uninstall-hooks) show changes without writing
-  --audit <pid>             feed the session's pending tool_use to the auditor
-  --audit-prompt            print the auditor prompt to stdout
-  --jump-to-self [--zoom]   focus an existing triage pane (tmux-binding entrypoint)
-  --exit-on-jump            exit cleanly after a successful Enter jump (popup-launch mode)
-  --zoom-on-jump            force zoom-on-jump regardless of pane width
-  --force-new               spawn a new TUI instance even if one is already alive
-
-IN-TUI KEYBINDINGS:
-  ⏎ jump · a/d approve/deny · A toggle auto mode
-  p toggle phone push · r reply · m mute · w watch · R rename · N new agent · / filter
-  H audit log · $ cost overlay · ? keys · q quit
-
-DOCS:
-  README:        https://github.com/inkless/triage
-  config file:   ~/.config/triage/config.toml (optional)
-"#
-    );
 }
 
 fn probe() -> io::Result<()> {
@@ -1294,41 +1295,80 @@ fn jump_to_selected(app: &mut AppState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::unrecognized_launch_args;
+    use super::{Cli, Command};
+    use clap::{CommandFactory, Parser};
 
-    fn argv(parts: &[&str]) -> Vec<String> {
-        std::iter::once("triage")
-            .chain(parts.iter().copied())
-            .map(str::to_string)
-            .collect()
+    fn parse(parts: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("triage").chain(parts.iter().copied()))
     }
 
     #[test]
-    fn bare_launch_has_no_unknown_args() {
-        assert!(unrecognized_launch_args(&argv(&[])).is_empty());
+    fn clap_config_is_valid() {
+        // Catches derive misconfigurations (conflicting flags, bad arg specs).
+        Cli::command().debug_assert();
     }
 
     #[test]
-    fn launch_flags_are_recognized() {
-        assert!(unrecognized_launch_args(&argv(&["--force-new"])).is_empty());
-        assert!(unrecognized_launch_args(&argv(&["--zoom-on-jump", "--exit-on-jump"])).is_empty());
+    fn bare_invocation_is_a_tui_launch() {
+        let cli = parse(&[]).unwrap();
+        assert!(cli.command.is_none());
+        assert!(!cli.jump_to_self && !cli.probe && !cli.force_new);
     }
 
     #[test]
-    fn stray_positional_is_unrecognized() {
-        assert_eq!(unrecognized_launch_args(&argv(&["bogus"])), vec!["bogus"]);
+    fn mode_flags_parse() {
+        let cli = parse(&["--jump-to-self", "--zoom"]).unwrap();
+        assert!(cli.jump_to_self && cli.zoom);
+        assert_eq!(parse(&["--audit", "1234"]).unwrap().audit, Some(1234));
     }
 
     #[test]
-    fn unknown_flag_is_unrecognized() {
-        assert_eq!(unrecognized_launch_args(&argv(&["--prob"])), vec!["--prob"]);
+    fn audit_requires_numeric_pid() {
+        assert!(parse(&["--audit", "notapid"]).is_err());
     }
 
     #[test]
-    fn reports_only_the_unknown_args_alongside_valid_flags() {
-        assert_eq!(
-            unrecognized_launch_args(&argv(&["--force-new", "oops"])),
-            vec!["oops"]
+    fn subcommand_args_pass_through_verbatim() {
+        // Everything after the subcommand name (including flags) is captured
+        // raw for the module parser — clap must not try to interpret it.
+        match parse(&["agents", "whoami", "--json"]).unwrap().command {
+            Some(Command::Agents { args }) => assert_eq!(args, ["whoami", "--json"]),
+            other => panic!("expected agents passthrough, got {other:?}"),
+        }
+        match parse(&["send", "--to", "%1", "hello"]).unwrap().command {
+            Some(Command::Send { args }) => assert_eq!(args, ["--to", "%1", "hello"]),
+            other => panic!("expected send passthrough, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unknown_subcommand_or_flag_is_rejected() {
+        assert!(parse(&["bogus"]).is_err());
+        assert!(parse(&["--prob"]).is_err());
+    }
+
+    // Regression guards vs the pre-clap dispatch (parity audit).
+
+    #[test]
+    fn help_word_is_still_accepted() {
+        // `triage help` printed top-level help before clap; clap's built-in
+        // help subcommand must remain enabled so this keeps working.
+        let err = parse(&["help"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+    }
+
+    #[test]
+    fn meaningless_flag_combos_are_rejected() {
+        // Old TRI-124 strictness: these no-op-on-their-own flags must error
+        // rather than silently launch the TUI.
+        assert!(parse(&["--zoom"]).is_err(), "--zoom needs --jump-to-self");
+        assert!(
+            parse(&["--dry-run"]).is_err(),
+            "--dry-run needs a hook action"
         );
+        // ...but the valid pairings still parse.
+        assert!(parse(&["--jump-to-self", "--zoom"]).is_ok());
+        assert!(parse(&["--install-hooks", "--dry-run"]).is_ok());
+        assert!(parse(&["--uninstall-hooks", "--dry-run"]).is_ok());
     }
 }
