@@ -552,6 +552,21 @@ pub fn capture_pane_tail(target: &str, lines: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Like `capture_pane_tail` but preserves ANSI styling (`-e`). Needed to tell
+/// Claude's faint ghost/placeholder composer text from real input — see
+/// `has_draft_input`. Run `strip_ansi` over it for plain-text line matching.
+pub fn capture_pane_tail_ansi(target: &str, lines: u32) -> Option<String> {
+    let start = format!("-{lines}");
+    let out = Command::new("tmux")
+        .args(["capture-pane", "-e", "-p", "-S", &start, "-t", target])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// True iff the captured pane shows a Claude permission prompt UI in its
 /// most recent block. We require two distinct UI lines to BOTH appear as
 /// trimmed exact-line matches:
@@ -612,25 +627,108 @@ pub fn has_codex_permission_prompt(pane: &str) -> bool {
     false
 }
 
-/// Best-effort: does the target's Claude composer hold draft text the user is
-/// mid-typing? Sending into it would paste onto their draft and submit the
-/// mangled result. Claude Code renders the input line as `❯ <draft>` (the
-/// marker is U+276F followed by a space/NBSP) at the bottom of the pane, with
-/// an empty composer showing a bare `❯`. We scan from the bottom for the first
-/// such line — that's the composer — and report whether anything non-blank
-/// follows the marker.
+/// Best-effort: does the target's Claude composer hold real, unsent text the
+/// user is mid-typing? Sending into it would paste onto their draft and submit
+/// the mangled result. Claude Code renders the input line as `❯ <text>` (the
+/// marker is U+276F) at the bottom of the pane. We scan from the bottom for the
+/// first such line — that's the composer — and report whether it holds real
+/// input.
+///
+/// Crucially, Claude draws a **faint** (ANSI SGR 2) ghost/placeholder hint in
+/// the empty composer (e.g. a suggested next prompt). That ghost text is NOT
+/// the user's input — pasting over it is fine. So `pane` must be captured WITH
+/// escapes (`capture_pane_tail_ansi`), and only **non-faint** glyphs after the
+/// marker count as a real draft. Without the styling these are indistinguishable
+/// and the ghost text false-triggers the gate (TRI-131 regression).
 ///
 /// Heuristic and Claude-specific: Codex's composer differs and isn't detected
-/// (returns false), and we err toward false (allow the send) on any layout we
-/// don't recognize rather than block on uncertainty.
+/// (returns false); we err toward false (allow the send) on anything we don't
+/// recognize rather than block on uncertainty.
 pub fn has_draft_input(pane: &str) -> bool {
     for line in pane.lines().rev() {
-        if let Some(rest) = line.trim_start().strip_prefix('❯') {
-            let rest = rest.trim_matches(|c: char| c == '\u{a0}' || c.is_whitespace());
-            return !rest.is_empty();
+        if let Some(pos) = line.find('❯') {
+            return composer_has_real_text(&line[pos + '❯'.len_utf8()..]);
         }
     }
     false
+}
+
+/// True if the composer content after the `❯` marker contains visible text at
+/// normal intensity. Two styles mark text as *not* real input, so they don't
+/// count:
+///   - **faint** (SGR 2) — Claude's ghost/placeholder hint is drawn faint.
+///   - **reverse** (SGR 7) — the terminal cursor block. On a placeholder the
+///     cursor sits at position 0, highlighting the first ghost char in
+///     reverse video; counting it would re-introduce the false positive even
+///     though the rest of the hint is faint. Real input keeps the cursor
+///     *after* the typed text, so the typed glyphs stay normal-intensity.
+///
+/// `s` may carry ANSI SGR escapes from a `-e` capture.
+fn composer_has_real_text(s: &str) -> bool {
+    let mut faint = false;
+    let mut reverse = false;
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            // Consume a CSI escape: ESC '[' params <final-letter>. Only `m`
+            // (SGR) carries the intensity/reverse state we care about.
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                let mut params = String::new();
+                let mut final_byte = '\0';
+                for p in chars.by_ref() {
+                    if p.is_ascii_alphabetic() {
+                        final_byte = p;
+                        break;
+                    }
+                    params.push(p);
+                }
+                if final_byte == 'm' {
+                    for code in params.split(';') {
+                        match code {
+                            "2" => faint = true,
+                            "7" => reverse = true,
+                            "22" => faint = false,
+                            "27" => reverse = false,
+                            "" | "0" => {
+                                faint = false;
+                                reverse = false;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if !faint && !reverse && c != '\u{a0}' && !c.is_whitespace() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Remove ANSI CSI escape sequences from `s`, yielding the visible glyphs only.
+/// Used so the plain-text line matchers (permission-prompt detection) can run
+/// on a `-e` capture.
+pub fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for p in chars.by_ref() {
+                    if p.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -996,10 +1094,43 @@ mod tests {
 
     #[test]
     fn draft_input_detected_when_composer_has_text() {
-        // Mirrors a real capture: rule border, the `❯ <draft>` composer line
-        // (marker U+276F + NBSP), then the bottom border + status lines.
+        // Real input is normal intensity (no faint span after the marker).
         let pane =
             "──────────────\n❯\u{a0}leave it to the coordinator\n──────────────\n  [Opus] ux";
+        assert!(has_draft_input(pane));
+    }
+
+    #[test]
+    fn faint_placeholder_is_not_draft() {
+        // TRI-133 regression: Claude's ghost/placeholder hint is drawn faint
+        // (SGR 2). Captured with -e it must NOT count as real unsent input.
+        // Mirrors a real %38 capture: `\e[39m❯ \e[2m<hint>\e[0m`.
+        let pane = "─────\n\u{1b}[39m❯\u{a0}\u{1b}[2mmonitor PR until CI green\u{1b}[0m\n─────";
+        assert!(!has_draft_input(pane));
+    }
+
+    #[test]
+    fn per_word_faint_placeholder_is_not_draft() {
+        // %165-style: each word individually wrapped in its own faint span.
+        let pane = "❯\u{a0}\u{1b}[2mmark\u{1b}[0m \u{1b}[2mit\u{1b}[0m \u{1b}[2mready\u{1b}[0m";
+        assert!(!has_draft_input(pane));
+    }
+
+    #[test]
+    fn cursor_on_faint_placeholder_is_not_draft() {
+        // TRI-133 follow-up: on a placeholder the cursor sits on the first char
+        // (reverse video, SGR 7) with the rest faint. Mirrors a real %39
+        // capture: `❯ \e[7ms\e[0;2mtand down…\e[0m`. The lone reverse cursor
+        // char must not count as real input.
+        let pane = "❯\u{a0}\u{1b}[7ms\u{1b}[0;2mtand down until coordinator replies\u{1b}[0m";
+        assert!(!has_draft_input(pane));
+    }
+
+    #[test]
+    fn real_text_with_trailing_ghost_is_draft() {
+        // Normal-intensity typed text followed by a faint autocomplete ghost
+        // still counts as a real draft.
+        let pane = "❯\u{a0}fix the \u{1b}[2mbug in the parser\u{1b}[0m";
         assert!(has_draft_input(pane));
     }
 

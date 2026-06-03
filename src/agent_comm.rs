@@ -473,15 +473,18 @@ fn evaluate_send_gate(s: &Session) -> GateResult {
     if s.pane_blocked {
         return blocked("target has a visible permission prompt");
     }
-    if let Some(content) = tmux::capture_pane_tail(&pane.pane_id, 80) {
-        if tmux::has_pending_permission_prompt(&content)
-            || tmux::has_codex_permission_prompt(&content)
+    // Capture WITH ANSI styling: the draft-input check needs it to tell
+    // Claude's faint ghost/placeholder text from real input. The plain-text
+    // permission matchers run on a stripped copy.
+    if let Some(raw) = tmux::capture_pane_tail_ansi(&pane.pane_id, 80) {
+        let plain = tmux::strip_ansi(&raw);
+        if tmux::has_pending_permission_prompt(&plain) || tmux::has_codex_permission_prompt(&plain)
         {
             return blocked("target has a visible permission prompt");
         }
-        // Draft text in the composer means the user is mid-typing — a paste
-        // would land on their draft and submit the mangled result.
-        if tmux::has_draft_input(&content) {
+        // Real (non-faint) text in the composer means the user is mid-typing —
+        // a paste would land on their draft and submit the mangled result.
+        if tmux::has_draft_input(&raw) {
             return blocked("target has unsent text in its input box (user may be typing)");
         }
     }
