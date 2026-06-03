@@ -129,6 +129,11 @@ pub struct Session {
     /// Watched sessions fire a "finished" notification on each transition
     /// into `JustFinished` until toggled off. In-memory only — not persisted.
     pub watched: bool,
+    /// True when the user has pinned this session via `*`. Pinned sessions
+    /// sort above everything else regardless of attention state, so the rows
+    /// you care about stay at the top. Sticky (only `*` clears it) and
+    /// persisted across restarts.
+    pub pinned: bool,
     /// Pending tool-use approval requests captured by the hook. Newest last.
     /// These enrich the headline/detail and hook-mode `a`/`d` flow, but they
     /// are only actionable when Claude itself reports `status == "waiting"`.
@@ -187,6 +192,7 @@ impl Session {
             pane_blocked: false,
             muted: false,
             watched: false,
+            pinned: false,
             pending_approvals: Vec::new(),
         }
     }

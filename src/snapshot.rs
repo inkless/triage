@@ -55,8 +55,12 @@ pub fn discover_sessions_with_panes(
 
 pub fn sort_sessions(sessions: &mut [Session]) {
     sessions.sort_by(|a, b| {
-        a.muted
-            .cmp(&b.muted)
+        // Pinned rows float to the very top regardless of state or mute —
+        // `*` is an explicit "keep this visible" override. `b.cmp(a)` so
+        // pinned (true) sorts before unpinned (false).
+        b.pinned
+            .cmp(&a.pinned)
+            .then_with(|| a.muted.cmp(&b.muted))
             .then_with(|| a.state.priority().cmp(&b.state.priority()))
             .then_with(|| a.cwd.cmp(&b.cwd))
     });
@@ -165,6 +169,7 @@ fn scan_blocked_panes(sessions: &mut [Session]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::AttentionState;
     use std::path::PathBuf;
 
     fn claude_session(cwd: &str, name: Option<&str>, version: Option<&str>) -> Session {
@@ -199,6 +204,32 @@ mod tests {
 
     fn pane_map(panes: Vec<Pane>) -> HashMap<u32, Pane> {
         panes.into_iter().map(|pane| (pane.pid, pane)).collect()
+    }
+
+    #[test]
+    fn pinned_sessions_sort_to_the_top() {
+        // A pinned, low-priority (Stale) row must outrank an unpinned
+        // high-priority (Blocked) one, and a pinned+muted row must still beat
+        // unpinned rows (pin overrides mute).
+        let mut blocked = claude_session("/repo/a", None, None);
+        blocked.state = AttentionState::Blocked;
+
+        let mut pinned_stale = claude_session("/repo/b", None, None);
+        pinned_stale.state = AttentionState::Stale;
+        pinned_stale.pinned = true;
+
+        let mut pinned_muted = claude_session("/repo/c", None, None);
+        pinned_muted.state = AttentionState::IdleLong;
+        pinned_muted.pinned = true;
+        pinned_muted.muted = true;
+
+        let mut sessions = vec![blocked, pinned_stale, pinned_muted];
+        sort_sessions(&mut sessions);
+
+        assert!(sessions[0].pinned, "first row should be pinned");
+        assert!(sessions[1].pinned, "second row should be pinned");
+        assert!(!sessions[2].pinned, "unpinned Blocked row sinks below pins");
+        assert_eq!(sessions[2].state, AttentionState::Blocked);
     }
 
     #[test]

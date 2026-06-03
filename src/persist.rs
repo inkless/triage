@@ -63,6 +63,14 @@ struct PersistedMute {
     muted_at_secs: u64,
 }
 
+/// On-disk shape for a pin. Unlike mutes, a pin carries no timestamp — it's
+/// sticky until the user toggles `*` off, with no auto-clear behavior.
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedPin {
+    cwd: PathBuf,
+    started_at_ms: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedAlias {
     provider: String,
@@ -74,6 +82,10 @@ struct PersistedAlias {
 struct PersistedState {
     #[serde(default)]
     mutes: Vec<PersistedMute>,
+    /// Pinned sessions (float to the top of the table). Keyed on the same
+    /// stable (cwd, started_at_ms) identity as mutes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pins: Vec<PersistedPin>,
     /// User-provided triage-only row names. These deliberately do not mutate
     /// Claude/Codex/tmux state; they are display aliases owned by triage.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -108,6 +120,7 @@ fn state_path() -> PathBuf {
 
 pub struct LoadedState {
     pub mutes: Vec<(MuteKey, SystemTime)>,
+    pub pins: Vec<MuteKey>,
     pub aliases: Vec<(AliasKey, String)>,
     pub autonomous: bool,
     pub phone_push_enabled: bool,
@@ -117,6 +130,7 @@ impl LoadedState {
     fn empty() -> Self {
         Self {
             mutes: Vec::new(),
+            pins: Vec::new(),
             aliases: Vec::new(),
             autonomous: false,
             phone_push_enabled: true,
@@ -147,8 +161,17 @@ pub fn load_state() -> LoadedState {
             )
         })
         .collect();
+    let pins = state
+        .pins
+        .into_iter()
+        .map(|p| MuteKey {
+            cwd: p.cwd,
+            started_at_ms: p.started_at_ms,
+        })
+        .collect();
     LoadedState {
         mutes,
+        pins,
         aliases,
         autonomous: state.autonomous,
         phone_push_enabled: state.phone_push_enabled,
@@ -187,17 +210,20 @@ pub fn save_last_pane_id(pane_id: &str) {
 
 /// Best-effort save. Failures are ignored — losing prefs is annoying
 /// but not catastrophic, and we don't want IO errors to surface in the TUI.
-pub fn save_state<'a, M, A>(
+pub fn save_state<'a, M, P, A>(
     mutes_iter: M,
+    pins_iter: P,
     aliases_iter: A,
     autonomous: bool,
     phone_push_enabled: bool,
 ) where
     M: IntoIterator<Item = (&'a MuteKey, &'a SystemTime)>,
+    P: IntoIterator<Item = &'a MuteKey>,
     A: IntoIterator<Item = (&'a AliasKey, &'a String)>,
 {
     save_state_with_alias_mode(
         mutes_iter,
+        pins_iter,
         aliases_iter,
         autonomous,
         phone_push_enabled,
@@ -207,17 +233,20 @@ pub fn save_state<'a, M, A>(
 
 /// Save state after an explicit rename edit. Unlike the normal save path,
 /// this replaces aliases so clearing an alias stays cleared.
-pub fn save_state_replace_aliases<'a, M, A>(
+pub fn save_state_replace_aliases<'a, M, P, A>(
     mutes_iter: M,
+    pins_iter: P,
     aliases_iter: A,
     autonomous: bool,
     phone_push_enabled: bool,
 ) where
     M: IntoIterator<Item = (&'a MuteKey, &'a SystemTime)>,
+    P: IntoIterator<Item = &'a MuteKey>,
     A: IntoIterator<Item = (&'a AliasKey, &'a String)>,
 {
     save_state_with_alias_mode(
         mutes_iter,
+        pins_iter,
         aliases_iter,
         autonomous,
         phone_push_enabled,
@@ -231,14 +260,16 @@ enum AliasWriteMode {
     Replace,
 }
 
-fn save_state_with_alias_mode<'a, M, A>(
+fn save_state_with_alias_mode<'a, M, P, A>(
     mutes_iter: M,
+    pins_iter: P,
     aliases_iter: A,
     autonomous: bool,
     phone_push_enabled: bool,
     alias_write_mode: AliasWriteMode,
 ) where
     M: IntoIterator<Item = (&'a MuteKey, &'a SystemTime)>,
+    P: IntoIterator<Item = &'a MuteKey>,
     A: IntoIterator<Item = (&'a AliasKey, &'a String)>,
 {
     let mutes: Vec<PersistedMute> = mutes_iter
@@ -250,6 +281,13 @@ fn save_state_with_alias_mode<'a, M, A>(
                 started_at_ms: k.started_at_ms,
                 muted_at_secs: secs,
             })
+        })
+        .collect();
+    let pins: Vec<PersistedPin> = pins_iter
+        .into_iter()
+        .map(|k| PersistedPin {
+            cwd: k.cwd.clone(),
+            started_at_ms: k.started_at_ms,
         })
         .collect();
 
@@ -271,6 +309,7 @@ fn save_state_with_alias_mode<'a, M, A>(
     );
     let state = PersistedState {
         mutes,
+        pins,
         aliases,
         autonomous,
         phone_push_enabled,

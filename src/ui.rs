@@ -37,6 +37,9 @@ pub struct AppState {
     /// clear an entry by pressing `w` again on the row. Not persisted across
     /// restarts; a watch only makes sense while the session exists.
     pub watched: HashSet<MuteKey>,
+    /// (cwd, started_at_ms) of sessions pinned to the top via `*`. Sticky —
+    /// only `*` clears an entry — and persisted across restarts.
+    pub pinned: HashSet<MuteKey>,
     /// pid → most recently observed AttentionState. Used to detect transitions
     /// (e.g. into `Blocked`) so we can fire a desktop notification once per
     /// transition rather than on every refresh while the session stays blocked.
@@ -154,6 +157,7 @@ impl AppState {
         state.select(Some(0));
         let loaded = persist::load_state();
         let muted = loaded.mutes.into_iter().collect();
+        let pinned = loaded.pins.into_iter().collect();
         let aliases = loaded.aliases.into_iter().collect();
         let (audit_tx, audit_rx) = mpsc::channel();
         Self {
@@ -165,6 +169,7 @@ impl AppState {
             codex_cache: crate::codex::CodexDigestCache::new(),
             aliases,
             muted,
+            pinned,
             watched: HashSet::new(),
             last_states: HashMap::new(),
             approval_mode: ApprovalMode::default(),
@@ -309,9 +314,30 @@ impl AppState {
         Some((now_watching, label))
     }
 
+    /// Toggle the pin on the selected session. Pinned sessions sort to the top
+    /// (see `sort_sessions`). Persisted so pins survive a restart. Returns
+    /// `(now_pinned, label)` for the status line, or None if nothing selected.
+    pub fn toggle_pin_selected(&mut self) -> Option<(bool, String)> {
+        let s = self.selected_session()?;
+        let key = MuteKey {
+            cwd: s.cwd.clone(),
+            started_at_ms: s.started_at_ms,
+        };
+        let label = session_display_label(s);
+        let now_pinned = if self.pinned.remove(&key) {
+            false
+        } else {
+            self.pinned.insert(key);
+            true
+        };
+        self.persist_state();
+        Some((now_pinned, label))
+    }
+
     pub fn persist_state(&self) {
         persist::save_state(
             self.muted.iter(),
+            self.pinned.iter(),
             self.aliases.iter(),
             self.autonomous,
             self.phone_push_enabled,
@@ -321,6 +347,7 @@ impl AppState {
     fn persist_state_replace_aliases(&self) {
         persist::save_state_replace_aliases(
             self.muted.iter(),
+            self.pinned.iter(),
             self.aliases.iter(),
             self.autonomous,
             self.phone_push_enabled,
@@ -1030,13 +1057,18 @@ fn build_row(
     // them. The state glyph still shows its label but in a muted color.
     // Watched rows append `·w` to the state label so the user can see the
     // arm-state in the column they're already scanning for state changes.
-    let (state_label, state_color) = if s.muted {
+    let (mut state_label, state_color) = if s.muted {
         ("muted".to_string(), Color::DarkGray)
     } else if s.watched {
         (format!("{state_str}·w"), color)
     } else {
         (state_str, color)
     };
+    // Pinned rows get a leading `*` in the state column so the reason they're
+    // floating at the top is visible where the eye already scans for state.
+    if s.pinned {
+        state_label = format!("*{state_label}");
+    }
     let row_style = if s.muted {
         Style::default().fg(Color::DarkGray)
     } else {
@@ -1284,6 +1316,10 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
     }
     header.push(sep());
     header.push(Span::styled(uptime, dim()));
+    if s.pinned {
+        header.push(sep());
+        header.push(Span::styled("[pinned]", yellow()));
+    }
     if s.muted {
         header.push(sep());
         header.push(Span::styled("[muted]", yellow()));
@@ -2317,7 +2353,7 @@ fn draw_key_help(f: &mut Frame, area: Rect) {
             ),
         ]),
         Line::from("  A auto mode                    p phone push     m mute"),
-        Line::from("  w watch                        R rename"),
+        Line::from("  w watch                        * pin to top     R rename"),
         Line::from("  N new agent"),
         Line::from(""),
         Line::from(vec![

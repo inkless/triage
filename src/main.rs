@@ -138,7 +138,7 @@ instance in the current tmux session).
 
 In-TUI keybindings:
   ⏎ jump · a/d approve/deny · A toggle auto mode
-  p toggle phone push · r reply · m mute · w watch · R rename · N new agent · / filter
+  p toggle phone push · r reply · m mute · w watch · * pin · R rename · N new agent · / filter
   H audit log · $ cost overlay · ? keys · q quit
 
 Docs:
@@ -626,6 +626,16 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         KeyCode::Char('m') => {
             app.toggle_mute_selected();
         }
+        KeyCode::Char('*') => {
+            if let Some((now_pinned, label)) = app.toggle_pin_selected() {
+                app.status_msg = Some(format!(
+                    "{}: {label}",
+                    if now_pinned { "pinned" } else { "unpinned" }
+                ));
+            } else {
+                app.status_msg = Some("no session selected".to_string());
+            }
+        }
         KeyCode::Char('w') => {
             if let Some((now_watching, label)) = app.toggle_watch_selected() {
                 app.status_msg = Some(format!(
@@ -887,6 +897,7 @@ fn refresh(app: &mut AppState) {
         };
         s.muted = app.muted.contains_key(&key);
         s.watched = app.watched.contains(&key);
+        s.pinned = app.pinned.contains(&key);
     }
     if app.muted.len() != mute_count_before {
         app.persist_state();
