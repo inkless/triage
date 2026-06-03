@@ -480,19 +480,15 @@ fn evaluate_send_gate(s: &Session) -> GateResult {
         return blocked("target has a visible permission prompt");
     }
 
-    match s.state {
-        AttentionState::Fresh
-        | AttentionState::JustFinished
-        | AttentionState::Working
-        | AttentionState::IdleShort
-        | AttentionState::IdleLong => GateResult {
-            can_send: true,
-            reason: String::new(),
-        },
-        AttentionState::Blocked => blocked("target is blocked"),
-        AttentionState::Error => blocked("target is in error state"),
-        AttentionState::Stale => blocked("target is stale"),
-        AttentionState::Unknown => blocked("target state is unknown"),
+    // Everything past the prompt checks is reachable. The only genuine
+    // "do not send" conditions are the two above — no pane to paste into, and
+    // a visible permission prompt (our keystrokes would answer it). Attention
+    // state does NOT gate delivery: Working queues input; Stale is just a
+    // >=24h-idle heuristic (a send wakes a long-idle-but-alive agent rather
+    // than failing); Error/Unknown sit at a normal prompt and take input fine.
+    GateResult {
+        can_send: true,
+        reason: String::new(),
     }
 }
 
@@ -811,13 +807,44 @@ mod tests {
     }
 
     #[test]
-    fn blocked_is_denied() {
-        let s = session(AttentionState::Blocked);
+    fn visible_prompt_is_denied() {
+        // pane_blocked is the real Blocked trigger — a permission prompt is up,
+        // so keystrokes would answer it.
+        let mut s = session(AttentionState::Blocked);
+        s.pane_blocked = true;
 
         let gate = evaluate_send_gate(&s);
 
         assert!(!gate.can_send);
-        assert_eq!(gate.reason, "target is blocked");
+        assert_eq!(gate.reason, "target has a visible permission prompt");
+    }
+
+    #[test]
+    fn stale_is_allowed() {
+        // Stale is a >=24h-idle heuristic, not an unreachability signal: a
+        // long-idle-but-alive agent must remain sendable (a send wakes it).
+        let gate = evaluate_send_gate(&session(AttentionState::Stale));
+        assert!(gate.can_send);
+        assert!(gate.reason.is_empty());
+    }
+
+    #[test]
+    fn error_and_unknown_are_allowed() {
+        // No prompt is up in these states — the pane sits at a normal prompt
+        // and takes queued input fine.
+        assert!(evaluate_send_gate(&session(AttentionState::Error)).can_send);
+        assert!(evaluate_send_gate(&session(AttentionState::Unknown)).can_send);
+    }
+
+    #[test]
+    fn no_pane_is_denied() {
+        let mut s = session(AttentionState::IdleShort);
+        s.pane = None;
+
+        let gate = evaluate_send_gate(&s);
+
+        assert!(!gate.can_send);
+        assert_eq!(gate.reason, "target has no tmux pane");
     }
 
     #[test]
