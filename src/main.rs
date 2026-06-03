@@ -100,7 +100,7 @@ struct Cli {
 /// through to those handlers rather than being intercepted here.
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Post a one-shot ntfy push using ~/.config/triage/config.toml
+    /// Send a one-shot notification: desktop banner + ntfy phone push (both by default)
     #[command(disable_help_flag = true)]
     Notify {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]

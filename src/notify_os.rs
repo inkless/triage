@@ -131,11 +131,14 @@ fn session_preview(session: &Session) -> String {
 ///
 /// Errors are reported to stderr; the function returns a non-zero `io::Error`
 /// on any failure (missing config, empty message, curl non-zero, curl missing).
-const NOTIFY_USAGE: &str = "usage: triage notify [--title T] [--tags T] <message...>";
+const NOTIFY_USAGE: &str = "usage: triage notify [--title T] [--tags T] [--desktop-only | --phone-only] <message...>\n\
+    \x20 default: both a macOS desktop banner and an ntfy phone push (phone skipped if [ntfy] unconfigured)";
 
 pub fn cli_notify(args: &[String]) -> io::Result<()> {
     let mut title: Option<String> = None;
     let mut tags: Option<String> = None;
+    let mut desktop_only = false;
+    let mut phone_only = false;
     let mut positional: Vec<String> = Vec::new();
 
     let mut i = 0;
@@ -144,6 +147,14 @@ pub fn cli_notify(args: &[String]) -> io::Result<()> {
             "--help" | "-h" => {
                 println!("{NOTIFY_USAGE}");
                 return Ok(());
+            }
+            "--desktop-only" => {
+                desktop_only = true;
+                i += 1;
+            }
+            "--phone-only" => {
+                phone_only = true;
+                i += 1;
             }
             "--title" => {
                 title = Some(
@@ -168,6 +179,12 @@ pub fn cli_notify(args: &[String]) -> io::Result<()> {
         }
     }
 
+    if desktop_only && phone_only {
+        return Err(io::Error::other(
+            "--desktop-only and --phone-only are mutually exclusive",
+        ));
+    }
+
     // Stdin convention: a single positional `-` reads the message from stdin.
     // Multiline output is preserved (we only trim trailing newline so
     // `echo` / heredocs feel natural).
@@ -184,16 +201,39 @@ pub fn cli_notify(args: &[String]) -> io::Result<()> {
     }
 
     let cfg = Config::load();
-    let ntfy = cfg.ntfy.as_ref().ok_or_else(|| {
-        io::Error::other(
-            "ntfy not configured. Add an [ntfy] block with `url=` (and optional \
-             `user=`/`token=`) to ~/.config/triage/config.toml.",
-        )
-    })?;
-
     let title = title.as_deref().unwrap_or("triage agent");
     let tags = tags.as_deref().unwrap_or("information");
 
+    // Default fires both channels; the *-only flags restrict to one.
+    let want_desktop = !phone_only;
+    let want_phone = !desktop_only;
+
+    if want_desktop {
+        send_desktop_banner(title, &message);
+    }
+
+    if want_phone {
+        match cfg.ntfy.as_ref() {
+            Some(ntfy) => cli_phone_push(ntfy, title, tags, &message)?,
+            // Phone was explicitly requested but can't be delivered → error.
+            // Under the default (both), a missing config just skips the phone
+            // channel silently — the desktop banner already fired.
+            None if phone_only => {
+                return Err(io::Error::other(
+                    "ntfy not configured. Add an [ntfy] block with `url=` (and optional \
+                     `user=`/`token=`) to ~/.config/triage/config.toml.",
+                ));
+            }
+            None => {}
+        }
+    }
+
+    Ok(())
+}
+
+/// Blocking ntfy POST for the `notify` CLI (unlike the fire-and-forget
+/// `ntfy_push`, this surfaces a real exit status to the caller).
+fn cli_phone_push(ntfy: &NtfyConfig, title: &str, tags: &str, message: &str) -> io::Result<()> {
     let mut cmd = Command::new("curl");
     cmd.args(["-fsSL", "-m", "5", "-X", "POST"]);
     if let (Some(user), Some(token)) = (ntfy.user.as_deref(), ntfy.token.as_deref()) {
@@ -201,7 +241,7 @@ pub fn cli_notify(args: &[String]) -> io::Result<()> {
     }
     cmd.arg("-H").arg(format!("Title: {title}"));
     cmd.arg("-H").arg(format!("Tags: {tags}"));
-    cmd.args(["-d", &message]);
+    cmd.args(["-d", message]);
     cmd.arg(&ntfy.url);
 
     let status = cmd
@@ -218,6 +258,25 @@ pub fn cli_notify(args: &[String]) -> io::Result<()> {
         )));
     }
     Ok(())
+}
+
+/// macOS desktop banner not tied to a session (CLI `notify`). Prefers the
+/// triage-notify.app helper (UNUserNotificationCenter, reliable on macOS 14+),
+/// falling back to `osascript`. No click action — there's no pane to jump to.
+/// Title line is "triage", subtitle is `title`, body is `message`.
+fn send_desktop_banner(title: &str, message: &str) {
+    if let Some(bundle_path) = triage_notify_path() {
+        let mut cmd = Command::new("open");
+        cmd.args(["-na", bundle_path]);
+        cmd.arg("--args");
+        cmd.args(["--title", "triage"]);
+        cmd.args(["--subtitle", title]);
+        cmd.args(["--message", message]);
+        cmd.args(["--timeout", "20"]);
+        spawn_detached(cmd);
+        return;
+    }
+    send_via_osascript(title, message, "");
 }
 
 fn ntfy_push(ntfy: &NtfyConfig, label: &str, state: &str) {
