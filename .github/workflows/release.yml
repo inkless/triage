@@ -57,7 +57,7 @@ jobs:
       TAG: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
       - uses: dtolnay/rust-toolchain@stable
