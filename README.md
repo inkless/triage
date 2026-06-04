@@ -17,6 +17,14 @@ Shared:
 
 Different shape from [`agentop`](https://crates.io/crates/agentop) (process-centric, token/cost focused). `triage` is content-centric: the headline column is the recap, the detail pane shows what the agent is doing and why, and auto mode (off by default) routes safe tool approvals through an LLM auditor.
 
+## Demo
+
+![triage demo](assets/demo.png)
+
+Sessions sorted by attention priority — `block` (needs you now) at the top, `stale` at the bottom — each row carrying the agent's own recap of what it's doing.
+
+> The demo runs entirely on synthetic fixtures, not real sessions. To regenerate it, see [`scripts/demo/`](./scripts/demo/README.md): `scripts/demo/seed.sh` builds a sandboxed `$HOME` + idle tmux panes, then run `triage` and screenshot it (or record with asciinema for an animated version).
+
 ## Install
 
 ```bash
