@@ -70,17 +70,20 @@ jobs:
         run: |
           cargo build --release --target aarch64-apple-darwin
           cargo build --release --target x86_64-apple-darwin
-          mkdir -p dist
-          lipo -create -output dist/triage \
+          # Assemble artifacts under target/ (already gitignored) so the working
+          # tree stays clean for the `cargo publish` step below — no
+          # --allow-dirty, and no genuine source change gets masked.
+          mkdir -p target/dist
+          lipo -create -output target/dist/triage \
             target/aarch64-apple-darwin/release/triage \
             target/x86_64-apple-darwin/release/triage
-          bash scripts/triage-notify/build.sh dist
-          tar -czf "triage-macos-universal.tar.gz" -C dist triage triage-notify.app
+          bash scripts/triage-notify/build.sh target/dist
+          tar -czf "target/triage-macos-universal.tar.gz" -C target/dist triage triage-notify.app
 
       - name: Attach binary to the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$TAG" triage-macos-universal.tar.gz --clobber
+        run: gh release upload "$TAG" target/triage-macos-universal.tar.gz --clobber
 
       # crates.io publish. Requires either Trusted Publishing (id-token, no
       # secret) configured for the `triage-tui` crate, or a CARGO_REGISTRY_TOKEN
