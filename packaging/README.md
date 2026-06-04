@@ -37,10 +37,11 @@ guarded (`if: env.… != ''`) so the pipeline stays green until they exist:
   the `.app` into `OUT_DIR` (not the source tree), so verification succeeds, and
   it still stages the helper to `~/.config/triage` so `cargo install triage-tui`
   produces a working binary with notifications.
-- ⚠️ **Homebrew** — the formula builds from source and installs the helper under
-  `prefix/scripts/triage-notify/` to match triage's runtime probe. This path
-  hasn't been exercised by a real `brew install` yet — validate on the first tap
-  release (`brew install --build-from-source`, then confirm a notification fires).
+- ✅ **Homebrew** — validated via a real `brew install inkless/triage/triage`:
+  the formula builds the `triage-tui` crate from the crates.io source crate and
+  installs the helper under `prefix/scripts/triage-notify/`, which triage's
+  runtime probe resolves. The `release.yml` bump step refreshes the formula's
+  url/version/sha256 from the new `.crate` on each release.
 
 ## Known gotchas ("what goes wrong")
 

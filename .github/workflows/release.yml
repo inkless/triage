@@ -50,8 +50,12 @@ jobs:
     permissions:
       contents: write # upload release assets
       id-token: write # crates.io Trusted Publishing (OIDC), if configured
+    # Tokens are job-level env so the `if: env.X != ''` step guards can read
+    # them (step-level env is not visible to that same step's `if`).
     env:
       TAG: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -83,19 +87,31 @@ jobs:
       # secret. Skipped (not failed) until one is set up.
       - name: Publish to crates.io
         if: env.CARGO_REGISTRY_TOKEN != ''
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish
 
-      # Bump the Homebrew tap formula (inkless/homebrew-triage). Requires a
-      # HOMEBREW_TAP_TOKEN PAT with repo scope on the tap. Skipped until set up.
+      # Bump the Homebrew tap formula (inkless/homebrew-triage). The formula
+      # builds from the crates.io source crate, so we point it at the new
+      # .crate and refresh url/version/sha256. Runs after the crates.io publish
+      # above so the .crate exists. Skipped until HOMEBREW_TAP_TOKEN is set.
       - name: Bump Homebrew formula
         if: env.HOMEBREW_TAP_TOKEN != ''
-        uses: dawidd6/action-homebrew-bump-formula@v4
-        env:
-          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-        with:
-          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
-          tap: inkless/homebrew-triage
-          formula: triage
-          tag: ${{ env.TAG }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#v}"
+          CRATE_URL="https://static.crates.io/crates/triage-tui/triage-tui-${VERSION}.crate"
+          # Wait for the crates.io CDN to serve the freshly published .crate.
+          for i in $(seq 1 12); do
+            if curl -fsSL "$CRATE_URL" -o crate.tgz; then break; fi
+            echo "waiting for $CRATE_URL ($i)…"; sleep 15
+          done
+          SHA=$(shasum -a 256 crate.tgz | awk '{print $1}')
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/inkless/homebrew-triage.git" tap
+          cd tap
+          # macos runner → BSD sed (-i '').
+          sed -i '' -E "s|triage-tui-[0-9]+\.[0-9]+\.[0-9]+\.crate|triage-tui-${VERSION}.crate|" Formula/triage.rb
+          sed -i '' -E "s|^  version \".*\"|  version \"${VERSION}\"|" Formula/triage.rb
+          sed -i '' -E "s|^  sha256 \".*\"|  sha256 \"${SHA}\"|" Formula/triage.rb
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git commit -am "triage ${VERSION}"
+          git push

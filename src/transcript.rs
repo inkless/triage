@@ -316,7 +316,7 @@ pub fn assign_transcripts(sessions: &mut [Session], cache: &mut DigestCache) {
         // PASS 3 — greedy fallback for any remaining sessions whose
         // sessionId was stale (post-`/clear` is the documented case).
         // Pair by updatedAt DESC against mtime DESC.
-        jsonls.sort_by(|a, b| b.0.cmp(&a.0));
+        jsonls.sort_by_key(|j| std::cmp::Reverse(j.0));
         idxs.sort_by_key(|&i| std::cmp::Reverse(sessions[i].updated_at_ms));
         for (k, &si) in idxs.iter().enumerate() {
             if k >= jsonls.len() {
