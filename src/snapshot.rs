@@ -50,7 +50,42 @@ pub fn discover_sessions_with_panes(
     codex_cache.evict_missing();
     ui::apply_aliases_to_sessions(&mut sessions, aliases);
 
+    dedup_sessions_by_pane(&mut sessions);
+
     sessions
+}
+
+/// Collapse sessions that resolve to the same tmux pane down to one. A pane
+/// runs a single interactive program, but newer Claude (2.1.16x) keeps a
+/// launcher process + the live session + claimed `--bg-spare` descendants, and
+/// stale previous-session JSONs linger after `/clear` — several of which can
+/// pid-walk to the same pane and surface as duplicate rows (the "two rows,
+/// one pane" bug). Keep the most-recently-updated session (the live one),
+/// breaking ties on higher pid; drop the rest. Sessions with no pane are never
+/// collapsed (nothing to collide on).
+fn dedup_sessions_by_pane(sessions: &mut Vec<Session>) {
+    // Best (most recent, then highest-pid) session index per pane id.
+    let mut best: HashMap<String, usize> = HashMap::new();
+    for (i, s) in sessions.iter().enumerate() {
+        let Some(pane) = &s.pane else { continue };
+        let rank = (s.updated_at_ms, s.pid);
+        match best.get(&pane.pane_id) {
+            Some(&b) if (sessions[b].updated_at_ms, sessions[b].pid) >= rank => {}
+            _ => {
+                best.insert(pane.pane_id.clone(), i);
+            }
+        }
+    }
+    let keepers: HashSet<usize> = best.into_values().collect();
+
+    let mut idx = 0;
+    sessions.retain(|s| {
+        // Pane-less sessions never collide; paned ones survive only if they're
+        // the chosen keeper for their pane.
+        let keep = s.pane.is_none() || keepers.contains(&idx);
+        idx += 1;
+        keep
+    });
 }
 
 pub fn sort_sessions(sessions: &mut [Session]) {
@@ -204,6 +239,47 @@ mod tests {
 
     fn pane_map(panes: Vec<Pane>) -> HashMap<u32, Pane> {
         panes.into_iter().map(|pane| (pane.pid, pane)).collect()
+    }
+
+    fn paned_session(cwd: &str, pid: u32, pane_id: &str, updated_at_ms: u64) -> Session {
+        let mut s = Session::new(
+            Provider::Claude,
+            pid,
+            format!("sid-{pid}"),
+            PathBuf::from(cwd),
+            None,
+            "idle".to_string(),
+            0,
+            updated_at_ms,
+            None,
+        );
+        s.pane = Some(pane(pid, pane_id, cwd, "claude", "win"));
+        s
+    }
+
+    #[test]
+    fn dedup_keeps_most_recent_session_per_pane() {
+        // Two sessions pid-walked to the same pane (launcher + claimed spare);
+        // the more-recently-updated one wins, the stale one is dropped.
+        let mut sessions = vec![
+            paned_session("/repo/ux", 30907, "%428", 1_000),
+            paned_session("/repo/ux", 31903, "%428", 2_000),
+        ];
+        dedup_sessions_by_pane(&mut sessions);
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].pid, 31903);
+    }
+
+    #[test]
+    fn dedup_leaves_distinct_panes_and_paneless_alone() {
+        let a = paned_session("/repo/ux", 1, "%1", 10);
+        let b = paned_session("/repo/ux", 2, "%2", 20);
+        // A pane-less session must never be collapsed away.
+        let mut c = paned_session("/repo/other", 3, "%3", 30);
+        c.pane = None;
+        let mut sessions = vec![a, b, c];
+        dedup_sessions_by_pane(&mut sessions);
+        assert_eq!(sessions.len(), 3);
     }
 
     #[test]
