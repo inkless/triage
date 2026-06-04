@@ -50,11 +50,11 @@ jobs:
     permissions:
       contents: write # upload release assets
       id-token: write # crates.io Trusted Publishing (OIDC), if configured
-    # Tokens are job-level env so the `if: env.X != ''` step guards can read
-    # them (step-level env is not visible to that same step's `if`).
+    # HOMEBREW_TAP_TOKEN is job-level env so the `if: env.X != ''` guard on the
+    # bump step can read it (step-level env is not visible to that step's `if`).
+    # crates.io uses Trusted Publishing (OIDC) — no static token.
     env:
       TAG: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
     steps:
       - uses: actions/checkout@v4
@@ -85,11 +85,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "$TAG" target/triage-macos-universal.tar.gz --clobber
 
-      # crates.io publish. Requires either Trusted Publishing (id-token, no
-      # secret) configured for the `triage-tui` crate, or a CARGO_REGISTRY_TOKEN
-      # secret. Skipped (not failed) until one is set up.
+      # crates.io publish via Trusted Publishing (OIDC). The crate is configured
+      # to require Trusted Publishing, so a static CARGO_REGISTRY_TOKEN is
+      # rejected (403). This action exchanges the workflow's OIDC identity
+      # (id-token: write, above) for a short-lived publish token.
+      - name: Authenticate to crates.io (Trusted Publishing)
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
       - name: Publish to crates.io
-        if: env.CARGO_REGISTRY_TOKEN != ''
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
         run: cargo publish
 
       # Bump the Homebrew tap formula (inkless/homebrew-triage). The formula
