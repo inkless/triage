@@ -1,0 +1,101 @@
+name: Release
+
+# One workflow, two jobs (the pattern from the release-please-action README):
+#   1. release-please runs on every push to main, maintaining the open Release
+#      PR. When that PR merges it creates the vX.Y.Z tag + GitHub Release.
+#   2. publish is gated on release-please's `release_created` output (or a manual
+#      dispatch) and does the actual artifact work in the same run — building the
+#      mac binary, publishing to crates.io, and bumping the Homebrew tap. Doing it
+#      here sidesteps GitHub's rule that a tag pushed by GITHUB_TOKEN can't itself
+#      trigger another workflow.
+#
+# Re-publish an existing tag (e.g. after a registry hiccup) with:
+#   gh workflow run release.yml -f tag=v0.2.3
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to (re)publish, e.g. v0.2.3 — manual dispatch only"
+        required: true
+        type: string
+
+jobs:
+  release-please:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  publish:
+    needs: release-please
+    if: |
+      always() &&
+      (
+        (needs.release-please.result == 'success' && needs.release-please.outputs.release_created == 'true')
+        || github.event_name == 'workflow_dispatch'
+      )
+    runs-on: macos-latest
+    permissions:
+      contents: write # upload release assets
+      id-token: write # crates.io Trusted Publishing (OIDC), if configured
+    env:
+      TAG: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || needs.release-please.outputs.tag_name }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      # Universal binary + the notify .app, tarred together so direct downloads
+      # and the Homebrew formula both get click-to-jump notifications.
+      - name: Build universal macOS binary + notify helper
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          mkdir -p dist
+          lipo -create -output dist/triage \
+            target/aarch64-apple-darwin/release/triage \
+            target/x86_64-apple-darwin/release/triage
+          bash scripts/triage-notify/build.sh dist
+          tar -czf "triage-macos-universal.tar.gz" -C dist triage triage-notify.app
+
+      - name: Attach binary to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$TAG" triage-macos-universal.tar.gz --clobber
+
+      # crates.io publish. Requires either Trusted Publishing (id-token, no
+      # secret) configured for the `triage-tui` crate, or a CARGO_REGISTRY_TOKEN
+      # secret. Skipped (not failed) until one is set up.
+      - name: Publish to crates.io
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish
+
+      # Bump the Homebrew tap formula (inkless/homebrew-triage). Requires a
+      # HOMEBREW_TAP_TOKEN PAT with repo scope on the tap. Skipped until set up.
+      - name: Bump Homebrew formula
+        if: env.HOMEBREW_TAP_TOKEN != ''
+        uses: dawidd6/action-homebrew-bump-formula@v4
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        with:
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          tap: inkless/homebrew-triage
+          formula: triage
+          tag: ${{ env.TAG }}

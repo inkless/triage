@@ -13,7 +13,13 @@
 set -eu
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-APP="$DIR/triage-notify.app"
+# Assemble the .app into $1 if given (build.rs passes cargo's $OUT_DIR), else
+# into the source dir for manual/dev use. Writing the bundle outside the source
+# tree is what lets `cargo publish` verify the package — build scripts must not
+# modify anything outside OUT_DIR.
+OUT="${1:-$DIR}"
+mkdir -p "$OUT"
+APP="$OUT/triage-notify.app"
 MACOS_DIR="$APP/Contents/MacOS"
 RES_DIR="$APP/Contents/Resources"
 BIN="$MACOS_DIR/triage-notify"

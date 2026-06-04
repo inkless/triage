@@ -1981,7 +1981,12 @@ fn context_rank_peak(peak: &LiveCodexContextPeak) -> u64 {
         .unwrap_or(peak.tokens)
 }
 
+// Several rendering helpers (draw_cost_overlay, draw_footer, …) are defined
+// after this module; keeping the tests beside the layout code they exercise is
+// intentional, so we allow the organizational lint rather than reshuffle ~500
+// lines.
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use std::path::PathBuf;
 

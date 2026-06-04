@@ -29,10 +29,17 @@ fn main() {
     if !script.exists() {
         return;
     }
-    let built_app = Path::new("scripts/triage-notify/triage-notify.app");
-    match Command::new("bash").arg(script).status() {
+    // Assemble the .app under OUT_DIR, never in the source tree — cargo forbids
+    // build scripts from modifying anything outside OUT_DIR, and an in-tree
+    // write breaks `cargo publish` verification. Fall back to the source dir
+    // only if OUT_DIR is somehow unset (it always is during a real cargo build).
+    let out_dir = std::env::var_os("OUT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("scripts/triage-notify"));
+    let built_app = out_dir.join("triage-notify.app");
+    match Command::new("bash").arg(script).arg(&out_dir).status() {
         Ok(s) if s.success() => {
-            stage_to_user_config(built_app);
+            stage_to_user_config(&built_app);
         }
         Ok(s) => {
             println!(

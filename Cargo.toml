@@ -1,12 +1,20 @@
+# Crate name is `triage-tui` because `triage` is already taken on crates.io.
+# The installed binary stays `triage` via the [[bin]] section below.
 [package]
-name = "triage"
+name = "triage-tui"
 version = "0.1.0"
 edition = "2024"
 description = "TUI to monitor parallel Claude Code and Codex CLI sessions across tmux panes — triage by attention priority"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/inkless/triage"
+homepage = "https://github.com/inkless/triage"
+readme = "README.md"
 keywords = ["tui", "claude", "monitor", "tmux", "agent"]
 categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "triage"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }
