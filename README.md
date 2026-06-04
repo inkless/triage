@@ -28,7 +28,19 @@ Sessions sorted by attention priority — `block` (needs you now) at the top, `s
 ## Install
 
 ```bash
+# Homebrew (macOS) — recommended; bundles the notification helper
+brew install inkless/triage/triage
+
+# crates.io — installs the `triage` binary (crate is named triage-tui)
+cargo install triage-tui
+
+# From source (development)
 cargo install --path .
+```
+
+Then:
+
+```bash
 triage              # launch the TUI
 triage --probe      # print the joined session table once (no TUI)
 triage agents --json # list peer agents and guarded send status
