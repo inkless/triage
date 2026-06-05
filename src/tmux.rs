@@ -567,6 +567,22 @@ pub fn capture_pane_tail_ansi(target: &str, lines: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Capture just the pane's **visible screen** (no scrollback) with ANSI
+/// styling preserved (`-e`). This is the live-preview primitive (TRI-138):
+/// it returns what's on screen right now — the closest thing tmux gives to a
+/// rendered snapshot — for in-process rendering via `ansi-to-tui`. Unlike
+/// `capture_pane*` we omit `-S` so we get exactly the viewport, not history.
+pub fn capture_pane_visible_ansi(target: &str) -> Option<String> {
+    let out = Command::new("tmux")
+        .args(["capture-pane", "-e", "-p", "-t", target])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// True iff the captured pane shows a Claude permission prompt UI in its
 /// most recent block. We require two distinct UI lines to BOTH appear as
 /// trimmed exact-line matches:
