@@ -369,8 +369,12 @@ impl AppState {
         {
             return; // unchanged — keep the parsed Text, skip re-parse + redraw cost
         }
-        let text =
+        let mut text =
             ansi_to_tui::IntoText::into_text(&raw).unwrap_or_else(|_| Text::raw(raw.clone()));
+        // tmux captures the source pane's full visible screen, which usually
+        // ends in blank rows below the prompt. Drop them so "tail to the
+        // bottom" (draw_preview) lands on the last real line, not whitespace.
+        trim_trailing_blank_lines(&mut text);
         self.preview = Some(PanePreview { pane_id, raw, text });
     }
 
@@ -735,7 +739,7 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
     let bottom_height = if app.detail_open {
         18
     } else if preview_bottom {
-        PREVIEW_BOTTOM_HEIGHT
+        bottom_preview_height(f.area().height)
     } else {
         0
     };
@@ -797,8 +801,33 @@ fn preview_layout(open: bool, pos: PreviewPos, width: u16) -> (bool, bool) {
 /// Fixed width of the compact identity table when the preview docks on the
 /// right — just enough for STATE/AGE/AI/SESSION; the preview takes the rest.
 const PREVIEW_RIGHT_TABLE_WIDTH: u16 = 42;
-/// Height of the bottom-docked preview region.
-const PREVIEW_BOTTOM_HEIGHT: u16 = 18;
+/// Rows the table keeps when a bottom-docked preview is open, so the preview
+/// can't crowd the list off-screen on short (mobile) clients.
+const PREVIEW_BOTTOM_MIN_TABLE_ROWS: u16 = 6;
+
+/// Height for a bottom-docked preview: ~60% of the frame so it's roomy on a
+/// desktop, but never so tall that the table drops below
+/// `PREVIEW_BOTTOM_MIN_TABLE_ROWS` (mobile-safe). `total_height` is the full
+/// frame height (header + table + preview + footer).
+fn bottom_preview_height(total_height: u16) -> u16 {
+    // header + footer + the table floor we must preserve.
+    let reserved = 2 + PREVIEW_BOTTOM_MIN_TABLE_ROWS;
+    let cap = total_height.saturating_sub(reserved);
+    let desired = total_height * 6 / 10;
+    desired.min(cap)
+}
+
+/// Trim trailing all-whitespace lines so tailing to the bottom lands on the
+/// last line with real content rather than the pane's blank filler rows.
+fn trim_trailing_blank_lines(text: &mut Text<'_>) {
+    while text
+        .lines
+        .last()
+        .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+    {
+        text.lines.pop();
+    }
+}
 
 /// Live preview of the selected row's tmux pane (TRI-138), docked right or
 /// bottom. Renders the cached ANSI capture; lines wider than the panel are
@@ -822,7 +851,13 @@ fn draw_preview(f: &mut Frame, area: Rect, app: &AppState) {
     f.render_widget(block, area);
 
     match &app.preview {
-        Some(p) => f.render_widget(Paragraph::new(p.text.clone()), inner),
+        Some(p) => {
+            // The capture is the source pane's full screen, usually taller than
+            // our panel. Tail it: scroll so the last lines (latest output /
+            // prompt) are visible rather than the stale top.
+            let offset = (p.text.lines.len() as u16).saturating_sub(inner.height);
+            f.render_widget(Paragraph::new(p.text.clone()).scroll((offset, 0)), inner);
+        }
         None => {
             let msg = if sel.and_then(|s| s.pane.as_ref()).is_some() {
                 "capturing…"
@@ -2375,6 +2410,36 @@ mod tests {
         // Bottom always docks bottom, wide or narrow.
         assert_eq!(preview_layout(true, PreviewPos::Bottom, 200), (false, true));
         assert_eq!(preview_layout(true, PreviewPos::Bottom, 80), (false, true));
+    }
+
+    #[test]
+    fn bottom_preview_height_is_roomy_but_keeps_table_on_short_screens() {
+        // Tall desktop: ~60% to the preview, table keeps the rest.
+        assert_eq!(bottom_preview_height(50), 30);
+        // Short (mobile) screen: capped so the table keeps its floor.
+        // reserved = 2 + 6 = 8, so cap = 20 - 8 = 12 (< 60% = 12 here they tie).
+        assert_eq!(bottom_preview_height(20), 12);
+        // Very short: cap dominates, never steals the table's floor rows.
+        assert_eq!(bottom_preview_height(12), 4);
+        assert_eq!(bottom_preview_height(8), 0);
+    }
+
+    #[test]
+    fn trim_trailing_blank_lines_drops_only_trailing_whitespace() {
+        let mut text = Text::from(vec![
+            Line::from("top"),
+            Line::from(""),
+            Line::from("> prompt"),
+            Line::from("   "),
+            Line::from(""),
+        ]);
+        trim_trailing_blank_lines(&mut text);
+        assert_eq!(
+            text.lines.len(),
+            3,
+            "trailing blanks dropped, interior kept"
+        );
+        assert_eq!(text.lines.last().unwrap().spans[0].content, "> prompt");
     }
 
     #[test]
