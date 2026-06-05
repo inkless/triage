@@ -178,6 +178,19 @@ Overlay navigation (H / $):
   Esc              close
 ```
 
+## Preview and reply
+
+Toggle preview with `p`. Triage captures the selected tmux pane's visible
+screen and renders it beside the table on wide terminals, or below the table on
+narrow terminals. The preview follows selection as you navigate. Press `>` to
+flip between right-docked and bottom-docked preview.
+
+Press `r` to compose a one-line reply to the selected agent. When preview is
+open, the composer appears inside the preview panel so the target pane and the
+outgoing message stay together. When preview is closed, triage shows a yellow
+compose bar above the footer. `Enter` sends via `triage send`'s tmux buffer
+path; `Esc` cancels.
+
 ## Attention states
 
 Default sort order, highest-attention first:
@@ -226,7 +239,7 @@ When on, each refresh spawns `claude -p --model claude-sonnet-4-6 --tools "" --n
 - `APPROVE` / `DENY` route through the same machinery as manual `a`/`d` (Claude hook decision file when available, tmux send-keys fallback; Codex visible-prompt routing).
 - `WAIT` surfaces the reason in the detail pane and leaves the prompt for human review.
 
-Decisions append to `~/.config/triage/auto-decisions.jsonl` (one JSON object per line, includes cost + duration). Press `H` for the audit-history overlay.
+Decisions append to `~/.config/triage/auto-decisions.jsonl` (one JSON object per line, includes cost + duration). Press `l` (or `H`) for the audit-history overlay.
 
 **Safety**: the prompt explicitly approves routine repo work (Read/Glob/Grep, builds, tests, git ops, `gh pr create/edit`, file edits in the repo) and denies destructive actions (`rm -rf`, force-push to main, dropping data, `sudo`, shared-infrastructure writes). It WAITs when the action itself is in a middle zone — unfamiliar API, unreadable Bash flags, paths outside the repo. Customize via `~/.config/triage/auditor-prompt.md` (or `$TRIAGE_AUDITOR_PROMPT_FILE`).
 
