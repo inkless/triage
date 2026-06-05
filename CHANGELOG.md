@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/inkless/triage/compare/v0.3.0...v0.4.0) (2026-06-05)
+
+
+### Features
+
+* relocate reply to a visible compose surface (panel or bottom bar) ([#5](https://github.com/inkless/triage/issues/5)) ([4439251](https://github.com/inkless/triage/commit/4439251f389cf3ccdcb09de4b729b7f360f7935e))
+
 ## [0.3.0](https://github.com/inkless/triage/compare/v0.2.0...v0.3.0) (2026-06-05)
 
 
