@@ -743,13 +743,18 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
     } else {
         0
     };
+    // When replying in default mode (no preview panel to host the composer),
+    // a dedicated compose bar sits just above the footer so the reply is
+    // impossible to miss — instead of being tucked into the header status line.
+    let compose_bar = app.reply_active && !app.preview_open;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),             // header
-            Constraint::Min(5),                // table
-            Constraint::Length(bottom_height), // detail or bottom preview
-            Constraint::Length(1),             // footer
+            Constraint::Length(1),                               // header
+            Constraint::Min(5),                                  // table
+            Constraint::Length(bottom_height),                   // detail or bottom preview
+            Constraint::Length(if compose_bar { 1 } else { 0 }), // reply compose bar
+            Constraint::Length(1),                               // footer
         ])
         .split(f.area());
 
@@ -776,7 +781,29 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
     } else if preview_bottom {
         draw_preview(f, chunks[2], app);
     }
-    draw_footer(f, chunks[3], app);
+    if compose_bar {
+        draw_reply_bar(f, chunks[3], app);
+    }
+    draw_footer(f, chunks[4], app);
+}
+
+/// Default-mode reply composer: a full-width yellow bar (TRI-140) shown just
+/// above the footer when replying without the preview panel open. Names the
+/// target and shows the live input so the reply can't be missed.
+fn draw_reply_bar(f: &mut Frame, area: Rect, app: &AppState) {
+    let line = Line::from(vec![
+        Span::styled(
+            format!(" ✎ reply → {}", app.reply_target_label),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("   "),
+        Span::styled("❯ ", Style::default().fg(Color::Yellow)),
+        Span::raw(app.reply_buffer.clone()),
+        Span::styled("▏", Style::default().fg(Color::Yellow)),
+    ]);
+    f.render_widget(Paragraph::new(line), area);
 }
 
 /// Minimum total table-region width before the right-docked preview rail is
@@ -835,28 +862,58 @@ fn trim_trailing_blank_lines(text: &mut Text<'_>) {
 /// placeholder when the selected row has no pane or hasn't been captured yet.
 fn draw_preview(f: &mut Frame, area: Rect, app: &AppState) {
     let sel = app.selected_session();
-    let title = match sel {
-        Some(s) => {
-            let label = session_display_label(s);
-            let pane = s.pane.as_ref().map(|p| p.pane_id.as_str()).unwrap_or("—");
-            format!(" preview · {label} · {pane} ")
-        }
-        None => " preview ".to_string(),
+    // When a reply is being composed, the panel becomes the reply surface
+    // (TRI-140): yellow border, named target, and an input line pinned to the
+    // bottom. The send path / buffer / send-gate are the existing `r` reply —
+    // only the rendering moves here. The footer carries the key hints.
+    let replying = app.reply_active;
+    let (border_color, title) = if replying {
+        (
+            Color::Yellow,
+            format!(" ✎ reply → {} ", app.reply_target_label),
+        )
+    } else {
+        let t = match sel {
+            Some(s) => {
+                let label = session_display_label(s);
+                let pane = s.pane.as_ref().map(|p| p.pane_id.as_str()).unwrap_or("—");
+                format!(" preview · {label} · {pane} ")
+            }
+            None => " preview ".to_string(),
+        };
+        (Color::DarkGray, t)
     };
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::DarkGray))
+        .border_style(Style::default().fg(border_color))
         .title(title);
     let inner = block.inner(area);
     f.render_widget(block, area);
+
+    // Reserve the bottom row of the panel for the compose line while replying.
+    let (content, input) = if replying && inner.height >= 2 {
+        (
+            Rect {
+                height: inner.height - 1,
+                ..inner
+            },
+            Some(Rect {
+                y: inner.y + inner.height - 1,
+                height: 1,
+                ..inner
+            }),
+        )
+    } else {
+        (inner, None)
+    };
 
     match &app.preview {
         Some(p) => {
             // The capture is the source pane's full screen, usually taller than
             // our panel. Tail it: scroll so the last lines (latest output /
             // prompt) are visible rather than the stale top.
-            let offset = (p.text.lines.len() as u16).saturating_sub(inner.height);
-            f.render_widget(Paragraph::new(p.text.clone()).scroll((offset, 0)), inner);
+            let offset = (p.text.lines.len() as u16).saturating_sub(content.height);
+            f.render_widget(Paragraph::new(p.text.clone()).scroll((offset, 0)), content);
         }
         None => {
             let msg = if sel.and_then(|s| s.pane.as_ref()).is_some() {
@@ -866,9 +923,23 @@ fn draw_preview(f: &mut Frame, area: Rect, app: &AppState) {
             };
             f.render_widget(
                 Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
-                inner,
+                content,
             );
         }
+    }
+
+    if let Some(input_rect) = input {
+        let line = Line::from(vec![
+            Span::styled(
+                "❯ ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(app.reply_buffer.clone()),
+            Span::styled("▏", Style::default().fg(Color::Yellow)),
+        ]);
+        f.render_widget(Paragraph::new(line), input_rect);
     }
 }
 
@@ -905,17 +976,9 @@ fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
         Span::raw("   "),
     ];
     spans.extend(header_status_spans(app, area.width));
-    if app.reply_active {
-        spans.push(Span::raw("   "));
-        spans.push(Span::styled(
-            format!("reply to {}: ", app.reply_target_label),
-            Style::default().fg(Color::DarkGray),
-        ));
-        spans.push(Span::styled(
-            format!("{}_", app.reply_buffer),
-            Style::default().fg(Color::Yellow),
-        ));
-    } else if app.rename_active {
+    // Reply no longer renders here (TRI-140): it shows in the preview panel
+    // when open, otherwise in the dedicated compose bar above the footer.
+    if app.rename_active {
         let cursor = "_";
         spans.push(Span::raw("   "));
         spans.push(Span::styled(
