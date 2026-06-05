@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/inkless/triage/compare/v0.2.0...v0.3.0) (2026-06-05)
+
+
+### Features
+
+* live preview rail (p, right/bottom) + l audit-log alias ([#3](https://github.com/inkless/triage/issues/3)) ([82a7a9b](https://github.com/inkless/triage/commit/82a7a9b812c68335abd4b3a676172d6cb1f60ae1))
+
+
+### Bug Fixes
+
+* drop Claude --bg-spare daemon sessions from discovery ([#2](https://github.com/inkless/triage/issues/2)) ([ab18f74](https://github.com/inkless/triage/commit/ab18f74eaf86a7a6317fdd94daf58d64f4ee915e))
+
 ## [0.2.0](https://github.com/inkless/triage/compare/v0.1.0...v0.2.0) (2026-06-04)
 
 
