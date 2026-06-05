@@ -726,9 +726,12 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
         draw_footer(f, chunks[2], app);
         return;
     }
+    // Resolve where the preview actually renders (vertical split preserves
+    // width, so f.area().width == the table region's width).
+    let (preview_right, preview_bottom) =
+        preview_layout(app.preview_open, app.preview_pos, f.area().width);
     // Bottom region height: detail pane, or a bottom-docked preview, else 0.
     // detail and preview are mutually exclusive so at most one is non-zero.
-    let preview_bottom = app.preview_open && app.preview_pos == PreviewPos::Bottom;
     let bottom_height = if app.detail_open {
         18
     } else if preview_bottom {
@@ -748,13 +751,8 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
 
     draw_header(f, chunks[0], app);
 
-    // Preview rail (TRI-138). Right: split the table region into a compact
-    // table | preview when the client is wide enough (mobile keeps the full
-    // table — a side rail can't fit). Bottom: full table here, preview docks in
-    // the bottom region below.
-    let preview_right = app.preview_open
-        && app.preview_pos == PreviewPos::Right
-        && chunks[1].width >= PREVIEW_MIN_TOTAL_WIDTH;
+    // Right: split the table region into a compact table | preview. Bottom
+    // (incl. the narrow-width fallback): full table here, preview docks below.
     if preview_right {
         let cols = Layout::default()
             .direction(Direction::Horizontal)
@@ -780,6 +778,22 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
 /// Minimum total table-region width before the right-docked preview rail is
 /// allowed to split off. Narrower clients (mobile) keep the full table.
 const PREVIEW_MIN_TOTAL_WIDTH: u16 = 100;
+
+/// Resolve `(render_right, render_bottom)` for the preview given the toggle,
+/// the user's dock preference, and the client width. A side rail can't fit
+/// under `PREVIEW_MIN_TOTAL_WIDTH`, so a right-docked preview falls back to the
+/// bottom there — that way `p` still works on mobile instead of silently
+/// showing nothing. At most one of the two is ever true.
+fn preview_layout(open: bool, pos: PreviewPos, width: u16) -> (bool, bool) {
+    if !open {
+        return (false, false);
+    }
+    match pos {
+        PreviewPos::Right if width >= PREVIEW_MIN_TOTAL_WIDTH => (true, false),
+        // Right but too narrow → fall back to bottom.
+        PreviewPos::Right | PreviewPos::Bottom => (false, true),
+    }
+}
 /// Fixed width of the compact identity table when the preview docks on the
 /// right — just enough for STATE/AGE/AI/SESSION; the preview takes the rest.
 const PREVIEW_RIGHT_TABLE_WIDTH: u16 = 42;
@@ -2344,6 +2358,23 @@ mod tests {
         app.toggle_preview();
         assert!(!app.preview_open);
         assert!(app.preview.is_none(), "closing the rail clears the capture");
+    }
+
+    #[test]
+    fn preview_layout_falls_back_to_bottom_on_narrow_clients() {
+        // Closed → nothing renders.
+        assert_eq!(
+            preview_layout(false, PreviewPos::Right, 200),
+            (false, false)
+        );
+        // Right on a wide client → right rail.
+        assert_eq!(preview_layout(true, PreviewPos::Right, 200), (true, false));
+        // Right on a narrow (mobile) client → falls back to bottom so `p`
+        // still does something instead of silently showing nothing.
+        assert_eq!(preview_layout(true, PreviewPos::Right, 80), (false, true));
+        // Bottom always docks bottom, wide or narrow.
+        assert_eq!(preview_layout(true, PreviewPos::Bottom, 200), (false, true));
+        assert_eq!(preview_layout(true, PreviewPos::Bottom, 80), (false, true));
     }
 
     #[test]
