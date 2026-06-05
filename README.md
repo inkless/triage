@@ -167,7 +167,7 @@ Filter & overlays:
                    in edit mode: type to filter · ↑↓ navigate · ⏎ jump to selection
                                  Esc clear · ^W delete word · ^U clear line
   R                rename selected row in triage only; ^U clears the old value while editing
-  H                open / close audit-log overlay (auto-mode decision history)
+  l                open / close audit-log overlay (auto-mode decision history); H also works
   $                open / close cost overlay (cross-session spend rollup)
 
 Overlay navigation (H / $):

@@ -2686,7 +2686,7 @@ fn draw_key_help(f: &mut Frame, area: Rect) {
             Span::styled("Views", Style::default().add_modifier(Modifier::BOLD)),
         ]),
         Line::from("  p preview pane (live)          > flip right/bottom"),
-        Line::from("  H audit log                    $ cost overlay"),
+        Line::from("  l audit log (or H)             $ cost overlay"),
         Line::from(""),
         Line::from(vec![
             Span::raw("  "),

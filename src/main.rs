@@ -144,7 +144,7 @@ instance in the current tmux session).
 In-TUI keybindings:
   ⏎ jump · a/d approve/deny · A toggle auto mode · p preview · > flip preview side
   P phone push · Space detail · r reply · m mute · w watch · * pin · R rename · N new agent · / filter
-  H audit log · $ cost overlay · ? keys · q quit
+  l audit log · $ cost overlay · ? keys · q quit
 
 Docs:
   README:      https://github.com/inkless/triage
@@ -569,7 +569,7 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         match code {
             KeyCode::Char('q') => return false,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
-            KeyCode::Char('H') | KeyCode::Esc => {
+            KeyCode::Char('l') | KeyCode::Char('H') | KeyCode::Esc => {
                 app.audit_log_open = false;
                 app.audit_log_offset = 0;
                 app.pending_g = false;
@@ -718,7 +718,9 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                 if app.phone_push_enabled { "ON" } else { "off" }
             ));
         }
-        KeyCode::Char('H') => {
+        // `l` = log (the easy primary); `H` = History (kept as an alias so
+        // existing muscle memory still works).
+        KeyCode::Char('l') | KeyCode::Char('H') => {
             app.toggle_audit_log();
             app.status_msg = Some(format!(
                 "audit log {}",
