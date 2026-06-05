@@ -147,6 +147,8 @@ General:
   gg / G           jump to top / bottom
   ⏎                jump to selected session's tmux pane
   space            toggle detail panel
+  p                toggle live preview of the selected pane — updates as you navigate
+  >                flip preview between right (compact table) and bottom (full table)
   ?                show all keybindings
   q / Ctrl-C       quit
 
@@ -154,7 +156,7 @@ Approve / deny / mute / watch:
   a                approve (selected session must be paused on a permission prompt)
   d                deny
   A                toggle autonomous mode (off → on)
-  p                toggle ntfy phone push (on by default; Mac banners unaffected)
+  P                toggle ntfy phone push (on by default; Mac banners unaffected)
   r                reply to selected agent with a one-line user message
   m                mute / unmute selected session
   w                watch / unwatch selected session — sticky; fires a "finished" banner on every work → done transition until toggled off
@@ -165,7 +167,7 @@ Filter & overlays:
                    in edit mode: type to filter · ↑↓ navigate · ⏎ jump to selection
                                  Esc clear · ^W delete word · ^U clear line
   R                rename selected row in triage only; ^U clears the old value while editing
-  H                open / close audit-log overlay (auto-mode decision history)
+  l                open / close audit-log overlay (auto-mode decision history); H also works
   $                open / close cost overlay (cross-session spend rollup)
 
 Overlay navigation (H / $):

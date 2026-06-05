@@ -16,10 +16,41 @@ use crate::models::{ApprovalMode, AttentionState, Provider, Session, session_dis
 use crate::persist::{self, AliasKey, MuteKey};
 use crate::transcript::DigestCache;
 
+/// Cached live capture of one tmux pane for the preview rail (TRI-138).
+/// `raw` is the `-e` ANSI capture; `text` is its parsed ratatui form. We keep
+/// `raw` so successive ticks can skip the (re)parse when the pane is unchanged.
+pub struct PanePreview {
+    pub pane_id: String,
+    pub raw: String,
+    pub text: Text<'static>,
+}
+
+/// Where the preview panel docks (TRI-138). Right pairs with a compact table
+/// (HEADLINE/CWD dropped, since the live pane replaces them); Bottom keeps the
+/// full-width table and docks the preview below it like the detail pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreviewPos {
+    #[default]
+    Right,
+    Bottom,
+}
+
 pub struct AppState {
     pub sessions: Vec<Session>,
     pub selected: TableState,
     pub detail_open: bool,
+    /// Live preview rail (TRI-138). Toggle with `p`; stays on across
+    /// navigation and retargets to the selected row's pane each tick.
+    /// Mutually exclusive with `detail_open` (different regions, but we keep
+    /// the layout to two zones at most).
+    pub preview_open: bool,
+    /// Most recent capture of the selected pane, or `None` when the rail is
+    /// open but the selected row has no tmux pane (→ placeholder) or nothing
+    /// has been captured yet.
+    pub preview: Option<PanePreview>,
+    /// Where the preview panel sits when open. `>` flips it. Right = beside a
+    /// compact table; Bottom = below the full-width table.
+    pub preview_pos: PreviewPos,
     pub status_msg: Option<String>,
     pub digest_cache: DigestCache,
     pub codex_cache: crate::codex::CodexDigestCache,
@@ -164,6 +195,9 @@ impl AppState {
             sessions: Vec::new(),
             selected: state,
             detail_open: false,
+            preview_open: false,
+            preview: None,
+            preview_pos: PreviewPos::default(),
             status_msg: None,
             digest_cache: DigestCache::new(),
             codex_cache: crate::codex::CodexDigestCache::new(),
@@ -272,6 +306,76 @@ impl AppState {
     pub fn toggle_phone_push(&mut self) {
         self.phone_push_enabled = !self.phone_push_enabled;
         self.persist_state();
+    }
+
+    /// Toggle the live preview rail (`p`). Mutually exclusive with the detail
+    /// pane. Ephemeral view state — not persisted. Clears the cached capture
+    /// on close so a re-open starts fresh.
+    pub fn toggle_preview(&mut self) {
+        self.preview_open = !self.preview_open;
+        if self.preview_open {
+            self.detail_open = false;
+        } else {
+            self.preview = None;
+        }
+    }
+
+    /// Flip the preview panel between right and bottom (`>`). No-op-ish when
+    /// the rail is closed (state still flips so it's remembered on re-open).
+    /// Returns the new position so the caller can surface it.
+    pub fn flip_preview_pos(&mut self) -> PreviewPos {
+        self.preview_pos = match self.preview_pos {
+            PreviewPos::Right => PreviewPos::Bottom,
+            PreviewPos::Bottom => PreviewPos::Right,
+        };
+        self.preview_pos
+    }
+
+    /// Toggle the detail pane (`Space`). Mutually exclusive with the preview
+    /// rail (closing the rail drops its cached capture).
+    pub fn toggle_detail(&mut self) {
+        self.detail_open = !self.detail_open;
+        if self.detail_open && self.preview_open {
+            self.preview_open = false;
+            self.preview = None;
+        }
+    }
+
+    /// Capture the selected row's pane for the preview rail. Returns quickly
+    /// when the rail is closed. The caller (main loop) handles throttling /
+    /// retarget timing; here we re-parse to ratatui `Text` only when the raw
+    /// capture actually changed, so a static pane costs one `capture-pane` and
+    /// no allocation per tick. Sets `preview = None` for paneless rows so the
+    /// renderer shows a placeholder.
+    pub fn capture_selected_preview(&mut self) {
+        if !self.preview_open {
+            return;
+        }
+        let Some(target) = self
+            .selected_session()
+            .and_then(|s| s.pane.as_ref())
+            .map(|p| (p.pane_id.clone(), p.target.clone()))
+        else {
+            self.preview = None;
+            return;
+        };
+        let (pane_id, pane_target) = target;
+        let Some(raw) = crate::tmux::capture_pane_visible_ansi(&pane_target) else {
+            return;
+        };
+        if let Some(prev) = &self.preview
+            && prev.pane_id == pane_id
+            && prev.raw == raw
+        {
+            return; // unchanged — keep the parsed Text, skip re-parse + redraw cost
+        }
+        let mut text =
+            ansi_to_tui::IntoText::into_text(&raw).unwrap_or_else(|_| Text::raw(raw.clone()));
+        // tmux captures the source pane's full visible screen, which usually
+        // ends in blank rows below the prompt. Drop them so "tail to the
+        // bottom" (draw_preview) lands on the last real line, not whitespace.
+        trim_trailing_blank_lines(&mut text);
+        self.preview = Some(PanePreview { pane_id, raw, text });
     }
 
     pub fn oldest_pending_uuid(&self) -> Option<String> {
@@ -626,22 +730,146 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
         draw_footer(f, chunks[2], app);
         return;
     }
+    // Resolve where the preview actually renders (vertical split preserves
+    // width, so f.area().width == the table region's width).
+    let (preview_right, preview_bottom) =
+        preview_layout(app.preview_open, app.preview_pos, f.area().width);
+    // Bottom region height: detail pane, or a bottom-docked preview, else 0.
+    // detail and preview are mutually exclusive so at most one is non-zero.
+    let bottom_height = if app.detail_open {
+        18
+    } else if preview_bottom {
+        bottom_preview_height(f.area().height)
+    } else {
+        0
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                                    // header
-            Constraint::Min(5),                                       // table
-            Constraint::Length(if app.detail_open { 18 } else { 0 }), // detail
-            Constraint::Length(1),                                    // footer
+            Constraint::Length(1),             // header
+            Constraint::Min(5),                // table
+            Constraint::Length(bottom_height), // detail or bottom preview
+            Constraint::Length(1),             // footer
         ])
         .split(f.area());
 
     draw_header(f, chunks[0], app);
-    draw_table(f, chunks[1], app, now);
+
+    // Right: split the table region into a compact table | preview. Bottom
+    // (incl. the narrow-width fallback): full table here, preview docks below.
+    if preview_right {
+        let cols = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Length(PREVIEW_RIGHT_TABLE_WIDTH),
+                Constraint::Min(0),
+            ])
+            .split(chunks[1]);
+        draw_table(f, cols[0], app, now, true); // compact — HEADLINE/CWD dropped
+        draw_preview(f, cols[1], app);
+    } else {
+        draw_table(f, chunks[1], app, now, false);
+    }
+
     if app.detail_open {
         draw_detail(f, chunks[2], app, now);
+    } else if preview_bottom {
+        draw_preview(f, chunks[2], app);
     }
     draw_footer(f, chunks[3], app);
+}
+
+/// Minimum total table-region width before the right-docked preview rail is
+/// allowed to split off. Narrower clients (mobile) keep the full table.
+const PREVIEW_MIN_TOTAL_WIDTH: u16 = 100;
+
+/// Resolve `(render_right, render_bottom)` for the preview given the toggle,
+/// the user's dock preference, and the client width. A side rail can't fit
+/// under `PREVIEW_MIN_TOTAL_WIDTH`, so a right-docked preview falls back to the
+/// bottom there — that way `p` still works on mobile instead of silently
+/// showing nothing. At most one of the two is ever true.
+fn preview_layout(open: bool, pos: PreviewPos, width: u16) -> (bool, bool) {
+    if !open {
+        return (false, false);
+    }
+    match pos {
+        PreviewPos::Right if width >= PREVIEW_MIN_TOTAL_WIDTH => (true, false),
+        // Right but too narrow → fall back to bottom.
+        PreviewPos::Right | PreviewPos::Bottom => (false, true),
+    }
+}
+/// Fixed width of the compact identity table when the preview docks on the
+/// right — just enough for STATE/AGE/AI/SESSION; the preview takes the rest.
+const PREVIEW_RIGHT_TABLE_WIDTH: u16 = 42;
+/// Rows the table keeps when a bottom-docked preview is open, so the preview
+/// can't crowd the list off-screen on short (mobile) clients.
+const PREVIEW_BOTTOM_MIN_TABLE_ROWS: u16 = 6;
+
+/// Height for a bottom-docked preview: ~60% of the frame so it's roomy on a
+/// desktop, but never so tall that the table drops below
+/// `PREVIEW_BOTTOM_MIN_TABLE_ROWS` (mobile-safe). `total_height` is the full
+/// frame height (header + table + preview + footer).
+fn bottom_preview_height(total_height: u16) -> u16 {
+    // header + footer + the table floor we must preserve.
+    let reserved = 2 + PREVIEW_BOTTOM_MIN_TABLE_ROWS;
+    let cap = total_height.saturating_sub(reserved);
+    let desired = total_height * 6 / 10;
+    desired.min(cap)
+}
+
+/// Trim trailing all-whitespace lines so tailing to the bottom lands on the
+/// last line with real content rather than the pane's blank filler rows.
+fn trim_trailing_blank_lines(text: &mut Text<'_>) {
+    while text
+        .lines
+        .last()
+        .is_some_and(|l| l.spans.iter().all(|s| s.content.trim().is_empty()))
+    {
+        text.lines.pop();
+    }
+}
+
+/// Live preview of the selected row's tmux pane (TRI-138), docked right or
+/// bottom. Renders the cached ANSI capture; lines wider than the panel are
+/// clipped at the right edge (Paragraph without wrap = truncate-right). Shows a
+/// placeholder when the selected row has no pane or hasn't been captured yet.
+fn draw_preview(f: &mut Frame, area: Rect, app: &AppState) {
+    let sel = app.selected_session();
+    let title = match sel {
+        Some(s) => {
+            let label = session_display_label(s);
+            let pane = s.pane.as_ref().map(|p| p.pane_id.as_str()).unwrap_or("—");
+            format!(" preview · {label} · {pane} ")
+        }
+        None => " preview ".to_string(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    match &app.preview {
+        Some(p) => {
+            // The capture is the source pane's full screen, usually taller than
+            // our panel. Tail it: scroll so the last lines (latest output /
+            // prompt) are visible rather than the stale top.
+            let offset = (p.text.lines.len() as u16).saturating_sub(inner.height);
+            f.render_widget(Paragraph::new(p.text.clone()).scroll((offset, 0)), inner);
+        }
+        None => {
+            let msg = if sel.and_then(|s| s.pane.as_ref()).is_some() {
+                "capturing…"
+            } else {
+                "no tmux pane for this session"
+            };
+            f.render_widget(
+                Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
+                inner,
+            );
+        }
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &AppState) {
@@ -719,7 +947,7 @@ fn header_status_spans(app: &AppState, width: u16) -> Vec<Span<'static>> {
     let mode = LayoutMode::from_width(width);
     let separator = match mode {
         LayoutMode::Narrow => " ",
-        LayoutMode::Medium | LayoutMode::Wide => " · ",
+        LayoutMode::Medium | LayoutMode::Wide | LayoutMode::Compact => " · ",
     };
     vec![
         Span::styled(
@@ -752,7 +980,7 @@ fn auto_mode_label_parts(autonomous: bool, in_flight: usize, width: u16) -> Stri
                     "AUTO on".to_string()
                 }
             }
-            LayoutMode::Wide => {
+            LayoutMode::Wide | LayoutMode::Compact => {
                 if in_flight > 0 {
                     format!(
                         "AUTO on · {in_flight} audit{}",
@@ -766,7 +994,7 @@ fn auto_mode_label_parts(autonomous: bool, in_flight: usize, width: u16) -> Stri
     } else {
         match mode {
             LayoutMode::Narrow => "A:off".to_string(),
-            LayoutMode::Medium | LayoutMode::Wide => "AUTO off".to_string(),
+            LayoutMode::Medium | LayoutMode::Wide | LayoutMode::Compact => "AUTO off".to_string(),
         }
     }
 }
@@ -815,6 +1043,9 @@ enum LayoutMode {
     Narrow,
     Medium,
     Wide,
+    /// Identity-only columns (STATE/AGE/AI/SESSION, no HEADLINE/CWD), used when
+    /// the preview rail docks on the right and the live pane replaces HEADLINE.
+    Compact,
 }
 
 impl LayoutMode {
@@ -829,16 +1060,39 @@ impl LayoutMode {
     }
 }
 
-fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime) {
+fn draw_table(f: &mut Frame, area: Rect, app: &mut AppState, now: SystemTime, compact: bool) {
     // Stash for the Enter handler's auto-zoom decision (see `should_zoom_on_jump`).
     // Set before borrowing `visible` from app to avoid an aliasing conflict.
     app.last_pane_width = area.width;
     let visible = app.visible();
     let selected_idx = app.selected.selected();
-    let layout = LayoutMode::from_width(area.width);
+    // `compact` (preview docked right) forces the identity-only column set
+    // regardless of width; otherwise pick the tier from the area width.
+    let layout = if compact {
+        LayoutMode::Compact
+    } else {
+        LayoutMode::from_width(area.width)
+    };
 
     // Fixed = sum of non-headline column widths + per-column gap (1) + highlight indent (2).
     let (fixed, widths, header_cells): (usize, Vec<Constraint>, Vec<Cell>) = match layout {
+        LayoutMode::Compact => (
+            // No HEADLINE column — the preview rail carries that. SESSION flexes
+            // to fill the fixed-width strip (PREVIEW_RIGHT_TABLE_WIDTH).
+            7 + 5 + 3 + 4 + 2,
+            vec![
+                Constraint::Length(7),
+                Constraint::Length(5),
+                Constraint::Length(3),
+                Constraint::Min(8),
+            ],
+            vec![
+                Cell::from("STATE"),
+                Cell::from("AGE"),
+                Cell::from("AI"),
+                Cell::from("SESSION"),
+            ],
+        ),
         LayoutMode::Narrow => (
             7 + 1 + 2,
             vec![Constraint::Length(7), Constraint::Min(20)],
@@ -1091,7 +1345,13 @@ fn build_row(
         _ => headline_raw,
     };
     let wrapped = wrap_text(&headline_raw, headline_width, 4);
-    let height = wrapped.len().max(1) as u16;
+    // Compact rows have no HEADLINE cell, so they're always a single line —
+    // don't let the (unrendered) wrapped headline inflate the row height.
+    let height = if layout == LayoutMode::Compact {
+        1
+    } else {
+        wrapped.len().max(1) as u16
+    };
     let mut headline_lines: Vec<Line> = wrapped.into_iter().map(Line::from).collect();
     // T-81: prepend a bold cyan ● on the first line of watched rows. Span
     // approach (vs string prefix) keeps the wrap correct and gives the
@@ -1157,6 +1417,12 @@ fn build_row(
     };
 
     let cells: Vec<Cell> = match layout {
+        LayoutMode::Compact => vec![
+            Cell::from(state_label).style(state_cell_style),
+            Cell::from(age).style(cwd_style),
+            Cell::from(provider_label).style(provider_style),
+            Cell::from(session_label).style(session_style),
+        ],
         LayoutMode::Narrow => vec![
             Cell::from(state_label).style(state_cell_style),
             Cell::from(Text::from(headline_lines)),
@@ -2097,6 +2363,104 @@ mod tests {
         assert_eq!(app.reply_target_label, "cc agent-triage");
         assert!(app.reply_buffer.is_empty());
     }
+
+    #[test]
+    fn preview_and_detail_are_mutually_exclusive() {
+        // Opening the preview rail closes the detail pane and vice versa
+        // (TRI-138) — they share the table region budget, so we never show
+        // both at once.
+        let mut app = AppState::new();
+        app.detail_open = true;
+
+        app.toggle_preview();
+        assert!(app.preview_open, "p opened the rail");
+        assert!(!app.detail_open, "opening preview closed detail");
+
+        app.toggle_detail();
+        assert!(app.detail_open, "Space opened detail");
+        assert!(!app.preview_open, "opening detail closed preview");
+    }
+
+    #[test]
+    fn toggling_preview_off_drops_the_cached_capture() {
+        let mut app = AppState::new();
+        app.toggle_preview();
+        app.preview = Some(PanePreview {
+            pane_id: "%42".to_string(),
+            raw: "hi".to_string(),
+            text: Text::raw("hi"),
+        });
+        app.toggle_preview();
+        assert!(!app.preview_open);
+        assert!(app.preview.is_none(), "closing the rail clears the capture");
+    }
+
+    #[test]
+    fn preview_layout_falls_back_to_bottom_on_narrow_clients() {
+        // Closed → nothing renders.
+        assert_eq!(
+            preview_layout(false, PreviewPos::Right, 200),
+            (false, false)
+        );
+        // Right on a wide client → right rail.
+        assert_eq!(preview_layout(true, PreviewPos::Right, 200), (true, false));
+        // Right on a narrow (mobile) client → falls back to bottom so `p`
+        // still does something instead of silently showing nothing.
+        assert_eq!(preview_layout(true, PreviewPos::Right, 80), (false, true));
+        // Bottom always docks bottom, wide or narrow.
+        assert_eq!(preview_layout(true, PreviewPos::Bottom, 200), (false, true));
+        assert_eq!(preview_layout(true, PreviewPos::Bottom, 80), (false, true));
+    }
+
+    #[test]
+    fn bottom_preview_height_is_roomy_but_keeps_table_on_short_screens() {
+        // Tall desktop: ~60% to the preview, table keeps the rest.
+        assert_eq!(bottom_preview_height(50), 30);
+        // Short (mobile) screen: capped so the table keeps its floor.
+        // reserved = 2 + 6 = 8, so cap = 20 - 8 = 12 (< 60% = 12 here they tie).
+        assert_eq!(bottom_preview_height(20), 12);
+        // Very short: cap dominates, never steals the table's floor rows.
+        assert_eq!(bottom_preview_height(12), 4);
+        assert_eq!(bottom_preview_height(8), 0);
+    }
+
+    #[test]
+    fn trim_trailing_blank_lines_drops_only_trailing_whitespace() {
+        let mut text = Text::from(vec![
+            Line::from("top"),
+            Line::from(""),
+            Line::from("> prompt"),
+            Line::from("   "),
+            Line::from(""),
+        ]);
+        trim_trailing_blank_lines(&mut text);
+        assert_eq!(
+            text.lines.len(),
+            3,
+            "trailing blanks dropped, interior kept"
+        );
+        assert_eq!(text.lines.last().unwrap().spans[0].content, "> prompt");
+    }
+
+    #[test]
+    fn flip_preview_pos_toggles_right_and_bottom() {
+        let mut app = AppState::new();
+        assert_eq!(app.preview_pos, PreviewPos::Right, "defaults to right");
+        assert_eq!(app.flip_preview_pos(), PreviewPos::Bottom);
+        assert_eq!(app.flip_preview_pos(), PreviewPos::Right);
+    }
+
+    #[test]
+    fn ansi_capture_parses_to_styled_text() {
+        // Sanity that the `-e` capture → ansi-to-tui wiring yields styled
+        // spans, not a single raw blob. A red "hi" SGR sequence should parse
+        // to a line whose span carries a foreground color.
+        let raw = "\x1b[31mhi\x1b[0m";
+        let text = ansi_to_tui::IntoText::into_text(&raw).expect("parses");
+        let span = &text.lines[0].spans[0];
+        assert_eq!(span.content, "hi");
+        assert_eq!(span.style.fg, Some(Color::Red));
+    }
 }
 
 fn draw_cost_overlay(f: &mut Frame, area: Rect, app: &mut AppState) {
@@ -2409,7 +2773,7 @@ fn draw_key_help(f: &mut Frame, area: Rect) {
                 Style::default().add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from("  A auto mode                    p phone push     m mute"),
+        Line::from("  A auto mode                    P phone push     m mute"),
         Line::from("  w watch                        * pin to top     R rename"),
         Line::from("  N new agent"),
         Line::from(""),
@@ -2417,7 +2781,8 @@ fn draw_key_help(f: &mut Frame, area: Rect) {
             Span::raw("  "),
             Span::styled("Views", Style::default().add_modifier(Modifier::BOLD)),
         ]),
-        Line::from("  H audit log                    $ cost overlay"),
+        Line::from("  p preview pane (live)          > flip right/bottom"),
+        Line::from("  l audit log (or H)             $ cost overlay"),
         Line::from(""),
         Line::from(vec![
             Span::raw("  "),
@@ -2561,7 +2926,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         let hint = match LayoutMode::from_width(area.width) {
             LayoutMode::Narrow => " ⏎ r a/d / ? q".to_string(),
             LayoutMode::Medium => " ⏎ jump  r reply  a/d approve  / filter  ? keys  q".to_string(),
-            LayoutMode::Wide => {
+            LayoutMode::Wide | LayoutMode::Compact => {
                 "  ⏎ jump  r reply  a/d approve  / filter  ? keys  q quit".to_string()
             }
         };

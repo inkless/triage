@@ -37,6 +37,11 @@ const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// iteration, blocking key handling. The configured refresh-interval still
 /// applies as the upper bound when nothing is changing.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
+/// Preview-rail re-capture interval for the *same* pane (TRI-138). Selection
+/// changes retarget immediately; this just bounds the live-refresh of a pane
+/// you're already hovering. 250ms (~4fps) reads as live for watching a pane and
+/// costs one `capture-pane` per interval for a single pane.
+const PREVIEW_REFRESH: Duration = Duration::from_millis(250);
 
 /// Top-level CLI. A bare `triage` (no subcommand, no mode flag) launches the
 /// TUI; everything else is a one-shot. The mode flags are kept as flags (rather
@@ -137,9 +142,9 @@ With no subcommand, triage launches the TUI (or silent-attaches to a running
 instance in the current tmux session).
 
 In-TUI keybindings:
-  ⏎ jump · a/d approve/deny · A toggle auto mode
-  p toggle phone push · r reply · m mute · w watch · * pin · R rename · N new agent · / filter
-  H audit log · $ cost overlay · ? keys · q quit
+  ⏎ jump · a/d approve/deny · A toggle auto mode · p preview · > flip preview side
+  P phone push · Space detail · r reply · m mute · w watch · * pin · R rename · N new agent · / filter
+  l audit log · $ cost overlay · ? keys · q quit
 
 Docs:
   README:      https://github.com/inkless/triage
@@ -296,9 +301,28 @@ fn run(
 
     refresh(&mut app);
     let mut last_refresh = Instant::now();
+    // Preview-rail capture cadence (TRI-138): retarget instantly when the
+    // selected pane changes, otherwise re-capture the same pane at most every
+    // PREVIEW_REFRESH. Keeps holding `j`/`k` from firing a capture per repeat.
+    let mut last_preview = Instant::now();
+    let mut last_preview_pane: Option<String> = None;
 
     loop {
         let now = SystemTime::now();
+        if app.preview_open {
+            let target = app
+                .selected_session()
+                .and_then(|s| s.pane.as_ref())
+                .map(|p| p.pane_id.clone());
+            let retargeted = target != last_preview_pane;
+            if retargeted || last_preview.elapsed() >= PREVIEW_REFRESH {
+                app.capture_selected_preview();
+                last_preview = Instant::now();
+                last_preview_pane = target;
+            }
+        } else if last_preview_pane.is_some() {
+            last_preview_pane = None;
+        }
         terminal.draw(|f| draw(f, &mut app, now))?;
 
         if event::poll(TICK_INTERVAL)? {
@@ -545,7 +569,7 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         match code {
             KeyCode::Char('q') => return false,
             KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
-            KeyCode::Char('H') | KeyCode::Esc => {
+            KeyCode::Char('l') | KeyCode::Char('H') | KeyCode::Esc => {
                 app.audit_log_open = false;
                 app.audit_log_offset = 0;
                 app.pending_g = false;
@@ -622,7 +646,24 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
             app.key_help_open = true;
             app.status_msg = None;
         }
-        KeyCode::Char(' ') => app.detail_open = !app.detail_open,
+        KeyCode::Char(' ') => app.toggle_detail(),
+        KeyCode::Char('p') => {
+            app.toggle_preview();
+            app.status_msg = Some(format!(
+                "preview {}",
+                if app.preview_open { "on" } else { "off" }
+            ));
+        }
+        KeyCode::Char('>') if app.preview_open => {
+            let pos = app.flip_preview_pos();
+            app.status_msg = Some(format!(
+                "preview: {}",
+                match pos {
+                    ui::PreviewPos::Right => "right",
+                    ui::PreviewPos::Bottom => "bottom",
+                }
+            ));
+        }
         KeyCode::Char('m') => {
             app.toggle_mute_selected();
         }
@@ -670,14 +711,16 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
                 if app.autonomous { "ON" } else { "off" }
             ));
         }
-        KeyCode::Char('p') => {
+        KeyCode::Char('P') => {
             app.toggle_phone_push();
             app.status_msg = Some(format!(
                 "phone push: {}",
                 if app.phone_push_enabled { "ON" } else { "off" }
             ));
         }
-        KeyCode::Char('H') => {
+        // `l` = log (the easy primary); `H` = History (kept as an alias so
+        // existing muscle memory still works).
+        KeyCode::Char('l') | KeyCode::Char('H') => {
             app.toggle_audit_log();
             app.status_msg = Some(format!(
                 "audit log {}",
