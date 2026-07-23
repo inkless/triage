@@ -48,11 +48,26 @@ pub fn discover_sessions_with_panes(
 
     digest_cache.evict_missing();
     codex_cache.evict_missing();
+    prefer_tmux_window_names(&mut sessions);
     ui::apply_aliases_to_sessions(&mut sessions, aliases);
 
     dedup_sessions_by_pane(&mut sessions);
 
     sessions
+}
+
+fn prefer_tmux_window_names(sessions: &mut [Session]) {
+    for session in sessions {
+        let Some(window_name) = session.pane.as_ref().and_then(useful_window_name) else {
+            continue;
+        };
+        let has_explicit_claude_name = session.provider == Provider::Claude
+            && session.name.is_some()
+            && !session.name_is_derived;
+        if !has_explicit_claude_name {
+            session.name = Some(window_name);
+        }
+    }
 }
 
 /// Collapse sessions that resolve to the same tmux pane down to one. A pane
@@ -280,6 +295,78 @@ mod tests {
         let mut sessions = vec![a, b, c];
         dedup_sessions_by_pane(&mut sessions);
         assert_eq!(sessions.len(), 3);
+    }
+
+    #[test]
+    fn task_window_name_overrides_stale_claude_name() {
+        let mut session = claude_session("/repo/ux", Some("ux-ab"), None);
+        session.name_is_derived = true;
+        session.pane = Some(pane(99658, "%38", "/repo/ux", "claude", "agent-MM-9"));
+
+        prefer_tmux_window_names(std::slice::from_mut(&mut session));
+
+        assert_eq!(session.name.as_deref(), Some("agent-MM-9"));
+    }
+
+    #[test]
+    fn explicit_claude_name_overrides_task_window_name() {
+        let mut session = claude_session("/repo/ux", Some("fingerprint-research"), None);
+        session.pane = Some(pane(99658, "%38", "/repo/ux", "claude", "agent-MM-9"));
+
+        prefer_tmux_window_names(std::slice::from_mut(&mut session));
+
+        assert_eq!(session.name.as_deref(), Some("fingerprint-research"));
+    }
+
+    #[test]
+    fn useful_window_name_overrides_derived_claude_name() {
+        let mut session = claude_session("/repo/ux", Some("ux-f8"), None);
+        session.name_is_derived = true;
+        session.pane = Some(pane(99658, "%89", "/repo/ux", "claude", "MM-manager"));
+
+        prefer_tmux_window_names(std::slice::from_mut(&mut session));
+
+        assert_eq!(session.name.as_deref(), Some("MM-manager"));
+    }
+
+    #[test]
+    fn useful_window_name_overrides_prompt_derived_codex_title() {
+        let mut session = Session::new(
+            Provider::Codex,
+            99658,
+            "sid".to_string(),
+            PathBuf::from("/repo/triage"),
+            Some("$mb-work triage looks the session name logic".to_string()),
+            "busy".to_string(),
+            0,
+            0,
+            None,
+        );
+        session.pane = Some(pane(99658, "%48", "/repo/triage", "codex", "triage"));
+
+        prefer_tmux_window_names(std::slice::from_mut(&mut session));
+
+        assert_eq!(session.name.as_deref(), Some("triage"));
+    }
+
+    #[test]
+    fn generic_window_name_does_not_override_codex_title() {
+        let mut session = Session::new(
+            Provider::Codex,
+            99658,
+            "sid".to_string(),
+            PathBuf::from("/repo/snowflake"),
+            Some("user-portal-analysis".to_string()),
+            "idle".to_string(),
+            0,
+            0,
+            None,
+        );
+        session.pane = Some(pane(99658, "%76", "/repo/snowflake", "codex", "nvim"));
+
+        prefer_tmux_window_names(std::slice::from_mut(&mut session));
+
+        assert_eq!(session.name.as_deref(), Some("user-portal-analysis"));
     }
 
     #[test]

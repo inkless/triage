@@ -13,6 +13,8 @@ struct RawSession {
     cwd: String,
     #[serde(default)]
     name: Option<String>,
+    #[serde(rename = "nameSource", default)]
+    name_source: Option<String>,
     #[serde(default)]
     status: Option<String>,
     #[serde(rename = "startedAt", default)]
@@ -79,6 +81,7 @@ fn raw_to_session(raw: RawSession) -> Option<Session> {
     if raw.name.as_deref() == Some(crate::auditor::AUDITOR_NAME) {
         return None;
     }
+    let name_is_derived = raw.name_source.as_deref() == Some("derived");
     let mut session = Session::new(
         Provider::Claude,
         raw.pid,
@@ -90,6 +93,7 @@ fn raw_to_session(raw: RawSession) -> Option<Session> {
         raw.updated_at,
         raw.waiting_for,
     );
+    session.name_is_derived = name_is_derived;
     session.cli_version = raw.version;
     Some(session)
 }
@@ -143,14 +147,17 @@ mod tests {
     #[test]
     fn keeps_interactive_and_kindless_sessions() {
         let interactive = raw(r#"{"pid":12919,"sessionId":"02c00b0b","cwd":"/repo/ux",
-                "name":"agent-UAC-24","status":"idle","kind":"interactive"}"#);
+                "name":"agent-UAC-24","nameSource":"derived","status":"idle",
+                "kind":"interactive"}"#);
         let session = raw_to_session(interactive).expect("interactive kept");
         assert_eq!(session.pid, 12919);
+        assert!(session.name_is_derived);
 
         // Older Claude session JSONs predate the `kind` field — absent kind
         // must default to "keep", not silently drop every session.
         let kindless = raw(r#"{"pid":777,"sessionId":"old","cwd":"/repo/ux","name":"legacy"}"#);
-        assert!(raw_to_session(kindless).is_some());
+        let session = raw_to_session(kindless).expect("kindless kept");
+        assert!(!session.name_is_derived);
     }
 
     #[test]
