@@ -952,38 +952,28 @@ fn refresh(app: &mut AppState) {
 
     snapshot::sort_sessions(&mut sessions);
 
-    // Fire macOS notifications when a session enters an actionable state for
-    // the first time we've seen this pid. "Actionable" means Claude itself is
-    // waiting on the user (`Blocked`) or the last stop hook errored. Pending
-    // hook files alone are not actionable because PreToolUse also fires for
-    // auto-approved tool calls.
+    // Fire notifications when a session transitions into an actionable state.
+    // The first refresh only establishes a baseline so restarting triage does
+    // not replay alerts for sessions that were already Blocked or Error.
+    //
+    // A Blocked transition with an auditor actually in flight is deferred:
+    // APPROVE/DENY need no user action, while WAIT (including audit/routing
+    // failure) emits the full alert from `drive_autonomous`. If auto mode
+    // cannot start an audit because there is no captured request, alert now.
     for s in &sessions {
         if s.muted {
             continue;
         }
-        let is_actionable = matches!(
+        let auto_audit_in_flight = app.audit_in_flight.contains_key(&s.pid);
+        if !should_alert_actionable_transition(
+            app.notifications_armed,
             s.state,
-            models::AttentionState::Blocked | models::AttentionState::Error
-        );
-        if !is_actionable {
+            app.last_states.get(&s.pid).copied(),
+            auto_audit_in_flight,
+        ) {
             continue;
         }
-        let prev = app.last_states.get(&s.pid).copied();
-        if prev == Some(s.state) {
-            continue;
-        }
-        // Defer phone push for Blocked transitions when auto-mode is on:
-        // the auditor will likely route the prompt without user action,
-        // and a phone buzz that resolves itself a few seconds later is
-        // noise. Phone push fires later only if the auditor returns WAIT
-        // (see `drive_autonomous` verdict drain). Error transitions still
-        // fire phone immediately — no auditor involvement on Error.
-        // Also gated on the user-level `phone_push_enabled` toggle (T-79):
-        // when off, never POST to ntfy regardless of state. Mac local
-        // banner still fires from `notify_os::alert` unchanged.
-        let phone_push =
-            app.phone_push_enabled && !(app.autonomous && is_auto_auditable_blocked(s));
-        notify_os::alert(s, &app.config, phone_push);
+        notify_os::alert(s, &app.config, app.phone_push_enabled);
     }
     // T-81 watch fire: any watched session that just transitioned into
     // `JustFinished` gets a "finished" banner (Mac local + ntfy gated on the
@@ -1003,10 +993,31 @@ fn refresh(app: &mut AppState) {
         notify_os::notify_session_done(s, &app.config, app.phone_push_enabled);
     }
     app.last_states = sessions.iter().map(|s| (s.pid, s.state)).collect();
+    app.notifications_armed = true;
 
     app.sessions = sessions;
     app.clamp_selection();
     app.status_msg = None;
+}
+
+fn should_alert_actionable_transition(
+    notifications_armed: bool,
+    state: models::AttentionState,
+    previous: Option<models::AttentionState>,
+    auto_audit_in_flight: bool,
+) -> bool {
+    if !notifications_armed || previous == Some(state) {
+        return false;
+    }
+    match state {
+        models::AttentionState::Error => true,
+        models::AttentionState::Blocked => !auto_audit_in_flight,
+        _ => false,
+    }
+}
+
+fn audit_verdict_needs_attention(decision: &str) -> bool {
+    decision == "WAIT"
 }
 
 fn is_auto_auditable_blocked(s: &models::Session) -> bool {
@@ -1139,14 +1150,12 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
             "auditor {}: pid {} ({})",
             v.decision, v.pid, v.tool_name
         ));
-        // Phone push for the WAIT verdict — this is the case the user
-        // actually needs to act on. APPROVE/DENY were handled by the
-        // auditor's hook routing, so a phone buzz would be noise. The
-        // original `notify_os::alert` call from refresh() already fired
-        // the desktop notification with `phone_push=false`; this is the
-        // deferred phone fan-out.
-        if v.decision == "WAIT" && app.phone_push_enabled {
-            notify_os::push_to_phone(s, &app.config);
+        // WAIT is the first point where this prompt actually needs the user.
+        // Audit subprocess failures and APPROVE/DENY routing failures are
+        // normalized to WAIT, so they take the same desktop + optional phone
+        // path. APPROVE/DENY remain silent.
+        if audit_verdict_needs_attention(&v.decision) {
+            notify_os::alert(s, &app.config, app.phone_push_enabled);
         }
     }
 
@@ -1351,7 +1360,8 @@ fn jump_to_selected(app: &mut AppState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command};
+    use super::{Cli, Command, audit_verdict_needs_attention, should_alert_actionable_transition};
+    use crate::models::AttentionState;
     use clap::{CommandFactory, Parser};
 
     fn parse(parts: &[&str]) -> Result<Cli, clap::Error> {
@@ -1426,5 +1436,72 @@ mod tests {
         assert!(parse(&["--jump-to-self", "--zoom"]).is_ok());
         assert!(parse(&["--install-hooks", "--dry-run"]).is_ok());
         assert!(parse(&["--uninstall-hooks", "--dry-run"]).is_ok());
+    }
+
+    #[test]
+    fn actionable_notifications_are_silent_during_startup_baseline() {
+        assert!(!should_alert_actionable_transition(
+            false,
+            AttentionState::Blocked,
+            None,
+            false,
+        ));
+        assert!(!should_alert_actionable_transition(
+            false,
+            AttentionState::Error,
+            None,
+            false,
+        ));
+    }
+
+    #[test]
+    fn actionable_notifications_fire_once_for_unhandled_transitions() {
+        assert!(should_alert_actionable_transition(
+            true,
+            AttentionState::Blocked,
+            Some(AttentionState::Working),
+            false,
+        ));
+        assert!(should_alert_actionable_transition(
+            true,
+            AttentionState::Error,
+            Some(AttentionState::Working),
+            false,
+        ));
+        assert!(!should_alert_actionable_transition(
+            true,
+            AttentionState::Blocked,
+            Some(AttentionState::Blocked),
+            false,
+        ));
+        assert!(!should_alert_actionable_transition(
+            true,
+            AttentionState::Working,
+            Some(AttentionState::Blocked),
+            false,
+        ));
+    }
+
+    #[test]
+    fn auto_audit_defers_blocked_but_not_error_notifications() {
+        assert!(!should_alert_actionable_transition(
+            true,
+            AttentionState::Blocked,
+            Some(AttentionState::Working),
+            true,
+        ));
+        assert!(should_alert_actionable_transition(
+            true,
+            AttentionState::Error,
+            Some(AttentionState::Working),
+            true,
+        ));
+    }
+
+    #[test]
+    fn only_wait_verdicts_need_user_attention() {
+        assert!(!audit_verdict_needs_attention("APPROVE"));
+        assert!(!audit_verdict_needs_attention("DENY"));
+        assert!(audit_verdict_needs_attention("WAIT"));
     }
 }

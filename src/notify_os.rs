@@ -28,9 +28,7 @@ pub fn alert(session: &Session, cfg: &Config, phone_push: bool) {
     // Phone push (ntfy). Body deliberately minimal — `<label> · <state>` —
     // so the publish target (whoever can read the topic) doesn't see prompt
     // contents. See specs/notify-self-host.md. Suppressed when `phone_push`
-    // is false — caller (refresh) sets this to defer Blocked transitions
-    // through the auditor when auto-mode is on; phone fires later only on
-    // a `WAIT` verdict via `push_to_phone`.
+    // is false — the caller owns the runtime phone-toggle policy.
     if phone_push && let Some(ntfy) = cfg.ntfy.as_ref() {
         ntfy_push(ntfy, &label, title);
     }
@@ -77,23 +75,6 @@ pub fn notify_session_done(session: &Session, cfg: &Config, phone_push: bool) {
         return;
     }
     send_via_osascript(title, &label, &preview);
-}
-
-/// Phone-only push. Used by the auto-mode WAIT path: triage deferred the
-/// phone push when the session went Blocked under auto-mode (the auditor
-/// might've handled it silently); now that the verdict is WAIT, surface the
-/// session to the phone. Desktop notification has already fired from the
-/// original `alert()` call.
-pub fn push_to_phone(session: &Session, cfg: &Config) {
-    let title = match session.state {
-        AttentionState::Blocked => "needs your input",
-        AttentionState::Error => "error",
-        _ => return,
-    };
-    let label = session_label(session);
-    if let Some(ntfy) = cfg.ntfy.as_ref() {
-        ntfy_push(ntfy, &label, title);
-    }
 }
 
 fn session_label(session: &Session) -> String {
