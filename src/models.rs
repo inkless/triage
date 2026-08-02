@@ -57,6 +57,9 @@ pub struct Session {
     pub alias_session_id: Option<String>,
     pub cwd: PathBuf,
     pub name: Option<String>,
+    /// Claude marks its default generated name as `derived`. An absent marker
+    /// means the name came from `--name` or `/rename` and should stay primary.
+    pub name_is_derived: bool,
     pub status: String,
     /// `waitingFor` from sessions JSON — populated when `status == "waiting"`
     /// (e.g. `"approve Bash"`). This is Claude Code's own canonical signal that
@@ -160,6 +163,7 @@ impl Session {
             alias_session_id: None,
             cwd,
             name,
+            name_is_derived: false,
             status,
             waiting_for,
             cli_version: None,

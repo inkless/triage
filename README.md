@@ -239,6 +239,12 @@ When on, each refresh spawns `claude -p --model claude-sonnet-4-6 --tools "" --n
 - `APPROVE` / `DENY` route through the same machinery as manual `a`/`d` (Claude hook decision file when available, tmux send-keys fallback; Codex visible-prompt routing).
 - `WAIT` surfaces the reason in the detail pane and leaves the prompt for human review.
 
+Notifications are deferred while an audit is actually running. `APPROVE` and
+`DENY` stay quiet; `WAIT` (including auditor or routing failures) sends a
+desktop banner plus phone push when enabled. A Blocked session with no
+auditable request alerts immediately, as do Error transitions. Starting or
+restarting triage silently baselines existing rows instead of replaying alerts.
+
 Decisions append to `~/.config/triage/auto-decisions.jsonl` (one JSON object per line, includes cost + duration). Press `l` (or `H`) for the audit-history overlay.
 
 **Safety**: the prompt explicitly approves routine repo work (Read/Glob/Grep, builds, tests, git ops, `gh pr create/edit`, file edits in the repo) and denies destructive actions (`rm -rf`, force-push to main, dropping data, `sudo`, shared-infrastructure writes). It WAITs when the action itself is in a middle zone — unfamiliar API, unreadable Bash flags, paths outside the repo. Customize via `~/.config/triage/auditor-prompt.md` (or `$TRIAGE_AUDITOR_PROMPT_FILE`).

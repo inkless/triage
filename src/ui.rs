@@ -75,6 +75,10 @@ pub struct AppState {
     /// (e.g. into `Blocked`) so we can fire a desktop notification once per
     /// transition rather than on every refresh while the session stays blocked.
     pub last_states: HashMap<u32, AttentionState>,
+    /// False until the first discovery refresh has established a state
+    /// baseline. Prevents restarting triage from replaying notifications for
+    /// sessions that were already Blocked or Error before the TUI launched.
+    pub notifications_armed: bool,
     /// Which mechanism Claude `a`/`d` use to deliver an approval. Configured
     /// via `[approval].mode`; Codex approvals always use the tmux path.
     pub approval_mode: ApprovalMode,
@@ -206,6 +210,7 @@ impl AppState {
             pinned,
             watched: HashSet::new(),
             last_states: HashMap::new(),
+            notifications_armed: false,
             approval_mode: ApprovalMode::default(),
             autonomous: loaded.autonomous,
             phone_push_enabled: loaded.phone_push_enabled,
