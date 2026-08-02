@@ -105,8 +105,7 @@ pub fn pid_alive(pid: u32) -> bool {
         if r == 0 {
             return true;
         }
-        let err = *libc::__error();
-        err == libc::EPERM
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
     }
 }
 
