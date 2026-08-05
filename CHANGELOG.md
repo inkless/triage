@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.4.1](https://github.com/inkless/triage/compare/v0.4.0...v0.4.1) (2026-08-02)
+
+
+### Bug Fixes
+
+* linux errors ([2127f45](https://github.com/inkless/triage/commit/2127f451e444512481bfff390ee81890ef6ddeca))
+* **sessions:** prefer useful labels and defer auto alerts ([#7](https://github.com/inkless/triage/issues/7)) ([fb819bc](https://github.com/inkless/triage/commit/fb819bc9e5e44bc2e83521ae04fe58cd838818c4))
+
 ## [0.4.0](https://github.com/inkless/triage/compare/v0.3.0...v0.4.0) (2026-06-05)
 
 
