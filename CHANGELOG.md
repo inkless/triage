@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.2](https://github.com/inkless/triage/compare/v0.4.1...v0.4.2) (2026-08-05)
+
+
+### Bug Fixes
+
+* honor fresh busy session metadata ([#9](https://github.com/inkless/triage/issues/9)) ([9bf31ce](https://github.com/inkless/triage/commit/9bf31ce49c65163820fe5124fc7b65d1dc6cc098))
+
 ## [0.4.1](https://github.com/inkless/triage/compare/v0.4.0...v0.4.1) (2026-08-02)
 
 
