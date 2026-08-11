@@ -1034,12 +1034,21 @@ fn audit_payload_for_session(s: &models::Session) -> Option<(String, String)> {
     }
 }
 
+fn is_auto_auditable_claude_tool(tool_name: &str) -> bool {
+    // User-choice prompts are semantic decisions, not permission requests.
+    // Auto-selecting even the currently highlighted option can change scope.
+    tool_name != "AskUserQuestion"
+}
+
 fn audit_payload_for_claude(s: &models::Session) -> Option<(String, String)> {
     // Prefer hook-captured (richer, structured, FULL untruncated input).
     // When the hook didn't fire (timed out for a stale Blocked, or the
     // session is in `permission_mode=auto` so the hook bailed), do a fresh
     // pane capture and parse the full pending command, not the UI brief.
     if let Some(a) = s.pending_approvals.first() {
+        if !is_auto_auditable_claude_tool(&a.tool_name) {
+            return None;
+        }
         return Some((a.tool_name.clone(), a.tool_input_full.clone()));
     }
     if let Some(pane) = &s.pane
@@ -1057,10 +1066,14 @@ fn audit_payload_for_claude(s: &models::Session) -> Option<(String, String)> {
                     .map(String::from)
             })
             .unwrap_or_else(|| "?".to_string());
+        if !is_auto_auditable_claude_tool(&tool_name) {
+            return None;
+        }
         return Some((tool_name, full_input));
     }
     s.last_tool_use
         .as_ref()
+        .filter(|(name, _)| is_auto_auditable_claude_tool(name))
         .map(|(name, brief)| (name.clone(), brief.clone()))
 }
 
@@ -1360,9 +1373,15 @@ fn jump_to_selected(app: &mut AppState) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, audit_verdict_needs_attention, should_alert_actionable_transition};
-    use crate::models::AttentionState;
+    use super::{
+        Cli, Command, audit_payload_for_claude, audit_verdict_needs_attention,
+        is_auto_auditable_claude_tool, should_alert_actionable_transition,
+    };
+    use crate::approval::PendingApproval;
+    use crate::models::{AttentionState, Provider, Session};
     use clap::{CommandFactory, Parser};
+    use std::path::PathBuf;
+    use std::time::SystemTime;
 
     fn parse(parts: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("triage").chain(parts.iter().copied()))
@@ -1503,5 +1522,42 @@ mod tests {
         assert!(!audit_verdict_needs_attention("APPROVE"));
         assert!(!audit_verdict_needs_attention("DENY"));
         assert!(audit_verdict_needs_attention("WAIT"));
+    }
+
+    #[test]
+    fn user_choice_prompts_are_never_auto_audited() {
+        assert!(!is_auto_auditable_claude_tool("AskUserQuestion"));
+        assert!(is_auto_auditable_claude_tool("Bash"));
+        assert!(is_auto_auditable_claude_tool("Edit"));
+
+        let mut session = Session::new(
+            Provider::Claude,
+            123,
+            "session".to_string(),
+            PathBuf::from("/repo"),
+            None,
+            "waiting".to_string(),
+            1,
+            2,
+            Some("approve AskUserQuestion".to_string()),
+        );
+        session.pending_approvals.push(PendingApproval {
+            uuid: "choice".to_string(),
+            session_id: "session".to_string(),
+            cwd: PathBuf::from("/repo"),
+            tool_name: "AskUserQuestion".to_string(),
+            tool_input_brief: "Pick one".to_string(),
+            tool_input_full: r#"{"questions":[]}"#.to_string(),
+            created_at: SystemTime::now(),
+            pending_path: PathBuf::from("/tmp/choice.json"),
+        });
+
+        assert_eq!(audit_payload_for_claude(&session), None);
+
+        session.pending_approvals[0].tool_name = "Bash".to_string();
+        assert_eq!(
+            audit_payload_for_claude(&session),
+            Some(("Bash".to_string(), r#"{"questions":[]}"#.to_string()))
+        );
     }
 }
