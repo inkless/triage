@@ -818,7 +818,7 @@ fn deliver_approve(app: &AppState) -> String {
     }
     let target = app
         .selected_session()
-        .filter(|s| s.status == "waiting")
+        .filter(|s| s.status == "waiting" || s.pane_blocked)
         .and_then(|s| s.pane.as_ref().map(|p| p.target.clone()));
     let Some(t) = target else {
         return "session not at a prompt (or no pane)".to_string();
@@ -853,7 +853,7 @@ fn deliver_deny(app: &AppState) -> String {
     }
     let target = app
         .selected_session()
-        .filter(|s| s.status == "waiting")
+        .filter(|s| s.status == "waiting" || s.pane_blocked)
         .and_then(|s| s.pane.as_ref().map(|p| p.target.clone()));
     let Some(t) = target else {
         return "session not at a prompt (or no pane)".to_string();

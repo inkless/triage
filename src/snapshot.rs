@@ -191,17 +191,16 @@ fn enrich_permission_prompts(sessions: &mut [Session]) {
 }
 
 fn scan_blocked_panes(sessions: &mut [Session]) {
-    for s in sessions.iter_mut() {
-        if s.provider == Provider::Claude
-            && s.status == "busy"
-            && s.pending_approvals.is_empty()
-            && let Some(pane) = &s.pane
-            && let Some(content) = tmux::capture_pane_tail(&pane.target, 15)
-            && tmux::has_pending_permission_prompt(&content)
-        {
-            s.pane_blocked = true;
-        }
-    }
+    let mut seen_targets = HashSet::new();
+    let claude_targets = sessions
+        .iter()
+        .filter(|s| should_scan_claude_pane(s))
+        .filter_map(|s| s.pane.as_ref().map(|pane| pane.target.clone()))
+        .filter(|target| seen_targets.insert(target.clone()))
+        .collect::<Vec<_>>();
+    let claude_captures = tmux::capture_pane_tails(&claude_targets, 15);
+
+    apply_claude_pane_captures(sessions, &claude_captures);
 
     for s in sessions {
         if s.provider == Provider::Codex
@@ -214,6 +213,24 @@ fn scan_blocked_panes(sessions: &mut [Session]) {
             s.pane_blocked = true;
         }
     }
+}
+
+fn apply_claude_pane_captures(sessions: &mut [Session], captures: &HashMap<String, String>) {
+    for s in sessions.iter_mut().filter(|s| should_scan_claude_pane(s)) {
+        if let Some(pane) = &s.pane
+            && let Some(content) = captures.get(&pane.target)
+            && tmux::has_pending_permission_prompt(content)
+        {
+            s.pane_blocked = true;
+        }
+    }
+}
+
+fn should_scan_claude_pane(session: &Session) -> bool {
+    session.provider == Provider::Claude
+        && session.status != "waiting"
+        && session.pending_approvals.is_empty()
+        && session.pane.is_some()
 }
 
 #[cfg(test)]
@@ -442,5 +459,20 @@ mod tests {
         attach_tmux_fallbacks(&mut sessions, &panes);
 
         assert!(sessions[0].pane.is_none());
+    }
+
+    #[test]
+    fn visible_prompt_blocks_idle_claude_parent() {
+        let mut session = claude_session("/repo/ux", None, None);
+        session.status = "idle".to_string();
+        session.pane = Some(pane(1, "%1", "/repo/ux", "claude", "agent"));
+        let captures = HashMap::from([(
+            "main:1.0".to_string(),
+            "❯ 1. Yes\nEsc to cancel · Tab to amend\n".to_string(),
+        )]);
+
+        apply_claude_pane_captures(std::slice::from_mut(&mut session), &captures);
+
+        assert!(session.pane_blocked);
     }
 }

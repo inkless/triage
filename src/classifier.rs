@@ -32,18 +32,22 @@ pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
         return AttentionState::Error;
     }
 
-    // Two-signal Blocked detection:
+    // Three-signal Blocked detection:
     //   1. Sessions JSON `status=waiting` — Claude Code's own canonical
     //      signal. Cheapest path, accurate when set, but routinely missed:
     //      observed cases where the native permission UI was visibly up for
     //      minutes while status stayed `busy`. We can't fix that from
     //      outside Claude Code, so we layer a second signal underneath.
-    //   2. `pane_blocked` — set in the refresh pass when the pane content
+    //   2. Hook pending files — structured tool name/input available before
+    //      provider status catches up. This is also what lets autonomous mode
+    //      claim the hook's short wait window promptly.
+    //   3. `pane_blocked` — set in the refresh pass when the pane content
     //      shows the `1. Yes`/`2. No` permission UI anchor. Deterministic
     //      ground truth from the pixels Claude actually drew; survives the
     //      hook's 3-s timeout (after which the hook file is gone and only
     //      the pane tells us the user is still being asked).
-    if session.status == "waiting" || session.pane_blocked {
+    if session.status == "waiting" || !session.pending_approvals.is_empty() || session.pane_blocked
+    {
         return AttentionState::Blocked;
     }
 
@@ -164,6 +168,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::approval::PendingApproval;
     use crate::models::{Pane, Provider};
 
     fn busy_claude(now: SystemTime, metadata_age: Duration, with_pane: bool) -> Session {
@@ -258,6 +263,25 @@ mod tests {
         let mut session = busy_claude(now, Duration::ZERO, true);
         session.status = "waiting".to_string();
         session.active_background_jobs = 1;
+
+        assert_eq!(classify(&session, now), AttentionState::Blocked);
+    }
+
+    #[test]
+    fn hook_pending_approval_blocks_idle_parent() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        let mut session = busy_claude(now, Duration::ZERO, true);
+        session.status = "idle".to_string();
+        session.pending_approvals.push(PendingApproval {
+            uuid: "pending".to_string(),
+            session_id: "session".to_string(),
+            cwd: PathBuf::from("/repo"),
+            tool_name: "Bash".to_string(),
+            tool_input_brief: "cargo test".to_string(),
+            tool_input_full: r#"{"command":"cargo test"}"#.to_string(),
+            created_at: now,
+            pending_path: PathBuf::from("/tmp/pending.json"),
+        });
 
         assert_eq!(classify(&session, now), AttentionState::Blocked);
     }
