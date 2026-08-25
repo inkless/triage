@@ -104,6 +104,7 @@ struct AgentRow {
     pane_id: Option<String>,
     session_id: String,
     updated_at_ms: u64,
+    active_background_jobs: usize,
     headline: Option<String>,
 }
 
@@ -522,6 +523,7 @@ fn agent_row(s: &Session) -> AgentRow {
         pane_id: s.pane.as_ref().map(|p| p.pane_id.clone()),
         session_id: s.session_id.clone(),
         updated_at_ms: s.updated_at_ms,
+        active_background_jobs: s.active_background_jobs,
         headline: s.headline.clone().or_else(|| s.last_prompt.clone()),
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -27,6 +28,10 @@ struct RawSession {
     version: Option<String>,
     #[serde(default)]
     kind: Option<String>,
+    #[serde(rename = "jobId", default)]
+    job_id: Option<String>,
+    #[serde(rename = "parkedJobId", default)]
+    parked_job_id: Option<String>,
 }
 
 pub fn sessions_dir() -> PathBuf {
@@ -40,7 +45,7 @@ pub fn discover_live_sessions() -> Vec<Session> {
         return Vec::new();
     };
 
-    let mut out = Vec::new();
+    let mut raw_sessions = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("json") {
@@ -53,18 +58,47 @@ pub fn discover_live_sessions() -> Vec<Session> {
         if !pid_alive(raw.pid) {
             continue;
         }
-        if let Some(session) = raw_to_session(raw) {
+        raw_sessions.push(raw);
+    }
+
+    let active_background_jobs = active_background_job_keys(&raw_sessions);
+    let mut out = Vec::new();
+    for raw in raw_sessions {
+        if let Some(session) = raw_to_session_with_background_jobs(raw, &active_background_jobs) {
             out.push(session);
         }
     }
     out
 }
 
+fn active_background_job_keys(raw_sessions: &[RawSession]) -> HashSet<(String, String)> {
+    raw_sessions
+        .iter()
+        .filter(|raw| raw.kind.as_deref() == Some("bg"))
+        .filter(|raw| raw.status.as_deref() == Some("busy"))
+        .filter_map(|raw| {
+            let job_id = raw.job_id.as_deref()?.trim();
+            if job_id.is_empty() {
+                return None;
+            }
+            Some((raw.cwd.clone(), job_id.to_string()))
+        })
+        .collect()
+}
+
 /// Turn a parsed session JSON into a `Session`, or `None` if it should be
 /// hidden from the TUI. The `pid_alive` check stays in the caller (it touches
 /// the live process table); everything here is a pure function of the JSON, so
 /// it's unit-testable without a real sessions dir.
+#[cfg(test)]
 fn raw_to_session(raw: RawSession) -> Option<Session> {
+    raw_to_session_with_background_jobs(raw, &HashSet::new())
+}
+
+fn raw_to_session_with_background_jobs(
+    raw: RawSession,
+    active_background_jobs: &HashSet<(String, String)>,
+) -> Option<Session> {
     // Skip Claude's warm background-pool processes. Newer Claude (2.1.16x)
     // keeps `--bg-spare` / `--bg-pty-host` daemons that each write their own
     // session JSON tagged `kind: "bg"`. They're not interactive sessions and
@@ -81,6 +115,9 @@ fn raw_to_session(raw: RawSession) -> Option<Session> {
     if raw.name.as_deref() == Some(crate::auditor::AUDITOR_NAME) {
         return None;
     }
+    let active_background_job = raw.parked_job_id.as_deref().is_some_and(|job_id| {
+        active_background_jobs.contains(&(raw.cwd.clone(), job_id.to_string()))
+    });
     let name_is_derived = raw.name_source.as_deref() == Some("derived");
     let mut session = Session::new(
         Provider::Claude,
@@ -95,6 +132,7 @@ fn raw_to_session(raw: RawSession) -> Option<Session> {
     );
     session.name_is_derived = name_is_derived;
     session.cli_version = raw.version;
+    session.active_background_jobs = usize::from(active_background_job);
     Some(session)
 }
 
@@ -166,5 +204,35 @@ mod tests {
             crate::auditor::AUDITOR_NAME
         ));
         assert!(raw_to_session(auditor).is_none());
+    }
+
+    #[test]
+    fn links_busy_background_job_to_parked_parent() {
+        let parent = raw(r#"{"pid":42,"sessionId":"parent","cwd":"/repo/ux",
+                "kind":"interactive","status":"idle","parkedJobId":"abc12345"}"#);
+        let child = raw(r#"{"pid":43,"sessionId":"child","cwd":"/repo/ux",
+                "kind":"bg","status":"busy","jobId":"abc12345"}"#);
+        let jobs = active_background_job_keys(&[child]);
+
+        let session =
+            raw_to_session_with_background_jobs(parent, &jobs).expect("interactive parent kept");
+
+        assert_eq!(session.active_background_jobs, 1);
+    }
+
+    #[test]
+    fn does_not_link_idle_or_other_cwd_background_job() {
+        let idle_child = raw(r#"{"pid":43,"sessionId":"idle","cwd":"/repo/ux",
+                "kind":"bg","status":"idle","jobId":"abc12345"}"#);
+        let other_cwd_child = raw(r#"{"pid":44,"sessionId":"other","cwd":"/repo/other",
+                "kind":"bg","status":"busy","jobId":"abc12345"}"#);
+        let jobs = active_background_job_keys(&[idle_child, other_cwd_child]);
+        let parent = raw(r#"{"pid":42,"sessionId":"parent","cwd":"/repo/ux",
+                "kind":"interactive","status":"idle","parkedJobId":"abc12345"}"#);
+
+        let session =
+            raw_to_session_with_background_jobs(parent, &jobs).expect("interactive parent kept");
+
+        assert_eq!(session.active_background_jobs, 0);
     }
 }

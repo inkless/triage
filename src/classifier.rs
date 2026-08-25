@@ -47,6 +47,13 @@ pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
         return AttentionState::Blocked;
     }
 
+    // Claude workflows are dispatched into a separate pane-less background
+    // session. The visible interactive parent reports `status=idle` while the
+    // matched child job is busy, but the row represents the whole agent.
+    if session.active_background_jobs > 0 {
+        return AttentionState::Working;
+    }
+
     // Real activity age, used for the Stale check below. last_stop_at is the
     // strongest signal (turn ended); fall back to last_event_at otherwise.
     let event_age = session
@@ -233,5 +240,25 @@ mod tests {
         session.updated_at_ms += 1;
 
         assert_eq!(classify(&session, now), AttentionState::Stale);
+    }
+
+    #[test]
+    fn active_background_job_keeps_idle_parent_working() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        let mut session = busy_claude(now, Duration::ZERO, true);
+        session.status = "idle".to_string();
+        session.active_background_jobs = 1;
+
+        assert_eq!(classify(&session, now), AttentionState::Working);
+    }
+
+    #[test]
+    fn blocked_parent_outranks_active_background_job() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(10 * 24 * 60 * 60);
+        let mut session = busy_claude(now, Duration::ZERO, true);
+        session.status = "waiting".to_string();
+        session.active_background_jobs = 1;
+
+        assert_eq!(classify(&session, now), AttentionState::Blocked);
     }
 }
