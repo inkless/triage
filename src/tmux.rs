@@ -552,6 +552,79 @@ pub fn capture_pane_tail(target: &str, lines: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Capture several pane tails through one tmux client process. Permission
+/// detection must inspect idle Claude panes because provider status can stay
+/// `idle` while a native prompt is visible. Forking one `tmux` process per
+/// pane would push the refresh path beyond its latency budget, so issue a
+/// command sequence with marker lines and split the combined output.
+pub fn capture_pane_tails(targets: &[String], lines: u32) -> HashMap<String, String> {
+    if targets.is_empty() {
+        return HashMap::new();
+    }
+
+    let start = format!("-{lines}");
+    let mut command = Command::new("tmux");
+    for (index, target) in targets.iter().enumerate() {
+        if index > 0 {
+            command.arg(";");
+        }
+        command.args([
+            "display-message",
+            "-p",
+            "-t",
+            target,
+            &batch_capture_marker(index),
+        ]);
+        command.arg(";");
+        command.args(["capture-pane", "-p", "-S", &start, "-t", target]);
+    }
+
+    let Ok(output) = command.output() else {
+        return HashMap::new();
+    };
+    parse_batched_pane_tails(&String::from_utf8_lossy(&output.stdout), targets)
+}
+
+const BATCH_CAPTURE_PREFIX: &str = "__TRIAGE_CAPTURE_";
+const BATCH_CAPTURE_SUFFIX: &str = "__";
+
+fn batch_capture_marker(index: usize) -> String {
+    format!("{BATCH_CAPTURE_PREFIX}{index}{BATCH_CAPTURE_SUFFIX}")
+}
+
+fn parse_batched_pane_tails(output: &str, targets: &[String]) -> HashMap<String, String> {
+    let mut captures = HashMap::new();
+    let mut current: Option<usize> = None;
+    let mut content = String::new();
+
+    let flush =
+        |current: Option<usize>, content: &mut String, captures: &mut HashMap<String, String>| {
+            if let Some(index) = current
+                && let Some(target) = targets.get(index)
+            {
+                captures.insert(target.clone(), std::mem::take(content));
+            } else {
+                content.clear();
+            }
+        };
+
+    for line in output.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        let marker_index = trimmed
+            .strip_prefix(BATCH_CAPTURE_PREFIX)
+            .and_then(|rest| rest.strip_suffix(BATCH_CAPTURE_SUFFIX))
+            .and_then(|index| index.parse::<usize>().ok());
+        if let Some(index) = marker_index {
+            flush(current, &mut content, &mut captures);
+            current = Some(index);
+        } else if current.is_some() {
+            content.push_str(line);
+        }
+    }
+    flush(current, &mut content, &mut captures);
+    captures
+}
+
 /// Like `capture_pane_tail` but preserves ANSI styling (`-e`). Needed to tell
 /// Claude's faint ghost/placeholder composer text from real input — see
 /// `has_draft_input`. Run `strip_ansi` over it for plain-text line matching.
@@ -974,6 +1047,38 @@ fn is_chip_header(s: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn parses_batched_pane_tails_by_marker() {
+        let targets = vec!["main:1.0".to_string(), "main:2.0".to_string()];
+        let output = "__TRIAGE_CAPTURE_0__\nfirst\npane\n__TRIAGE_CAPTURE_1__\nsecond\n";
+
+        let captures = parse_batched_pane_tails(output, &targets);
+
+        assert_eq!(
+            captures.get("main:1.0").map(String::as_str),
+            Some("first\npane\n")
+        );
+        assert_eq!(
+            captures.get("main:2.0").map(String::as_str),
+            Some("second\n")
+        );
+    }
+
+    #[test]
+    fn detects_claude_permission_prompt() {
+        let pane = r#"
+Do you want to proceed?
+
+❯ 1. Yes
+  2. Yes, and don't ask again
+  3. No
+
+Esc to cancel · Tab to amend
+"#;
+
+        assert!(has_pending_permission_prompt(pane));
+    }
 
     #[test]
     fn new_window_command_explicitly_enters_cwd() {

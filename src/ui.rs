@@ -385,7 +385,7 @@ impl AppState {
 
     pub fn oldest_pending_uuid(&self) -> Option<String> {
         self.selected_session()
-            .filter(|s| s.status == "waiting")
+            .filter(|s| s.state == AttentionState::Blocked)
             .and_then(|s| s.pending_approvals.first())
             .map(|a| a.uuid.clone())
     }
@@ -1365,10 +1365,9 @@ fn build_row(
     let provider_label = s.provider.label();
 
     let cwd_short = shorten_path(&s.cwd.to_string_lossy(), 24);
-    // Only show a permission headline when Claude itself is actually paused on
-    // user input. Pending files alone are not enough: the hook also sees
-    // auto-approved tool calls.
-    let headline_raw = if s.provider == Provider::Claude && s.status == "waiting" {
+    // Provider status can remain idle while a hook request or native prompt
+    // is waiting. Use triage's joined state rather than the raw status field.
+    let headline_raw = if s.provider == Provider::Claude && s.state == AttentionState::Blocked {
         if let Some(a) = s.pending_approvals.first() {
             if a.tool_input_brief.is_empty() {
                 format!("⏸ approve? {}", a.tool_name)
@@ -1731,7 +1730,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
         ]));
     }
 
-    if s.provider == Provider::Claude && s.status == "waiting" {
+    if s.provider == Provider::Claude && s.state == AttentionState::Blocked {
         if let Some(a) = s.pending_approvals.first() {
             lines.push(Line::from(vec![
                 Span::styled(a.tool_name.clone(), yellow().add_modifier(Modifier::BOLD)),
