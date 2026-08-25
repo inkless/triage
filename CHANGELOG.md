@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.2](https://github.com/inkless/triage/compare/v0.4.1...v0.4.2) (2026-08-25)
+
+
+### Bug Fixes
+
+* **auto:** separate human choices from routine approvals ([#11](https://github.com/inkless/triage/issues/11)) ([5e6e2f5](https://github.com/inkless/triage/commit/5e6e2f5783fadb334245f30f36af0bc83b28a4d4))
+* honor fresh busy session metadata ([#9](https://github.com/inkless/triage/issues/9)) ([9bf31ce](https://github.com/inkless/triage/commit/9bf31ce49c65163820fe5124fc7b65d1dc6cc098))
+* **sessions:** count active background workflows as working ([#12](https://github.com/inkless/triage/issues/12)) ([6a2cd53](https://github.com/inkless/triage/commit/6a2cd53df9d62cca91510a5857d35539bc24469a))
+
 ## [0.4.1](https://github.com/inkless/triage/compare/v0.4.0...v0.4.1) (2026-08-02)
 
 
