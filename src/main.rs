@@ -268,11 +268,12 @@ fn probe() -> io::Result<()> {
         let head_short: String = headline.chars().take(80).collect();
         let name_short: String = s.name.as_deref().unwrap_or("-").chars().take(28).collect();
         println!(
-            "  {:<2} pid={:<6} state={:<6} status={:<5} pane={:<24} name={:<28} cwd={}",
+            "  {:<2} pid={:<6} state={:<6} status={:<5} bg={:<2} pane={:<24} name={:<28} cwd={}",
             s.provider.label(),
             s.pid,
             s.state.label(),
             s.status,
+            s.active_background_jobs,
             pane,
             name_short,
             s.cwd.display()

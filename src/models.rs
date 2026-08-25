@@ -72,6 +72,10 @@ pub struct Session {
     pub cli_version: Option<String>,
     pub started_at_ms: u64,
     pub updated_at_ms: u64,
+    /// Number of live, busy Claude background jobs parked from this
+    /// interactive session. Claude workflows run in these pane-less child
+    /// sessions while the visible parent reports `status=idle`.
+    pub active_background_jobs: usize,
 
     pub pane: Option<Pane>,
 
@@ -169,6 +173,7 @@ impl Session {
             cli_version: None,
             started_at_ms,
             updated_at_ms,
+            active_background_jobs: 0,
             pane: None,
             transcript_path: None,
             headline: None,
