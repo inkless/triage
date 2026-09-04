@@ -708,15 +708,24 @@ pub fn capture_pane_visible_ansi(target: &str) -> Option<String> {
 
 /// True iff the captured pane shows a Claude permission prompt UI in its
 /// most recent block. We require two distinct UI lines to BOTH appear as
-/// trimmed exact-line matches:
+/// trimmed whole-line matches:
 ///
-///   `❯ 1. Yes`                         (the live cursor on option 1)
-///   `Esc to cancel · Tab to amend`     (the prompt footer)
+///   `❯ 1. Yes`             (the live cursor on option 1)
+///   `Esc to cancel · ...`  (the prompt footer, keyed on its stable prefix)
 ///
-/// Anchoring on whole lines (not substring) is what keeps this from
+/// Anchoring on whole lines (not substring-anywhere) is what keeps this from
 /// false-firing on code edits / diffs / prose that *quote* these strings
 /// inside source — Claude renders them on their own lines (with at most
 /// leading whitespace), while a quote in code has surrounding chars.
+///
+/// The footer is matched by prefix, not full equality: Claude Code has
+/// repeatedly appended new trailing hints to this same footer (e.g. `· Tab to
+/// amend`, then `· ctrl+e to explain`), and each addition silently broke an
+/// exact-match anchor, leaving live permission prompts undetected until
+/// someone noticed a row stuck at Working. `Esc to cancel` is the one prefix
+/// that has survived every observed revision; matching on it (rather than
+/// enumerating every known suffix combination) means a future added hint
+/// doesn't require another patch here.
 pub fn has_pending_permission_prompt(pane: &str) -> bool {
     let mut found_cursor = false;
     let mut found_footer = false;
@@ -725,7 +734,7 @@ pub fn has_pending_permission_prompt(pane: &str) -> bool {
         if trimmed == "❯ 1. Yes" {
             found_cursor = true;
         }
-        if trimmed == "Esc to cancel · Tab to amend" {
+        if trimmed.starts_with("Esc to cancel") {
             found_footer = true;
         }
         if found_cursor && found_footer {
@@ -1125,6 +1134,25 @@ Do you want to proceed?
   3. No
 
 Esc to cancel · Tab to amend
+"#;
+
+        assert!(has_pending_permission_prompt(pane));
+    }
+
+    #[test]
+    fn detects_claude_permission_prompt_with_added_footer_hint() {
+        // Regression: Claude Code appended `· ctrl+e to explain` to this
+        // footer after the exact-match anchor was written, which silently
+        // stopped detecting the prompt (TRI observed: agent-UPR-192 stuck at
+        // Working with a live prompt on screen).
+        let pane = r#"
+Do you want to proceed?
+
+❯ 1. Yes
+  2. Yes, and don't ask again for: python3 -
+  3. No
+
+Esc to cancel · Tab to amend · ctrl+e to explain
 "#;
 
         assert!(has_pending_permission_prompt(pane));
