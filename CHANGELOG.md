@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.4](https://github.com/inkless/triage/compare/v0.4.3...v0.4.4) (2026-09-04)
+
+
+### Bug Fixes
+
+* **ci:** format tmux expression ([804c353](https://github.com/inkless/triage/commit/804c353df5a3c464421c9fcf68cdd36c2ccea86d))
+
 ## [0.4.3](https://github.com/inkless/triage/compare/v0.4.2...v0.4.3) (2026-09-04)
 
 
