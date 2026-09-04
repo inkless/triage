@@ -1,5 +1,14 @@
 # Changelog
 
+## [0.4.3](https://github.com/inkless/triage/compare/v0.4.2...v0.4.3) (2026-09-04)
+
+
+### Bug Fixes
+
+* **sessions:** detect blocked prompts while Claude reports idle ([#13](https://github.com/inkless/triage/issues/13)) ([f54c092](https://github.com/inkless/triage/commit/f54c0922d85f4db1ef35d89c84689d7e0813e384))
+* **tmux:** match permission-prompt footer by prefix, not exact line ([a70a3da](https://github.com/inkless/triage/commit/a70a3dadc897b86a15c1f7d2b113a1201accfc88))
+* **tmux:** pin new-window to a real session when $TMUX is unset ([90ffbfd](https://github.com/inkless/triage/commit/90ffbfd4fc7992c6444eb5180b4c4d65bb8a08bd))
+
 ## [0.4.2](https://github.com/inkless/triage/compare/v0.4.1...v0.4.2) (2026-08-25)
 
 
