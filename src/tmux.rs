@@ -406,6 +406,21 @@ pub fn new_window(
     if detached {
         tmux.arg("-d");
     }
+    // `tmux new-window` without `-t` targets the *current* session, which tmux
+    // infers from `$TMUX`. Inside a pane that's correct. But when triage (and
+    // therefore `triage launch`) runs from a plain shell with `$TMUX` unset,
+    // there is no current session even if others exist — tmux silently mints a
+    // freshly-numbered detached session and drops the window there, landing the
+    // agent in what looks like a random session. Pin a target instead: the
+    // focused client's session when one is attached, else the most recently
+    // active session. Fall back to an unnamed detached session only when no
+    // session exists at all (tmux then starts a fresh server, which is the only
+    // sane move with nothing to attach to).
+    if std::env::var_os("TMUX").is_none()
+        && let Some(session) = resolve_target_session()
+    {
+        tmux.args(["-t", &session]);
+    }
     let output = tmux
         .arg("-c")
         .arg(cwd)
@@ -425,6 +440,41 @@ pub fn new_window(
         return Err(std::io::Error::other("tmux new-window returned no pane id"));
     }
     Ok(pane_id)
+}
+
+/// Pick which session a no-`$TMUX` `new-window` should land in. The focused
+/// client's session is the user's current context; the most recently active
+/// session is the next-best signal when every client is detached. Returns
+/// `None` when tmux has no sessions at all.
+fn resolve_target_session() -> Option<String> {
+    if let Some(session) = tmux_expression("#{client_session}") {
+        return Some(session);
+    }
+    if let Some(s) = tmux_expression("#{session_name}:#{session_activity}")
+        && let Some((session, _)) = s.split_once(':')
+    {
+        return Some(session.to_string());
+    }
+    None
+}
+
+/// Evaluate a tmux `display-message` expression from the server's perspective
+/// (no calling client required). Returns the trimmed result on success, `None`
+/// when tmux errors (e.g. no server running) or the value is empty.
+fn tmux_expression(fmt: &str) -> Option<String> {
+    let out = Command::new("tmux")
+        .args(["display-message", "-p", fmt])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 fn command_in_cwd(cwd: &Path, command: &str) -> String {
