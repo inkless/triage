@@ -470,11 +470,7 @@ fn tmux_expression(fmt: &str) -> Option<String> {
         return None;
     }
     let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if value.is_empty() {
-        None
-    } else {
-        Some(value)
-    }
+    if value.is_empty() { None } else { Some(value) }
 }
 
 fn command_in_cwd(cwd: &Path, command: &str) -> String {
