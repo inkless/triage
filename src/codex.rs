@@ -17,7 +17,7 @@ pub fn sessions_dir() -> PathBuf {
 
 #[derive(Default)]
 pub struct CodexDigestCache {
-    entries: HashMap<PathBuf, (SystemTime, CodexDigest)>,
+    entries: HashMap<PathBuf, (SystemTime, Option<CodexDigest>)>,
     thread_titles: Option<(CodexStateStamp, HashMap<String, CodexThreadTitle>)>,
     thread_roots: Option<(CodexStateStamp, HashMap<String, String>)>,
 }
@@ -36,13 +36,13 @@ impl CodexDigestCache {
         if let Some((cached_mtime, cached)) = self.entries.get(path)
             && *cached_mtime == mtime
         {
-            return Some(cached.clone());
+            return cached.clone();
         }
         let text = fs::read_to_string(path).ok()?;
-        let digest = parse_rollout(path, &text, mtime)?;
+        let digest = parse_rollout(path, &text, mtime);
         self.entries
             .insert(path.to_path_buf(), (mtime, digest.clone()));
-        Some(digest)
+        digest
     }
 
     pub fn evict_missing(&mut self) {
@@ -95,10 +95,7 @@ pub fn discover_live_sessions(
     let thread_titles = cache.thread_titles();
     let thread_roots = cache.thread_roots();
     for pid in codex_pids() {
-        let Some(path) = rollout_path_for_pid(pid) else {
-            continue;
-        };
-        let Some(digest) = cache.get(&path) else {
+        let Some((path, digest)) = select_rollout(rollout_paths_for_pid(pid), cache) else {
             continue;
         };
         let cwd = digest
@@ -352,21 +349,32 @@ fn codex_pids() -> Vec<u32> {
     pids
 }
 
-fn rollout_path_for_pid(pid: u32) -> Option<PathBuf> {
+fn rollout_paths_for_pid(pid: u32) -> Vec<PathBuf> {
     let Ok(out) = Command::new("lsof")
         .args(["-Fn", "-p", &pid.to_string()])
         .output()
     else {
-        return None;
+        return Vec::new();
     };
     if !out.status.success() {
-        return None;
+        return Vec::new();
     }
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| line.strip_prefix('n'))
-        .find(|path| is_codex_rollout(path))
+        .filter(|path| is_codex_rollout(path))
         .map(PathBuf::from)
+        .collect()
+}
+
+fn select_rollout(
+    paths: Vec<PathBuf>,
+    cache: &mut CodexDigestCache,
+) -> Option<(PathBuf, CodexDigest)> {
+    paths
+        .into_iter()
+        .filter_map(|path| cache.get(&path).map(|digest| (path, digest)))
+        .max_by_key(|(_, digest)| (digest.is_user_thread, digest.updated_at_ms))
 }
 
 fn is_codex_rollout(path: &str) -> bool {
@@ -380,6 +388,7 @@ fn is_codex_rollout(path: &str) -> bool {
 
 #[derive(Clone)]
 struct CodexDigest {
+    is_user_thread: bool,
     session_id: String,
     cwd: Option<PathBuf>,
     started_at_ms: u64,
@@ -441,6 +450,7 @@ enum LatestKind {
 }
 
 fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDigest> {
+    let mut is_user_thread = false;
     let mut session_id = String::new();
     let mut cwd: Option<PathBuf> = None;
     let mut started_at: Option<SystemTime> = None;
@@ -482,6 +492,21 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
         match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "session_meta" => {
                 if let Some(payload) = v.get("payload") {
+                    if payload.get("thread_source").and_then(Value::as_str)
+                        == Some("guardian_review")
+                        || payload
+                            .pointer("/source/subagent/other")
+                            .and_then(Value::as_str)
+                            == Some("guardian")
+                    {
+                        return None;
+                    }
+                    is_user_thread = payload.get("thread_source").and_then(Value::as_str)
+                        == Some("user")
+                        || matches!(
+                            payload.get("source").and_then(Value::as_str),
+                            Some("cli" | "vscode")
+                        );
                     if let Some(id) = payload.get("id").and_then(|id| id.as_str()) {
                         session_id = id.to_string();
                     }
@@ -664,12 +689,30 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
         .map(system_time_ms)
         .unwrap_or_else(|| system_time_ms(mtime));
     let latest_assistant_text = latest_assistant.as_ref().map(|(_, text)| text.clone());
-    let headline = latest_assistant_text
-        .clone()
-        .or_else(|| last_prompt.clone());
+    let prompt_is_newer = last_prompt_at.is_some_and(|prompt_at| {
+        latest_assistant
+            .as_ref()
+            .is_none_or(|(assistant_at, _)| prompt_at > *assistant_at)
+    });
+    let headline = if prompt_is_newer {
+        last_prompt.as_ref().map(|prompt| format!("→ {prompt}"))
+    } else {
+        latest_assistant_text
+            .clone()
+            .or_else(|| last_prompt.clone())
+    };
+    let headline = headline.and_then(|text| {
+        let visible = text
+            .split("<oai-mem-citation>")
+            .next()
+            .unwrap_or_default()
+            .trim();
+        (!visible.is_empty()).then(|| visible.to_string())
+    });
     let latest_assistant_at = latest_assistant.map(|(t, _)| t);
 
     Some(CodexDigest {
+        is_user_thread,
         session_id,
         cwd,
         started_at_ms,
@@ -844,6 +887,92 @@ fn system_time_ms(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selects_user_rollout_regardless_of_open_file_order() {
+        let dir = std::env::temp_dir().join(format!("triage-rollouts-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let user = dir.join("user.jsonl");
+        let guardian = dir.join("guardian.jsonl");
+        let child = dir.join("child.jsonl");
+        fs::write(&user, r#"{"type":"session_meta","payload":{"id":"user","source":"cli","thread_source":"user"}}
+{"timestamp":"2026-09-10T16:00:00Z","type":"event_msg","payload":{"type":"agent_message","message":"Checking headlines"}}"#).unwrap();
+        fs::write(&guardian, r#"{"type":"session_meta","payload":{"id":"guardian","thread_source":"guardian_review"}}
+{"timestamp":"2026-09-10T16:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"approval JSON"}}"#).unwrap();
+        fs::write(&child, r#"{"type":"session_meta","payload":{"id":"child","source":{"subagent":{"spawn":{}}}}}
+{"timestamp":"2026-09-10T16:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"Child result"}}"#).unwrap();
+        let mut cache = CodexDigestCache::new();
+        for paths in [
+            vec![guardian.clone(), child.clone(), user.clone()],
+            vec![user.clone(), child.clone(), guardian.clone()],
+        ] {
+            let (path, digest) = select_rollout(paths, &mut cache).unwrap();
+            assert_eq!(path, user);
+            assert_eq!(digest.headline.as_deref(), Some("Checking headlines"));
+        }
+        assert!(select_rollout(vec![guardian], &mut cache).is_none());
+        assert_eq!(
+            select_rollout(vec![child], &mut cache)
+                .unwrap()
+                .1
+                .session_id,
+            "child"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn rejects_guardian_source_without_thread_source() {
+        assert!(
+            parse_rollout(
+                Path::new("rollout.jsonl"),
+                r#"{"type":"session_meta","payload":{"source":{"subagent":{"other":"guardian"}}}}"#,
+                SystemTime::UNIX_EPOCH
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn new_request_replaces_old_answer_until_assistant_responds() {
+        let mut text = String::from(
+            r#"{"timestamp":"2026-09-10T16:00:00Z","type":"event_msg","payload":{"type":"agent_message","message":"Previous task done"}}
+{"timestamp":"2026-09-10T16:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Check the headlines"}}"#,
+        );
+        let parse = |text: &str| {
+            parse_rollout(Path::new("rollout.jsonl"), text, SystemTime::UNIX_EPOCH).unwrap()
+        };
+        assert_eq!(
+            parse(&text).headline.as_deref(),
+            Some("→ Check the headlines")
+        );
+        text.push_str(r#"
+{"timestamp":"2026-09-10T16:00:02Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Investigating transcript selection"}]}}"#);
+        assert_eq!(
+            parse(&text).headline.as_deref(),
+            Some("Investigating transcript selection")
+        );
+        text.push_str(r#"
+{"timestamp":"2026-09-10T16:00:03Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Fixed transcript selection"}]}}"#);
+        assert_eq!(
+            parse(&text).headline.as_deref(),
+            Some("Fixed transcript selection")
+        );
+    }
+
+    #[test]
+    fn headline_omits_memory_metadata_but_detail_preserves_it() {
+        let text = r#"{"timestamp":"2026-09-10T16:00:00Z","type":"event_msg","payload":{"type":"agent_message","message":"Ready for review.\n<oai-mem-citation>internal references</oai-mem-citation>"}}"#;
+        let digest =
+            parse_rollout(Path::new("rollout.jsonl"), text, SystemTime::UNIX_EPOCH).unwrap();
+        assert_eq!(digest.headline.as_deref(), Some("Ready for review."));
+        assert!(
+            digest
+                .latest_assistant_text
+                .unwrap()
+                .contains("<oai-mem-citation>")
+        );
+    }
 
     #[test]
     fn parses_codex_rollout_core_fields() {
