@@ -413,10 +413,14 @@ struct CodexDigest {
     latest_model: Option<String>,
     latest_assistant_text: Option<String>,
     latest_kind: LatestKind,
+    turn_active: Option<bool>,
 }
 
 impl CodexDigest {
     fn status(&self) -> String {
+        if let Some(active) = self.turn_active {
+            return if active { "busy" } else { "idle" }.to_string();
+        }
         if self.pending_tool
             || matches!(
                 self.latest_kind,
@@ -424,6 +428,8 @@ impl CodexDigest {
                     | LatestKind::TaskStarted
                     | LatestKind::FunctionCall
                     | LatestKind::FunctionOutput
+                    | LatestKind::Commentary
+                    | LatestKind::Reasoning
             )
         {
             "busy".to_string()
@@ -445,6 +451,8 @@ enum LatestKind {
     User,
     TaskStarted,
     Assistant,
+    Commentary,
+    Reasoning,
     FunctionCall,
     FunctionOutput,
 }
@@ -470,6 +478,7 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
     let mut context_window = None;
     let mut function_calls: Vec<CodexFunctionCall> = Vec::new();
     let mut completed_calls: HashSet<String> = HashSet::new();
+    let mut turn_active = None;
     let mut latest_kind = LatestKind::None;
     let mut latest_kind_at: Option<SystemTime> = None;
 
@@ -541,7 +550,15 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
             "event_msg" => {
                 if let Some(payload) = v.get("payload") {
                     match payload.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+                        "task_complete" | "turn_aborted" => {
+                            turn_active = Some(false);
+                            function_calls.clear();
+                            completed_calls.clear();
+                        }
                         "task_started" => {
+                            turn_active = Some(true);
+                            function_calls.clear();
+                            completed_calls.clear();
                             if let Some(n) =
                                 payload.get("model_context_window").and_then(|n| n.as_u64())
                             {
@@ -555,6 +572,9 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
                             );
                         }
                         "user_message" => {
+                            if turn_active.is_some() {
+                                turn_active = Some(true);
+                            }
                             if let Some(message) = payload.get("message").and_then(|m| m.as_str()) {
                                 last_prompt = Some(message.to_string());
                                 last_prompt_at = ts;
@@ -571,13 +591,9 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
                             if let Some(message) = payload.get("message").and_then(|m| m.as_str())
                                 && let Some(t) = ts
                             {
+                                let kind = assistant_kind(payload, &mut turn_active);
                                 update_assistant(&mut latest_assistant, t, message.to_string());
-                                mark_latest(
-                                    &mut latest_kind,
-                                    &mut latest_kind_at,
-                                    LatestKind::Assistant,
-                                    ts,
-                                );
+                                mark_latest(&mut latest_kind, &mut latest_kind_at, kind, ts);
                             }
                         }
                         "token_count" => {
@@ -607,16 +623,20 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
                                 && let Some(text) = content_text(content, "output_text")
                                 && let Some(t) = ts
                             {
+                                let kind = assistant_kind(payload, &mut turn_active);
                                 update_assistant(&mut latest_assistant, t, text);
-                                mark_latest(
-                                    &mut latest_kind,
-                                    &mut latest_kind_at,
-                                    LatestKind::Assistant,
-                                    ts,
-                                );
+                                mark_latest(&mut latest_kind, &mut latest_kind_at, kind, ts);
                             }
                         }
-                        "function_call" => {
+                        "reasoning" => {
+                            mark_latest(
+                                &mut latest_kind,
+                                &mut latest_kind_at,
+                                LatestKind::Reasoning,
+                                ts,
+                            );
+                        }
+                        "function_call" | "custom_tool_call" => {
                             let call_id = payload
                                 .get("call_id")
                                 .and_then(|id| id.as_str())
@@ -629,6 +649,7 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
                                 .to_string();
                             let arguments = payload
                                 .get("arguments")
+                                .or_else(|| payload.get("input"))
                                 .and_then(|a| a.as_str())
                                 .unwrap_or_default();
                             let brief = brief_codex_arguments(arguments);
@@ -646,7 +667,7 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
                                 ts,
                             );
                         }
-                        "function_call_output" => {
+                        "function_call_output" | "custom_tool_call_output" => {
                             if let Some(call_id) = payload.get("call_id").and_then(|id| id.as_str())
                             {
                                 completed_calls.insert(call_id.to_string());
@@ -737,7 +758,19 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
         latest_model,
         latest_assistant_text,
         latest_kind,
+        turn_active,
     })
+}
+
+fn assistant_kind(payload: &Value, turn_active: &mut Option<bool>) -> LatestKind {
+    match payload.get("phase").and_then(Value::as_str) {
+        Some("commentary") => LatestKind::Commentary,
+        Some("final_answer") => {
+            *turn_active = Some(false);
+            LatestKind::Assistant
+        }
+        _ => LatestKind::Assistant,
+    }
 }
 
 struct CodexFunctionCall {
@@ -887,6 +920,102 @@ fn system_time_ms(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_turn_stays_busy_through_commentary_and_code_mode_tools() {
+        let events = [
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Checking it"}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"custom_tool_call","call_id":"code-1","name":"exec","input":"await tools.exec_command({cmd: 'cargo test'})"}}"#,
+            r#"{"type":"response_item","payload":{"type":"custom_tool_call_output","call_id":"code-1","output":"ok"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"agent_message","message":"Still investigating"}}"#,
+            r#"{"type":"response_item","payload":{"type":"reasoning"}}"#,
+        ];
+        let mut text = String::new();
+        for (index, event) in events.iter().enumerate() {
+            let mut event: Value = serde_json::from_str(event).unwrap();
+            event["timestamp"] = format!("2026-09-10T16:00:{index:02}Z").into();
+            text.push_str(&format!("{event}\n"));
+            let digest =
+                parse_rollout(Path::new("rollout.jsonl"), &text, SystemTime::UNIX_EPOCH).unwrap();
+            assert_eq!(digest.status(), "busy", "event {index}");
+            assert_eq!(digest.last_stop_at(), None);
+            assert_eq!(digest.pending_tool, index == 2);
+            if index == 2 {
+                assert_eq!(digest.last_tool_use.as_ref().unwrap().0, "exec");
+                assert!(
+                    digest
+                        .last_tool_use
+                        .as_ref()
+                        .unwrap()
+                        .1
+                        .contains("cargo test")
+                );
+            }
+        }
+        for terminal in [
+            r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"turn_aborted"}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Finished"}]}}"#,
+        ] {
+            let mut event: Value = serde_json::from_str(terminal).unwrap();
+            event["timestamp"] = "2026-09-10T16:00:10Z".into();
+            let ended = format!("{text}{event}\n");
+            assert_eq!(
+                parse_rollout(Path::new("rollout.jsonl"), &ended, SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .status(),
+                "idle"
+            );
+            let restarted = format!(
+                "{ended}{{\"timestamp\":\"2026-09-10T16:00:11Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"task_started\"}}}}\n"
+            );
+            assert_eq!(
+                parse_rollout(
+                    Path::new("rollout.jsonl"),
+                    &restarted,
+                    SystemTime::UNIX_EPOCH
+                )
+                .unwrap()
+                .status(),
+                "busy"
+            );
+        }
+    }
+
+    #[test]
+    fn commentary_without_lifecycle_events_is_busy() {
+        for envelope in ["response_item", "event_msg"] {
+            let text = serde_json::json!({
+                "timestamp": "2026-09-10T16:00:00Z",
+                "type": envelope,
+                "payload": {
+                    "type": if envelope == "response_item" { "message" } else { "agent_message" },
+                    "role": "assistant", "phase": "commentary", "message": "Checking it",
+                    "content": [{"type": "output_text", "text": "Checking it"}]
+                }
+            })
+            .to_string();
+            assert_eq!(
+                parse_rollout(Path::new("rollout.jsonl"), &text, SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .status(),
+                "busy"
+            );
+        }
+    }
+
+    #[test]
+    fn aborted_turn_discards_unanswered_tools() {
+        let text = r#"{"timestamp":"2026-09-10T16:00:00Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-09-10T16:00:01Z","type":"response_item","payload":{"type":"function_call","call_id":"old","name":"exec_command","arguments":"{\"sandbox_permissions\":\"require_escalated\"}"}}
+{"timestamp":"2026-09-10T16:00:02Z","type":"event_msg","payload":{"type":"turn_aborted"}}"#;
+        let digest =
+            parse_rollout(Path::new("rollout.jsonl"), text, SystemTime::UNIX_EPOCH).unwrap();
+        assert_eq!(digest.status(), "idle");
+        assert!(!digest.pending_tool);
+        assert!(!digest.pending_approval_tool);
+    }
 
     #[test]
     fn selects_user_rollout_regardless_of_open_file_order() {
