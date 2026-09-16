@@ -20,6 +20,7 @@ list-panes) echo "fixture|1.0|$FIXTURE_PID|/dev/null|codex|/tmp|1|%42|fixture" ;
 capture-pane)
   case "$SCENARIO" in
     capture-failure) exit 1 ;;
+    animated) /bin/cat "$FIXTURE_CAPTURE" ;;
     permission) printf 'Would you like to run the following command?\n  $ test\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n' ;;
     draft) printf '› unsent draft\n' ;;
     wrapped) printf '› \n  wrapped draft\n' ;;
@@ -62,6 +63,13 @@ exit 0
             .env("FIXTURE_PID", std::process::id().to_string())
             .env("FIXTURE_ROLLOUT", &rollout)
             .env("SCENARIO", scenario)
+            .env(
+                "FIXTURE_CAPTURE",
+                concat!(
+                    env!("CARGO_MANIFEST_DIR"),
+                    "/tests/fixtures/codex-empty-165.ansi"
+                ),
+            )
             .output()
             .unwrap()
     };
@@ -111,7 +119,7 @@ exit 0
             "{scenario} pasted into the composer"
         );
     }
-    for scenario in ["quiet", "placeholder"] {
+    for scenario in ["quiet", "placeholder", "animated"] {
         let send = run(
             scenario,
             &[

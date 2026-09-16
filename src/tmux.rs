@@ -798,15 +798,55 @@ pub fn has_draft_input(pane: &str) -> bool {
 }
 
 pub fn codex_composer_has_draft(pane: &str) -> Option<bool> {
-    let lines = pane.lines().collect::<Vec<_>>();
+    use ansi_to_tui::IntoText;
+    use ratatui::style::{Color, Modifier, Style};
+
+    // Parse the whole capture so inherited styles and RGB SGR parameters are
+    // preserved. A color component equal to 2 is not the DIM modifier.
+    let text = pane.into_text().ok()?;
+    let lines = text
+        .lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .flat_map(|span| span.content.chars().map(|c| (c, span.style)))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
     for (index, line) in lines.iter().enumerate().rev() {
-        if strip_ansi(line).trim_start().starts_with('›') {
-            let pos = line.find('›')?;
-            let continuation = lines
-                .get(index + 1)
-                .is_some_and(|line| !strip_ansi(line).trim().is_empty());
-            return Some(composer_has_real_text(&line[pos + '›'.len_utf8()..]) || continuation);
+        let Some(marker) = line.iter().position(|(c, _)| !c.is_whitespace()) else {
+            continue;
+        };
+        if line[marker].0 != '›' {
+            continue;
         }
+        let content = &line[marker + 1..];
+        let placeholder = content
+            .iter()
+            .filter(|(_, style)| style.add_modifier.contains(Modifier::DIM))
+            .map(|(c, _)| *c)
+            .collect::<String>();
+        let animated_placeholder = placeholder.trim() == "Ask Codex to do anything";
+        let is_particle = |c: char, style: Style| {
+            animated_placeholder
+                && matches!(style.fg, Some(Color::Rgb(_, _, _)))
+                && matches!(style.bg, Some(Color::Rgb(_, _, _)))
+                && (0x2801..=0x2880).contains(&(c as u32))
+                && (c as u32 - 0x2800).is_power_of_two()
+        };
+        let draft = content.iter().any(|&(c, style)| {
+            !c.is_whitespace()
+                && !style
+                    .add_modifier
+                    .intersects(Modifier::DIM | Modifier::REVERSED)
+                && !is_particle(c, style)
+        });
+        let continuation = lines.get(index + 1).is_some_and(|line| {
+            line.iter()
+                .any(|&(c, style)| !c.is_whitespace() && !is_particle(c, style))
+        });
+        return Some(draft || continuation);
     }
     None
 }
@@ -1116,6 +1156,35 @@ fn is_chip_header(s: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn codex_animated_empty_composer_captures() {
+        for capture in [
+            include_str!("../tests/fixtures/codex-empty-165.ansi"),
+            include_str!("../tests/fixtures/codex-empty-38.ansi"),
+        ] {
+            assert_eq!(codex_composer_has_draft(capture), Some(false));
+            let typed = capture.replace("Ask Codex to do anything", "\x1b[22mactual draft");
+            assert_eq!(codex_composer_has_draft(&typed), Some(true));
+            let braille_draft =
+                capture.replace("Ask Codex to do anything", "\x1b[22;38;2;134;128;111m⠁⠠");
+            assert_eq!(codex_composer_has_draft(&braille_draft), Some(true));
+            let colored = capture.replace(
+                "Ask Codex to do anything",
+                "\x1b[22;38;2;2;40;50mactual draft",
+            );
+            assert_eq!(codex_composer_has_draft(&colored), Some(true));
+            let with_placeholder = capture.replace(
+                "Ask Codex to do anything",
+                "\x1b[22mreal draft \x1b[2mAsk Codex to do anything",
+            );
+            assert_eq!(codex_composer_has_draft(&with_placeholder), Some(true));
+            // Insert real text into the existing animated continuation row.
+            let mut lines = capture.lines().map(str::to_string).collect::<Vec<_>>();
+            lines[2].push_str("\x1b[0mwrapped draft");
+            assert_eq!(codex_composer_has_draft(&lines.join("\n")), Some(true));
+        }
+    }
 
     #[test]
     fn codex_interrupt_composer_guard() {
