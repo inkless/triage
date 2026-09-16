@@ -163,6 +163,7 @@ pub fn discover_live_sessions(
         session.last_prompt = digest.last_prompt.clone();
         session.last_prompt_at = digest.last_prompt_at;
         session.last_event_at = digest.last_event_at;
+        session.last_progress_at = digest.last_progress_at;
         session.last_stop_at = digest.last_stop_at();
         session.user_prompt_count = digest.user_prompt_count;
         session.last_tool_use = digest.last_tool_use.clone();
@@ -447,6 +448,7 @@ struct CodexDigest {
     agent_nickname: Option<String>,
     agent_role: Option<String>,
     last_event_at: Option<SystemTime>,
+    last_progress_at: Option<SystemTime>,
     latest_assistant_at: Option<SystemTime>,
     user_prompt_count: u64,
     last_tool_use: Option<(String, String)>,
@@ -511,6 +513,7 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
     let mut cwd: Option<PathBuf> = None;
     let mut started_at: Option<SystemTime> = None;
     let mut last_event_at: Option<SystemTime> = None;
+    let mut last_progress_at: Option<SystemTime> = None;
     let mut last_prompt: Option<String> = None;
     let mut last_prompt_at: Option<SystemTime> = None;
     let mut agent_nickname: Option<String> = None;
@@ -545,6 +548,11 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
             if last_event_at.is_none_or(|prev| t > prev) {
                 last_event_at = Some(t);
             }
+        }
+        if is_progress_event(&v, turn_active)
+            && let Some(t) = ts
+        {
+            last_progress_at = Some(last_progress_at.map_or(t, |previous| previous.max(t)));
         }
         match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "session_meta" => {
@@ -792,6 +800,7 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
         agent_nickname,
         agent_role,
         last_event_at,
+        last_progress_at,
         latest_assistant_at,
         user_prompt_count,
         last_tool_use,
@@ -808,6 +817,34 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
         latest_kind,
         turn_active,
     })
+}
+
+fn is_progress_event(event: &Value, turn_active: Option<bool>) -> bool {
+    let payload = &event["payload"];
+    let kind = payload["type"].as_str().unwrap_or("");
+    match event["type"].as_str() {
+        Some("event_msg") => {
+            matches!(
+                kind,
+                "task_started"
+                    | "task_complete"
+                    | "turn_aborted"
+                    | "agent_message"
+                    | "agent_reasoning"
+            ) || (kind == "user_message" && turn_active != Some(true))
+        }
+        Some("response_item") => {
+            matches!(
+                kind,
+                "reasoning"
+                    | "function_call"
+                    | "custom_tool_call"
+                    | "function_call_output"
+                    | "custom_tool_call_output"
+            ) || (kind == "message" && payload["role"] == "assistant")
+        }
+        _ => false,
+    }
 }
 
 fn assistant_kind(payload: &Value, turn_active: &mut Option<bool>) -> LatestKind {
@@ -970,6 +1007,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn user_input_and_metadata_do_not_reset_active_turn_progress() {
+        let text = r#"{"timestamp":"2026-09-15T12:00:00Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-09-15T12:01:00Z","type":"response_item","payload":{"type":"reasoning"}}
+{"timestamp":"2026-09-15T12:20:00Z","type":"event_msg","payload":{"type":"user_message","message":"queued followup"}}
+{"timestamp":"2026-09-15T12:21:00Z","type":"turn_context","payload":{}}"#;
+        let digest = parse_rollout(Path::new("rollout.jsonl"), text, SystemTime::now()).unwrap();
+        assert_eq!(digest.status(), "busy");
+        assert_eq!(
+            digest.last_progress_at,
+            parse_timestamp("2026-09-15T12:01:00Z")
+        );
+        assert_eq!(
+            digest.last_event_at,
+            parse_timestamp("2026-09-15T12:21:00Z")
+        );
+    }
+
+    #[test]
     fn active_turn_stays_busy_through_commentary_and_code_mode_tools() {
         let events = [
             r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
@@ -987,6 +1042,10 @@ mod tests {
             let digest =
                 parse_rollout(Path::new("rollout.jsonl"), &text, SystemTime::UNIX_EPOCH).unwrap();
             assert_eq!(digest.status(), "busy", "event {index}");
+            assert_eq!(
+                digest.last_progress_at, digest.last_event_at,
+                "event {index}"
+            );
             assert_eq!(digest.last_stop_at(), None);
             assert_eq!(digest.pending_tool, index == 2);
             if index == 2 {

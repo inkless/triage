@@ -2,6 +2,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::models::{AttentionState, Provider, Session};
 
+pub const NO_PROGRESS_THRESHOLD: Duration = Duration::from_secs(15 * 60);
+
 const JUST_FINISHED_WINDOW: Duration = Duration::from_secs(3 * 60);
 const IDLE_LONG_THRESHOLD: Duration = Duration::from_secs(30 * 60);
 /// A session whose latest event is older than this is considered abandoned —
@@ -123,9 +125,21 @@ pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
     AttentionState::Unknown
 }
 
+pub fn no_progress_age(session: &Session, now: SystemTime) -> Option<Duration> {
+    if session.provider != Provider::Codex || session.status != "busy" {
+        return None;
+    }
+    let age = now.duration_since(session.last_progress_at?).ok()?;
+    (age >= NO_PROGRESS_THRESHOLD).then_some(age)
+}
+
 fn classify_codex(session: &Session, now: SystemTime) -> AttentionState {
     if session.pane_blocked {
         return AttentionState::Blocked;
+    }
+
+    if no_progress_age(session, now).is_some() {
+        return AttentionState::NoProgress;
     }
 
     let event_age = session
@@ -204,6 +218,33 @@ mod tests {
             });
         }
         session
+    }
+
+    #[test]
+    fn codex_no_progress_boundary_and_recovery() {
+        let now = SystemTime::now();
+        let mut session = busy_claude(now, Duration::ZERO, true);
+        session.provider = Provider::Codex;
+        session.last_event_at = Some(now);
+        session.last_progress_at = Some(now - NO_PROGRESS_THRESHOLD + Duration::from_secs(1));
+        assert_eq!(classify(&session, now), AttentionState::Working);
+        session.last_progress_at = Some(now - NO_PROGRESS_THRESHOLD);
+        assert_eq!(classify(&session, now), AttentionState::NoProgress);
+        session.pane_blocked = true;
+        assert_eq!(classify(&session, now), AttentionState::Blocked);
+        session.pane_blocked = false;
+        session.last_progress_at = Some(now);
+        assert_eq!(classify(&session, now), AttentionState::Working);
+        session.last_progress_at = Some(now + Duration::from_secs(1));
+        assert_eq!(classify(&session, now), AttentionState::Working);
+        session.last_progress_at = None;
+        assert_eq!(classify(&session, now), AttentionState::Working);
+        session.last_progress_at = Some(now - NO_PROGRESS_THRESHOLD);
+        session.status = "idle".into();
+        assert_eq!(no_progress_age(&session, now), None);
+        session.provider = Provider::Claude;
+        session.status = "busy".into();
+        assert_eq!(no_progress_age(&session, now), None);
     }
 
     #[test]

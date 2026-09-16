@@ -82,6 +82,28 @@ message body is pasted through an internal tmux buffer and submitted with a
 separate Enter, so agents can use either one-line text or a file/stdin body
 without caring about the transport.
 
+Codex turns with no recorded agent/tool progress for 15 minutes appear as
+`NoProgress` (`quiet` in the TUI, with “no progress Nm” in the headline).
+`agents --json` includes `no_progress_seconds` and `pending_tool`. User input
+and metadata updates do not reset the progress clock. A quiet turn can still
+be doing legitimate work; this is not a dead-process diagnosis. `can_receive`
+means the terminal accepts input, not that the agent has processed it.
+
+To explicitly interrupt an eligible quiet Codex turn:
+
+```bash
+triage interrupt --to '%42' --dry-run
+triage interrupt --to '%42'
+```
+
+The command rechecks session identity and progress, requires a readable pane,
+and refuses permission prompts, unsent drafts, unfinished tool calls, live
+child processes, or a transcript that changes during the checks. It sends one
+Escape and records the action in the message audit. There is no atomic lock
+with the receiving agent, so progress can resume after the final check.
+Interruption does not guarantee queued input is processed; inspect the agent
+again before using normal `send` for an urgent follow-up. `send` never interrupts.
+
 `launch` is the reusable tmux/process primitive behind the TUI's `N` shortcut
 and future mb-work fleet launch integration:
 

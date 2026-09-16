@@ -797,6 +797,20 @@ pub fn has_draft_input(pane: &str) -> bool {
     false
 }
 
+pub fn codex_composer_has_draft(pane: &str) -> Option<bool> {
+    let lines = pane.lines().collect::<Vec<_>>();
+    for (index, line) in lines.iter().enumerate().rev() {
+        if strip_ansi(line).trim_start().starts_with('›') {
+            let pos = line.find('›')?;
+            let continuation = lines
+                .get(index + 1)
+                .is_some_and(|line| !strip_ansi(line).trim().is_empty());
+            return Some(composer_has_real_text(&line[pos + '›'.len_utf8()..]) || continuation);
+        }
+    }
+    None
+}
+
 /// True if the composer content after the `❯` marker contains visible text at
 /// normal intensity. Two styles mark text as *not* real input, so they don't
 /// count:
@@ -1102,6 +1116,21 @@ fn is_chip_header(s: &str) -> bool {
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn codex_interrupt_composer_guard() {
+        assert_eq!(codex_composer_has_draft("› draft\n\n"), Some(true));
+        assert_eq!(
+            codex_composer_has_draft("› \n  wrapped draft\n"),
+            Some(true)
+        );
+        assert_eq!(
+            codex_composer_has_draft("› \x1b[2mAsk Codex to do anything\x1b[0m\n\n"),
+            Some(false)
+        );
+        assert_eq!(codex_composer_has_draft("› \n\n"), Some(false));
+        assert_eq!(codex_composer_has_draft("unknown layout"), None);
+    }
 
     #[test]
     fn parses_batched_pane_tails_by_marker() {

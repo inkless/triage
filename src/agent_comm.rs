@@ -9,7 +9,7 @@ use serde::Serialize;
 
 use crate::models::{AttentionState, Provider, Session, session_display_label};
 use crate::persist::{self, AliasKey};
-use crate::{codex, snapshot, tmux, transcript};
+use crate::{classifier, codex, snapshot, tmux, transcript};
 
 const MAX_MESSAGE_CHARS: usize = 8000;
 
@@ -34,6 +34,171 @@ pub fn cli_send(args: &[String]) -> i32 {
             e.code
         }
     }
+}
+
+pub fn cli_interrupt(args: &[String]) -> i32 {
+    match run_interrupt(args) {
+        Ok(message) => {
+            println!("{message}");
+            0
+        }
+        Err(error) => {
+            eprintln!("{}", error.message);
+            error.code
+        }
+    }
+}
+
+const INTERRUPT_USAGE: &str = "usage: triage interrupt --to TARGET [--dry-run]";
+
+fn run_interrupt(args: &[String]) -> Result<String, CliError> {
+    let (selector, dry_run) = parse_interrupt_args(args)?;
+    let Some(selector) = selector else {
+        return Ok(INTERRUPT_USAGE.to_string());
+    };
+    let sessions = load_snapshot()?;
+    let initial = resolve_target(&sessions, &selector)?;
+    interrupt_eligibility(initial, SystemTime::now()).map_err(CliError::denied)?;
+    let stamp = transcript_stamp(initial)?;
+    let pane_id = target_id(initial);
+
+    let fresh = load_snapshot()?;
+    let target = resolve_target(&fresh, &pane_id)?;
+    if target.session_id != initial.session_id || target.pid != initial.pid {
+        return Err(CliError::denied(
+            "target session changed during interrupt checks",
+        ));
+    }
+    interrupt_eligibility(target, SystemTime::now()).map_err(CliError::denied)?;
+    let gate = evaluate_send_gate_with_capture(target, true);
+    if !gate.can_send {
+        return Err(CliError::denied(gate.reason));
+    }
+    if has_live_children(target.pid)? {
+        return Err(CliError::denied(
+            "target has live child processes; tool activity may still be running",
+        ));
+    }
+    if transcript_stamp(target)? != stamp {
+        return Err(CliError::denied(
+            "target transcript changed during interrupt checks; retry after inspecting progress",
+        ));
+    }
+    if dry_run {
+        return Ok(format!(
+            "dry-run: would interrupt {} ({}) with Escape",
+            pane_id,
+            target_label(target)
+        ));
+    }
+    tmux::send_keys(&pane_id, &["Escape"])
+        .map_err(|error| CliError::delivery(format!("interrupt failed: {error}")))?;
+    if let Err(error) = append_message_audit(&AuditEntry::new(
+        "interrupt",
+        &selector,
+        target,
+        "interrupted",
+        None,
+        None,
+    )) {
+        eprintln!("warning: failed to append interrupt audit: {error}");
+    }
+    Ok(format!(
+        "interrupt sent to {pane_id}; queued input processing is not confirmed"
+    ))
+}
+
+fn parse_interrupt_args(args: &[String]) -> Result<(Option<String>, bool), CliError> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return Ok((None, false));
+    }
+    let mut selector = None;
+    let mut dry_run = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--to" if selector.is_none() => {
+                selector = Some(
+                    args.next()
+                        .filter(|value| !value.starts_with('-'))
+                        .ok_or_else(|| CliError::usage(INTERRUPT_USAGE))?
+                        .clone(),
+                );
+            }
+            "--dry-run" => dry_run = true,
+            _ => return Err(CliError::usage(INTERRUPT_USAGE)),
+        }
+    }
+    if selector.is_none() {
+        return Err(CliError::usage(INTERRUPT_USAGE));
+    }
+    Ok((selector, dry_run))
+}
+
+fn interrupt_eligibility(session: &Session, now: SystemTime) -> Result<(), &'static str> {
+    if classifier::no_progress_age(session, now).is_none() {
+        return Err(
+            "requires an active Codex turn with no observable progress for at least 15 minutes",
+        );
+    }
+    if session.last_tool_use.is_some() {
+        return Err(
+            "target has an unfinished tool call; quiet tools are not proof of a stalled turn",
+        );
+    }
+    Ok(())
+}
+
+fn transcript_stamp(session: &Session) -> Result<(SystemTime, u64), CliError> {
+    let path = session
+        .transcript_path
+        .as_ref()
+        .ok_or_else(|| CliError::denied("target has no readable transcript"))?;
+    let metadata = fs::metadata(path).map_err(|error| CliError::runtime(error.to_string()))?;
+    Ok((
+        metadata
+            .modified()
+            .map_err(|error| CliError::runtime(error.to_string()))?,
+        metadata.len(),
+    ))
+}
+
+fn has_live_children(pid: u32) -> Result<bool, CliError> {
+    let output = Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,stat="])
+        .output()
+        .map_err(|error| CliError::runtime(format!("interrupt process check failed: {error}")))?;
+    if !output.status.success() {
+        return Err(CliError::runtime(format!(
+            "interrupt process check failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    live_children_in_ps(pid, &String::from_utf8_lossy(&output.stdout)).map_err(CliError::runtime)
+}
+
+fn live_children_in_ps(pid: u32, text: &str) -> Result<bool, &'static str> {
+    let mut found_target = false;
+    let mut live_child = false;
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() != 3 {
+            return Err("interrupt process check returned malformed output");
+        }
+        let child = fields[0].parse::<u32>().map_err(|_| "invalid process id")?;
+        let parent = fields[1]
+            .parse::<u32>()
+            .map_err(|_| "invalid parent process id")?;
+        found_target |= child == pid && !fields[2].starts_with('Z');
+        live_child |= parent == pid && !fields[2].starts_with('Z');
+    }
+    if !found_target {
+        return Err("interrupt target process is no longer live");
+    }
+    Ok(live_child)
 }
 
 #[derive(Debug)]
@@ -99,6 +264,8 @@ struct AgentRow {
     cwd: String,
     state: String,
     can_receive: bool,
+    no_progress_seconds: Option<u64>,
+    pending_tool: bool,
     deny_reason: Option<String>,
     pane_target: Option<String>,
     pane_id: Option<String>,
@@ -161,6 +328,9 @@ fn run_agents(args: &[String]) -> Result<(), CliError> {
                 row.id, row.provider, row.state, row.name, recv
             );
             println!("       cwd: {}", row.cwd);
+            if let Some(seconds) = row.no_progress_seconds {
+                println!("       no progress {}m", seconds / 60);
+            }
             if let Some(headline) = row.headline {
                 println!(
                     "       headline: {}",
@@ -310,7 +480,9 @@ fn deliver_message(
         eprintln!("warning: failed to append agent-message audit: {e}");
     }
 
-    let suffix = if target.state == AttentionState::Working {
+    let suffix = if target.state == AttentionState::NoProgress {
+        "; no recent agent progress, input submitted but processing is unconfirmed"
+    } else if target.state == AttentionState::Working {
         "; target is Working, input queued by terminal"
     } else {
         ""
@@ -471,6 +643,10 @@ struct GateResult {
 }
 
 fn evaluate_send_gate(s: &Session) -> GateResult {
+    evaluate_send_gate_with_capture(s, false)
+}
+
+fn evaluate_send_gate_with_capture(s: &Session, require_capture: bool) -> GateResult {
     let Some(pane) = &s.pane else {
         return blocked("target has no tmux pane");
     };
@@ -490,11 +666,24 @@ fn evaluate_send_gate(s: &Session) -> GateResult {
         {
             return blocked("target has a visible permission prompt");
         }
+        if require_capture && s.provider == Provider::Codex {
+            match tmux::codex_composer_has_draft(&raw) {
+                Some(false) => {}
+                Some(true) => {
+                    return blocked(
+                        "target has unsent text or an unrecognized composer continuation",
+                    );
+                }
+                None => return blocked("cannot recognize the Codex composer before interrupt"),
+            }
+        }
         // Real (non-faint) text in the composer means the user is mid-typing —
         // a paste would land on their draft and submit the mangled result.
         if tmux::has_draft_input(&raw) {
             return blocked("target has unsent text in its input box (user may be typing)");
         }
+    } else if require_capture {
+        return blocked("cannot inspect target pane before interrupt");
     }
 
     // Everything past the prompt checks is reachable. The only genuine
@@ -525,6 +714,9 @@ fn agent_row(s: &Session) -> AgentRow {
         cwd: s.cwd.display().to_string(),
         state: attention_state_name(s.state).to_string(),
         can_receive: gate.can_send,
+        no_progress_seconds: classifier::no_progress_age(s, SystemTime::now())
+            .map(|age| age.as_secs()),
+        pending_tool: s.provider == Provider::Codex && s.last_tool_use.is_some(),
         deny_reason: (!gate.can_send).then_some(gate.reason),
         pane_target: s.pane.as_ref().map(|p| p.target.clone()),
         pane_id: s.pane.as_ref().map(|p| p.pane_id.clone()),
@@ -560,6 +752,7 @@ fn attention_state_name(state: AttentionState) -> &'static str {
         AttentionState::Blocked => "Blocked",
         AttentionState::JustFinished => "JustFinished",
         AttentionState::Working => "Working",
+        AttentionState::NoProgress => "NoProgress",
         AttentionState::Fresh => "Fresh",
         AttentionState::IdleShort => "IdleShort",
         AttentionState::IdleLong => "IdleLong",

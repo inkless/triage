@@ -1357,7 +1357,8 @@ fn build_row(
     is_selected: bool,
 ) -> Row<'static> {
     let (state_str, color) = state_glyph(s.state);
-    let age = idle_age(s, now)
+    let age = crate::classifier::no_progress_age(s, now)
+        .or_else(|| idle_age(s, now))
         .map(format_duration)
         .unwrap_or_else(|| "—".to_string());
 
@@ -1403,6 +1404,14 @@ fn build_row(
             .or_else(|| s.last_prompt.clone())
             .map(|t| t.replace('\n', " "))
             .unwrap_or_else(|| "(no transcript)".to_string())
+    };
+
+    let headline_raw = if s.state == AttentionState::NoProgress {
+        let minutes =
+            crate::classifier::no_progress_age(s, now).map_or(0, |age| age.as_secs() / 60);
+        format!("no progress {minutes}m · {headline_raw}")
+    } else {
+        headline_raw
     };
 
     // Narrow layout has only STATE+HEADLINE columns, so prefix the headline
@@ -1598,6 +1607,7 @@ fn state_glyph(state: AttentionState) -> (String, Color) {
         AttentionState::Blocked => Color::Yellow,
         AttentionState::JustFinished => Color::Green,
         AttentionState::Working => Color::Cyan,
+        AttentionState::NoProgress => Color::Yellow,
         AttentionState::Fresh => Color::White,
         AttentionState::IdleShort => Color::DarkGray,
         AttentionState::IdleLong => Color::DarkGray,
@@ -2326,6 +2336,45 @@ mod tests {
     use crate::models::Pane;
 
     use super::*;
+
+    #[test]
+    fn quiet_codex_row_renders_progress_age() {
+        let now = SystemTime::now();
+        let mut session = Session::new(
+            Provider::Codex,
+            1,
+            "test".into(),
+            PathBuf::from("/tmp"),
+            None,
+            "busy".into(),
+            0,
+            0,
+            None,
+        );
+        session.last_progress_at = Some(now - crate::classifier::NO_PROGRESS_THRESHOLD);
+        session.last_event_at = Some(now);
+        session.state = crate::classifier::classify(&session, now);
+        let backend = ratatui::backend::TestBackend::new(100, 5);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                let row = build_row(&session, now, 80, LayoutMode::Narrow, false);
+                frame.render_widget(
+                    Table::new([row], [Constraint::Length(8), Constraint::Min(80)]),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("quiet"));
+        assert!(rendered.contains("no progress 15m"));
+    }
 
     #[test]
     fn live_codex_token_rollup_uses_only_codex_sessions() {

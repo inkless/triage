@@ -28,9 +28,11 @@ fn run_failure(tool: &str) {
         vec!["agents", "whoami"],
         vec!["send", "--to", "%1", "--message", "test", "--dry-run"],
         vec!["--probe"],
+        vec!["interrupt", "--to", "%1", "--dry-run"],
     ] {
         let output = Command::new(env!("CARGO_BIN_EXE_triage"))
             .args(&args)
+            .env("TMUX_PANE", "%fixture")
             .env("HOME", &dir)
             .env("PATH", &dir)
             .output()

@@ -129,6 +129,12 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Interrupt a Codex turn with no observable progress for at least 15 minutes
+    #[command(disable_help_flag = true)]
+    Interrupt {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Launch a configured Claude/Codex agent tmux window
     #[command(disable_help_flag = true)]
     Launch {
@@ -160,6 +166,7 @@ fn main() -> io::Result<()> {
             Command::Cost { args } => return cost_rollup::cli_cost(&args),
             Command::Agents { args } => std::process::exit(agent_comm::cli_agents(&args)),
             Command::Send { args } => std::process::exit(agent_comm::cli_send(&args)),
+            Command::Interrupt { args } => std::process::exit(agent_comm::cli_interrupt(&args)),
             Command::Launch { args } => std::process::exit(spawn_agent::cli_launch(&args)),
         }
     }
@@ -285,6 +292,9 @@ fn probe() -> io::Result<()> {
             s.cwd.display()
         );
         println!("    headline: {head_short}");
+        if let Some(age) = classifier::no_progress_age(s, now) {
+            println!("    no progress {}m", age.as_secs() / 60);
+        }
         if let Some((n, b)) = &s.last_tool_use {
             let b_short: String = b.chars().take(120).collect();
             println!("    pending:  {n} — {b_short}");
