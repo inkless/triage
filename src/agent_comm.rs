@@ -643,7 +643,7 @@ struct GateResult {
 }
 
 fn evaluate_send_gate(s: &Session) -> GateResult {
-    evaluate_send_gate_with_capture(s, false)
+    evaluate_send_gate_with_capture(s, s.provider == Provider::Codex)
 }
 
 fn evaluate_send_gate_with_capture(s: &Session, require_capture: bool) -> GateResult {
@@ -666,7 +666,7 @@ fn evaluate_send_gate_with_capture(s: &Session, require_capture: bool) -> GateRe
         {
             return blocked("target has a visible permission prompt");
         }
-        if require_capture && s.provider == Provider::Codex {
+        if s.provider == Provider::Codex {
             match tmux::codex_composer_has_draft(&raw) {
                 Some(false) => {}
                 Some(true) => {
@@ -674,24 +674,19 @@ fn evaluate_send_gate_with_capture(s: &Session, require_capture: bool) -> GateRe
                         "target has unsent text or an unrecognized composer continuation",
                     );
                 }
-                None => return blocked("cannot recognize the Codex composer before interrupt"),
+                None => return blocked("cannot recognize the Codex composer"),
             }
         }
         // Real (non-faint) text in the composer means the user is mid-typing —
         // a paste would land on their draft and submit the mangled result.
-        if tmux::has_draft_input(&raw) {
+        if s.provider == Provider::Claude && tmux::has_draft_input(&raw) {
             return blocked("target has unsent text in its input box (user may be typing)");
         }
     } else if require_capture {
-        return blocked("cannot inspect target pane before interrupt");
+        return blocked("cannot inspect target pane");
     }
 
-    // Everything past the prompt checks is reachable. The only genuine
-    // "do not send" conditions are the two above — no pane to paste into, and
-    // a visible permission prompt (our keystrokes would answer it). Attention
-    // state does NOT gate delivery: Working queues input; Stale is just a
-    // >=24h-idle heuristic (a send wakes a long-idle-but-alive agent rather
-    // than failing); Error/Unknown sit at a normal prompt and take input fine.
+    // Working sessions may queue input; attention state does not gate delivery.
     GateResult {
         can_send: true,
         reason: String::new(),

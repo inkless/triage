@@ -22,9 +22,12 @@ capture-pane)
     capture-failure) exit 1 ;;
     permission) printf 'Would you like to run the following command?\n  $ test\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n' ;;
     draft) printf '› unsent draft\n' ;;
+    wrapped) printf '› \n  wrapped draft\n' ;;
+    unknown) printf 'unrecognized screen\n' ;;
+    placeholder) printf '› \033[2mAsk Codex to do anything\033[0m\n\n' ;;
     *) printf '› \n' ;;
   esac ;;
-send-keys) echo "$*" >> "$HOME/keys" ;;
+send-keys|load-buffer|paste-buffer) echo "$*" >> "$HOME/keys" ;;
 esac
 "#,
         ),
@@ -73,6 +76,62 @@ exit 0
     assert_eq!(rows[0]["state"], "NoProgress");
     assert!(rows[0]["no_progress_seconds"].as_u64().unwrap() >= 900);
     assert_eq!(rows[0]["can_receive"], true);
+
+    for scenario in [
+        "draft",
+        "wrapped",
+        "unknown",
+        "capture-failure",
+        "permission",
+    ] {
+        let rows = run(scenario, &["agents", "--json"]);
+        assert!(rows.status.success());
+        let rows: serde_json::Value = serde_json::from_slice(&rows.stdout).unwrap();
+        assert_eq!(rows[0]["can_receive"], false, "{scenario}");
+        let send = run(
+            scenario,
+            &[
+                "send",
+                "--to",
+                "%42",
+                "--from",
+                "test",
+                "--message",
+                "hello",
+            ],
+        );
+        assert_eq!(
+            send.status.code(),
+            Some(3),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&send.stderr)
+        );
+        assert!(
+            !dir.join("keys").exists(),
+            "{scenario} pasted into the composer"
+        );
+    }
+    for scenario in ["quiet", "placeholder"] {
+        let send = run(
+            scenario,
+            &[
+                "send",
+                "--to",
+                "%42",
+                "--from",
+                "test",
+                "--message",
+                "hello",
+                "--dry-run",
+            ],
+        );
+        assert!(
+            send.status.success(),
+            "{scenario}: {}",
+            String::from_utf8_lossy(&send.stderr)
+        );
+        assert!(!dir.join("keys").exists());
+    }
 
     let dry = run("quiet", &["interrupt", "--to", "%42", "--dry-run"]);
     assert!(

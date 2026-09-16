@@ -76,7 +76,9 @@ printf '%s\n' "short message" | triage send --to '%42' --from TRI-106 -
 
 `send` recomputes a fresh snapshot, refuses ambiguous/no-pane/unknown targets,
 and denies delivery when the target is on a visible Claude/Codex permission
-prompt. Working sessions are allowed when no prompt is visible; the receiving
+prompt. Codex delivery also requires a readable, recognized composer with no
+unsent text; drafts and uncertain composer layouts are refused. Working sessions
+are allowed when the composer is clear; the receiving
 agent's terminal may queue the submitted line until its next input slot. The
 message body is pasted through an internal tmux buffer and submitted with a
 separate Enter, so agents can use either one-line text or a file/stdin body
