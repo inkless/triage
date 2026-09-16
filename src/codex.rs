@@ -530,6 +530,7 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
     let mut function_calls: Vec<CodexFunctionCall> = Vec::new();
     let mut completed_calls: HashSet<String> = HashSet::new();
     let mut turn_active = None;
+    let mut resume_after_final = false;
     let mut latest_kind = LatestKind::None;
     let mut latest_kind_at: Option<SystemTime> = None;
 
@@ -548,6 +549,10 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
             if last_event_at.is_none_or(|prev| t > prev) {
                 last_event_at = Some(t);
             }
+        }
+        if resume_after_final && is_turn_continuation(&v) {
+            turn_active = Some(true);
+            resume_after_final = false;
         }
         if is_progress_event(&v, turn_active)
             && let Some(t) = ts
@@ -608,11 +613,13 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
                     match payload.get("type").and_then(|t| t.as_str()).unwrap_or("") {
                         "task_complete" | "turn_aborted" => {
                             turn_active = Some(false);
+                            resume_after_final = false;
                             function_calls.clear();
                             completed_calls.clear();
                         }
                         "task_started" => {
                             turn_active = Some(true);
+                            resume_after_final = false;
                             function_calls.clear();
                             completed_calls.clear();
                             if let Some(n) =
@@ -647,7 +654,11 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
                             if let Some(message) = payload.get("message").and_then(|m| m.as_str())
                                 && let Some(t) = ts
                             {
-                                let kind = assistant_kind(payload, &mut turn_active);
+                                let kind = assistant_kind(
+                                    payload,
+                                    &mut turn_active,
+                                    &mut resume_after_final,
+                                );
                                 update_assistant(&mut latest_assistant, t, message.to_string());
                                 mark_latest(&mut latest_kind, &mut latest_kind_at, kind, ts);
                             }
@@ -679,7 +690,11 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
                                 && let Some(text) = content_text(content, "output_text")
                                 && let Some(t) = ts
                             {
-                                let kind = assistant_kind(payload, &mut turn_active);
+                                let kind = assistant_kind(
+                                    payload,
+                                    &mut turn_active,
+                                    &mut resume_after_final,
+                                );
                                 update_assistant(&mut latest_assistant, t, text);
                                 mark_latest(&mut latest_kind, &mut latest_kind_at, kind, ts);
                             }
@@ -847,10 +862,40 @@ fn is_progress_event(event: &Value, turn_active: Option<bool>) -> bool {
     }
 }
 
-fn assistant_kind(payload: &Value, turn_active: &mut Option<bool>) -> LatestKind {
+fn is_turn_continuation(event: &Value) -> bool {
+    let payload = &event["payload"];
+    match event["type"].as_str() {
+        Some("response_item") => {
+            matches!(
+                payload["type"].as_str(),
+                Some(
+                    "reasoning"
+                        | "function_call"
+                        | "custom_tool_call"
+                        | "function_call_output"
+                        | "custom_tool_call_output"
+                )
+            ) || (payload["type"] == "message"
+                && payload["role"] == "assistant"
+                && payload["phase"] == "commentary")
+        }
+        Some("event_msg") => {
+            payload["type"] == "agent_reasoning"
+                || (payload["type"] == "agent_message" && payload["phase"] == "commentary")
+        }
+        _ => false,
+    }
+}
+
+fn assistant_kind(
+    payload: &Value,
+    turn_active: &mut Option<bool>,
+    resume_after_final: &mut bool,
+) -> LatestKind {
     match payload.get("phase").and_then(Value::as_str) {
         Some("commentary") => LatestKind::Commentary,
         Some("final_answer") => {
+            *resume_after_final |= *turn_active != Some(false);
             *turn_active = Some(false);
             LatestKind::Assistant
         }
@@ -1005,6 +1050,40 @@ fn system_time_ms(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn work_after_final_answer_reopens_turn_until_explicit_completion() {
+        let final_answer = r#"{"timestamp":"2026-09-16T21:12:46Z","type":"event_msg","payload":{"type":"task_started"}}
+{"timestamp":"2026-09-16T21:17:14Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"Batch finished"}]}}
+{"timestamp":"2026-09-16T21:17:14Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"queued followup"}]}}
+"#;
+        let parse = |text: &str| {
+            parse_rollout(Path::new("rollout.jsonl"), text, SystemTime::now()).unwrap()
+        };
+        assert_eq!(parse(final_answer).status(), "idle");
+        for continuation in [
+            r#"{"type":"reasoning"}"#,
+            r#"{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"Continuing"}]}"#,
+            r#"{"type":"custom_tool_call","call_id":"next","name":"exec"}"#,
+            r#"{"type":"custom_tool_call_output","call_id":"next","output":"ok"}"#,
+        ] {
+            let event = format!(
+                "{{\"timestamp\":\"2026-09-16T21:34:06Z\",\"type\":\"response_item\",\"payload\":{continuation}}}\n"
+            );
+            let resumed = parse(&format!("{final_answer}{event}"));
+            assert_eq!(resumed.status(), "busy");
+            assert_eq!(
+                resumed.last_progress_at,
+                parse_timestamp("2026-09-16T21:34:06Z")
+            );
+            for terminal in ["task_complete", "turn_aborted"] {
+                let ended = format!(
+                    "{final_answer}{{\"timestamp\":\"2026-09-16T21:18:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"{terminal}\"}}}}\n{event}"
+                );
+                assert_eq!(parse(&ended).status(), "idle", "{terminal}");
+            }
+        }
+    }
 
     #[test]
     fn user_input_and_metadata_do_not_reset_active_turn_progress() {
