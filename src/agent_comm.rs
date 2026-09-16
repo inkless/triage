@@ -415,13 +415,20 @@ fn load_snapshot() -> Result<Vec<Session>, CliError> {
     let aliases: HashMap<AliasKey, String> = loaded.aliases.into_iter().collect();
     let mut digest_cache = transcript::DigestCache::new();
     let mut codex_cache = codex::CodexDigestCache::new();
-    Ok(snapshot::discover_sessions_with_panes(
+    let sessions = snapshot::discover_sessions_with_panes(
         SystemTime::now(),
         &mut digest_cache,
         &mut codex_cache,
         &aliases,
         panes,
-    ))
+    );
+    if !codex_cache.discovery_errors.is_empty() {
+        return Err(CliError::runtime(format!(
+            "Codex discovery unavailable: {}",
+            codex_cache.discovery_errors.join("; ")
+        )));
+    }
+    Ok(sessions)
 }
 
 fn resolve_target<'a>(sessions: &'a [Session], selector: &str) -> Result<&'a Session, CliError> {

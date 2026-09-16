@@ -238,6 +238,12 @@ fn probe() -> io::Result<()> {
     let mut digest_cache = transcript::DigestCache::new();
     let mut codex_cache = codex::CodexDigestCache::new();
     let sessions = snapshot::discover_sessions(now, &mut digest_cache, &mut codex_cache, &aliases);
+    if !codex_cache.discovery_errors.is_empty() {
+        return Err(io::Error::other(format!(
+            "Codex discovery unavailable: {}",
+            codex_cache.discovery_errors.join("; ")
+        )));
+    }
     let claude_count = sessions
         .iter()
         .filter(|s| s.provider == models::Provider::Claude)
@@ -916,6 +922,21 @@ fn refresh(app: &mut AppState) {
         &mut app.codex_cache,
         &app.aliases,
     );
+
+    if !app.codex_cache.discovery_errors.is_empty() {
+        app.status_msg = Some(format!(
+            "Codex discovery unavailable: {}",
+            app.codex_cache.discovery_errors.join("; ")
+        ));
+        return;
+    }
+    if app
+        .status_msg
+        .as_deref()
+        .is_some_and(|message| message.starts_with("Codex discovery unavailable:"))
+    {
+        app.status_msg = None;
+    }
 
     // Auto-unmute any session whose user-text timestamp has advanced past the
     // mute-at time. The user typing in a muted pane is the strongest possible

@@ -17,6 +17,7 @@ pub fn sessions_dir() -> PathBuf {
 
 #[derive(Default)]
 pub struct CodexDigestCache {
+    pub discovery_errors: Vec<String>,
     entries: HashMap<PathBuf, (SystemTime, Option<CodexDigest>)>,
     thread_titles: Option<(CodexStateStamp, HashMap<String, CodexThreadTitle>)>,
     thread_roots: Option<(CodexStateStamp, HashMap<String, String>)>,
@@ -62,7 +63,13 @@ impl CodexDigestCache {
         {
             return cached.clone();
         }
-        let titles = load_thread_titles(&path);
+        let titles = match load_thread_titles(&path) {
+            Ok(value) => value,
+            Err(error) => {
+                self.discovery_errors.push(error);
+                return HashMap::new();
+            }
+        };
         self.thread_titles = Some((stamp, titles.clone()));
         titles
     }
@@ -80,7 +87,13 @@ impl CodexDigestCache {
         {
             return cached.clone();
         }
-        let roots = load_thread_roots(&path);
+        let roots = match load_thread_roots(&path) {
+            Ok(value) => value,
+            Err(error) => {
+                self.discovery_errors.push(error);
+                return HashMap::new();
+            }
+        };
         self.thread_roots = Some((stamp, roots.clone()));
         roots
     }
@@ -91,11 +104,26 @@ pub fn discover_live_sessions(
     ppid_map: &HashMap<u32, u32>,
     cache: &mut CodexDigestCache,
 ) -> Vec<Session> {
+    cache.discovery_errors.clear();
     let mut out = Vec::new();
     let thread_titles = cache.thread_titles();
     let thread_roots = cache.thread_roots();
-    for pid in codex_pids() {
-        let Some((path, digest)) = select_rollout(rollout_paths_for_pid(pid), cache) else {
+    let pids = match codex_pids() {
+        Ok(pids) => pids,
+        Err(error) => {
+            cache.discovery_errors.push(error);
+            return out;
+        }
+    };
+    for pid in pids {
+        let paths = match rollout_paths_for_pid(pid) {
+            Ok(paths) => paths,
+            Err(error) => {
+                cache.discovery_errors.push(error);
+                continue;
+            }
+        };
+        let Some((path, digest)) = select_rollout(paths, cache) else {
             continue;
         };
         let cwd = digest
@@ -161,7 +189,13 @@ pub fn load_thread_roots_for_aliases() -> HashMap<String, String> {
     let Some(path) = codex_state_path() else {
         return HashMap::new();
     };
-    load_thread_roots(&path)
+    if !path.exists() {
+        return HashMap::new();
+    }
+    load_thread_roots(&path).unwrap_or_else(|error| {
+        eprintln!("Codex alias lookup unavailable: {error}");
+        HashMap::new()
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,40 +238,50 @@ impl CodexThreadTitle {
     }
 }
 
-fn load_thread_titles(path: &Path) -> HashMap<String, CodexThreadTitle> {
-    let Ok(out) = Command::new("sqlite3")
-        .args([
-            "-readonly",
-            "-json",
-            &path.to_string_lossy(),
-            "select id, title, agent_nickname, agent_role from threads where archived = 0",
-        ])
+fn checked_output(command: &mut Command, context: &str) -> Result<Vec<u8>, String> {
+    let out = command
         .output()
-    else {
-        return HashMap::new();
-    };
+        .map_err(|error| format!("{context}: {error}"))?;
     if !out.status.success() {
-        return HashMap::new();
+        return Err(format!(
+            "{context}: {}{}",
+            out.status,
+            if out.stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", String::from_utf8_lossy(&out.stderr).trim())
+            }
+        ));
     }
-    parse_thread_titles_json(&out.stdout)
+    Ok(out.stdout)
 }
 
-fn load_thread_roots(path: &Path) -> HashMap<String, String> {
-    let Ok(out) = Command::new("sqlite3")
-        .args([
-            "-readonly",
-            "-json",
-            &path.to_string_lossy(),
-            "select parent_thread_id, child_thread_id from thread_spawn_edges",
-        ])
-        .output()
-    else {
-        return HashMap::new();
-    };
-    if !out.status.success() {
-        return HashMap::new();
+fn sqlite_rows(path: &Path, query: &str) -> Result<Vec<u8>, String> {
+    let bytes = checked_output(
+        Command::new("sqlite3").args(["-readonly", "-json", &path.to_string_lossy(), query]),
+        "sqlite3 Codex metadata lookup failed",
+    )?;
+    if !bytes.is_empty() {
+        serde_json::from_slice::<Vec<Value>>(&bytes)
+            .map_err(|error| format!("invalid sqlite3 Codex metadata: {error}"))?;
     }
-    parse_thread_roots_json(&out.stdout)
+    Ok(bytes)
+}
+
+fn load_thread_titles(path: &Path) -> Result<HashMap<String, CodexThreadTitle>, String> {
+    sqlite_rows(
+        path,
+        "select id, title, agent_nickname, agent_role from threads where archived = 0",
+    )
+    .map(|bytes| parse_thread_titles_json(&bytes))
+}
+
+fn load_thread_roots(path: &Path) -> Result<HashMap<String, String>, String> {
+    sqlite_rows(
+        path,
+        "select parent_thread_id, child_thread_id from thread_spawn_edges",
+    )
+    .map(|bytes| parse_thread_roots_json(&bytes))
 }
 
 fn parse_thread_roots_json(bytes: &[u8]) -> HashMap<String, String> {
@@ -326,15 +370,13 @@ fn normalize_codex_label(raw: &str) -> Option<String> {
     Some(crate::approval::truncate(&label, 80))
 }
 
-fn codex_pids() -> Vec<u32> {
-    let Ok(out) = Command::new("ps").args(["-A", "-o", "pid=,comm="]).output() else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
-    }
+fn codex_pids() -> Result<Vec<u32>, String> {
+    let stdout = checked_output(
+        Command::new("ps").args(["-A", "-o", "pid=,comm="]),
+        "ps Codex discovery failed",
+    )?;
     let mut pids = Vec::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
+    for line in String::from_utf8_lossy(&stdout).lines() {
         let line = line.trim();
         let Some((pid_raw, command)) = split_first_ws(line) else {
             continue;
@@ -346,25 +388,31 @@ fn codex_pids() -> Vec<u32> {
             pids.push(pid);
         }
     }
-    pids
+    Ok(pids)
 }
 
-fn rollout_paths_for_pid(pid: u32) -> Vec<PathBuf> {
-    let Ok(out) = Command::new("lsof")
-        .args(["-Fn", "-p", &pid.to_string()])
-        .output()
-    else {
-        return Vec::new();
+fn rollout_paths_for_pid(pid: u32) -> Result<Vec<PathBuf>, String> {
+    let stdout = match checked_output(
+        Command::new("lsof").args(["-Fn", "-p", &pid.to_string()]),
+        &format!("lsof Codex discovery failed for pid {pid}"),
+    ) {
+        Ok(stdout) => stdout,
+        Err(error) => {
+            // A process may exit between ps and lsof.
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
+                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return Ok(Vec::new());
+            }
+            return Err(error);
+        }
     };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    String::from_utf8_lossy(&out.stdout)
+    Ok(String::from_utf8_lossy(&stdout)
         .lines()
         .filter_map(|line| line.strip_prefix('n'))
         .filter(|path| is_codex_rollout(path))
         .map(PathBuf::from)
-        .collect()
+        .collect())
 }
 
 fn select_rollout(
