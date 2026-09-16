@@ -38,8 +38,8 @@ esac
 case "$*" in
 *stat*)
   [ "$SCENARIO" = process-failure ] && exit 1
-  echo "$FIXTURE_PID 1 S"
-  [ "$SCENARIO" = child ] && echo "999999 $FIXTURE_PID S"
+  echo "$FIXTURE_PID 1 S 00:01 codex"
+  [ "$SCENARIO" = child ] && echo "999999 $FIXTURE_PID S 00:00 sleep 60"
   [ "$SCENARIO" = changed ] && printf '\n{}\n' >> "$FIXTURE_ROLLOUT"
   ;;
 *comm*) echo "$FIXTURE_PID codex" ;;

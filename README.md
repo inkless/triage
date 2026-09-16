@@ -100,7 +100,11 @@ triage interrupt --to '%42'
 
 The command rechecks session identity and progress, requires a readable pane,
 and refuses permission prompts, unsent drafts, unfinished tool calls, live
-child processes, or a transcript that changes during the checks. It sends one
+task processes, or a transcript that changes during the checks. Recognized sleeping
+startup services (Codex code-mode host and the supported memory-bank, Playwright,
+and Salesforce MCP launch chains) may remain: they must start within 30 seconds
+of Codex and predate its last recorded progress. Every descendant is checked;
+new services, unknown commands, and browser/task children still block interruption. It sends one
 Escape and records the action in the message audit. There is no atomic lock
 with the receiving agent, so progress can resume after the final check.
 Interruption does not guarantee queued input is processed; inspect the agent

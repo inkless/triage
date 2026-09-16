@@ -74,7 +74,7 @@ fn run_interrupt(args: &[String]) -> Result<String, CliError> {
     if !gate.can_send {
         return Err(CliError::denied(gate.reason));
     }
-    if has_live_children(target.pid)? {
+    if has_live_children(target)? {
         return Err(CliError::denied(
             "target has live child processes; tool activity may still be running",
         ));
@@ -166,9 +166,9 @@ fn transcript_stamp(session: &Session) -> Result<(SystemTime, u64), CliError> {
     ))
 }
 
-fn has_live_children(pid: u32) -> Result<bool, CliError> {
+fn has_live_children(session: &Session) -> Result<bool, CliError> {
     let output = Command::new("ps")
-        .args(["-A", "-o", "pid=,ppid=,stat="])
+        .args(["-ww", "-A", "-o", "pid=,ppid=,stat=,etime=,args="])
         .output()
         .map_err(|error| CliError::runtime(format!("interrupt process check failed: {error}")))?;
     if !output.status.success() {
@@ -177,28 +177,169 @@ fn has_live_children(pid: u32) -> Result<bool, CliError> {
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
-    live_children_in_ps(pid, &String::from_utf8_lossy(&output.stdout)).map_err(CliError::runtime)
+    let quiet_age = classifier::no_progress_age(session, SystemTime::now())
+        .ok_or_else(|| CliError::denied("target is no longer eligible for interrupt"))?;
+    live_children_in_ps(
+        session.pid,
+        quiet_age.as_secs(),
+        &String::from_utf8_lossy(&output.stdout),
+    )
+    .map_err(CliError::runtime)
 }
 
-fn live_children_in_ps(pid: u32, text: &str) -> Result<bool, &'static str> {
-    let mut found_target = false;
-    let mut live_child = false;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BaselineService {
+    MemoryLauncher,
+    PlaywrightLauncher,
+    SalesforceLauncher,
+    Worker,
+}
+
+fn baseline_service(command: &[&str], parent: Option<BaselineService>) -> Option<BaselineService> {
+    use BaselineService::*;
+    let executable = std::path::Path::new(*command.first()?)
+        .file_name()?
+        .to_str()?;
+    let args = &command[1..];
+    match (parent, executable, args) {
+        (None, "codex-code-mode-host", []) => Some(Worker),
+        (
+            None,
+            "uv",
+            [
+                "tool",
+                "uvx",
+                "--from",
+                "git+ssh://git@github.com/Affirm/ai-memory-bank-mcp",
+                "mcp_memory_bank_setup",
+            ],
+        ) => Some(MemoryLauncher),
+        (None, "npm", ["exec", package]) if package.starts_with("@playwright/mcp@") => {
+            Some(PlaywrightLauncher)
+        }
+        (
+            None,
+            "npm",
+            [
+                "exec",
+                package,
+                "--orgs",
+                "DEFAULT_TARGET_ORG",
+                "--toolsets",
+                "orgs,metadata,data,users",
+            ],
+        ) if package.starts_with("@salesforce/mcp@") => Some(SalesforceLauncher),
+        (Some(MemoryLauncher), "python" | "python3", [script])
+            if std::path::Path::new(script)
+                .file_name()
+                .is_some_and(|name| name == "mcp_memory_bank_setup") =>
+        {
+            Some(Worker)
+        }
+        (Some(PlaywrightLauncher), "node", [script])
+            if script.ends_with("/node_modules/.bin/playwright-mcp") =>
+        {
+            Some(Worker)
+        }
+        (
+            Some(SalesforceLauncher),
+            "node",
+            [
+                script,
+                "--orgs",
+                "DEFAULT_TARGET_ORG",
+                "--toolsets",
+                "orgs,metadata,data,users",
+            ],
+        ) if script.ends_with("/node_modules/.bin/sf-mcp-server") => Some(Worker),
+        _ => None,
+    }
+}
+
+fn elapsed_seconds(raw: &str) -> Option<u64> {
+    let (days, time) = match raw.split_once('-') {
+        Some((days, time)) => (days.parse::<u64>().ok()?, time),
+        None => (0, raw),
+    };
+    let parts = time
+        .split(':')
+        .map(str::parse::<u64>)
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    let (hours, minutes, seconds) = match parts.as_slice() {
+        [minutes, seconds] if days == 0 => (0, *minutes, *seconds),
+        [hours, minutes, seconds] => (*hours, *minutes, *seconds),
+        _ => return None,
+    };
+    if minutes >= 60 || seconds >= 60 {
+        return None;
+    }
+    days.checked_mul(24)?
+        .checked_add(hours)?
+        .checked_mul(60)?
+        .checked_add(minutes)?
+        .checked_mul(60)?
+        .checked_add(seconds)
+}
+
+fn live_children_in_ps(pid: u32, quiet_seconds: u64, text: &str) -> Result<bool, &'static str> {
+    struct Process<'a> {
+        pid: u32,
+        parent: u32,
+        state: &'a str,
+        age: u64,
+        command: Vec<&'a str>,
+    }
+    let mut processes = Vec::new();
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() != 3 {
+        if fields.len() < 5 {
             return Err("interrupt process check returned malformed output");
         }
-        let child = fields[0].parse::<u32>().map_err(|_| "invalid process id")?;
-        let parent = fields[1]
-            .parse::<u32>()
-            .map_err(|_| "invalid parent process id")?;
-        found_target |= child == pid && !fields[2].starts_with('Z');
-        live_child |= parent == pid && !fields[2].starts_with('Z');
+        processes.push(Process {
+            pid: fields[0].parse().map_err(|_| "invalid process id")?,
+            parent: fields[1].parse().map_err(|_| "invalid parent process id")?,
+            state: fields[2],
+            age: elapsed_seconds(fields[3]).ok_or("invalid process elapsed time")?,
+            command: fields[4..].to_vec(),
+        });
     }
-    if !found_target {
-        return Err("interrupt target process is no longer live");
+    let root = processes
+        .iter()
+        .find(|process| process.pid == pid && !process.state.starts_with('Z'))
+        .ok_or("interrupt target process is no longer live")?;
+    let mut queue = vec![(pid, None)];
+    let mut visited = std::collections::HashSet::from([pid]);
+    while let Some((parent_pid, parent_service)) = queue.pop() {
+        for process in processes
+            .iter()
+            .filter(|process| process.parent == parent_pid)
+        {
+            if !visited.insert(process.pid) {
+                return Err("interrupt process tree contains a cycle");
+            }
+            if process.state.starts_with('Z') {
+                queue.push((process.pid, Some(BaselineService::Worker)));
+                continue;
+            }
+            // Only sleeping, recognized startup services qualify. Check every
+            // descendant: a baseline MCP server can still launch a task/browser.
+            let startup_service = process.state.starts_with('S')
+                && root
+                    .age
+                    .checked_sub(process.age)
+                    .is_some_and(|delta| delta <= 30)
+                && process.age > quiet_seconds.saturating_add(2);
+            let service = startup_service
+                .then(|| baseline_service(&process.command, parent_service))
+                .flatten();
+            let Some(service) = service else {
+                return Ok(true);
+            };
+            queue.push((process.pid, Some(service)));
+        }
     }
-    Ok(live_child)
+    Ok(false)
 }
 
 #[derive(Debug)]
@@ -1001,6 +1142,57 @@ mod tests {
             active: false,
         });
         s
+    }
+
+    #[test]
+    fn interrupt_distinguishes_baseline_services_from_task_descendants() {
+        let baseline = "100 1 S+ 19:00:00 codex
+101 100 S 19:00:00 /opt/homebrew/bin/uv tool uvx --from git+ssh://git@github.com/Affirm/ai-memory-bank-mcp mcp_memory_bank_setup
+102 101 S 18:59:58 /cache/bin/python /cache/bin/mcp_memory_bank_setup
+103 100 S 19:00:00 npm exec @playwright/mcp@0.0.68
+104 103 S 18:59:59 node /cache/node_modules/.bin/playwright-mcp
+105 100 S 19:00:00 npm exec @salesforce/mcp@0.25.0 --orgs DEFAULT_TARGET_ORG --toolsets orgs,metadata,data,users
+106 105 S 18:59:59 node /cache/node_modules/.bin/sf-mcp-server --orgs DEFAULT_TARGET_ORG --toolsets orgs,metadata,data,users
+107 100 S 18:59:51 /release/bin/codex-code-mode-host
+";
+        assert_eq!(live_children_in_ps(100, 900, baseline), Ok(false));
+        for child in [
+            "108 100 S 00:01 sleep 60",
+            "108 107 S 00:01 node task.js",
+            "108 104 S 00:01 /bin/chromium",
+            "108 102 S 00:01 /bin/python task.py",
+            "108 100 S 19:00:00 node old-task.js",
+            "108 100 S 00:01 /release/bin/codex-code-mode-host",
+            "108 100 S 19:00:00 npm exec unrelated-mcp",
+            "108 100 S 19:00:00 node /cache/node_modules/.bin/playwright-mcp",
+        ] {
+            assert_eq!(
+                live_children_in_ps(100, 900, &format!("{baseline}{child}")),
+                Ok(true),
+                "{child}"
+            );
+        }
+        assert_eq!(
+            live_children_in_ps(100, 900, &baseline.replace("107 100 S", "107 100 R")),
+            Ok(true)
+        );
+        assert_eq!(
+            live_children_in_ps(100, 900, &baseline.replace("18:59:51", "18:59:29")),
+            Ok(true)
+        );
+        assert_eq!(live_children_in_ps(100, 19 * 3600, baseline), Ok(true));
+        assert!(live_children_in_ps(999, 900, baseline).is_err());
+        assert!(live_children_in_ps(100, 900, "100 1 S invalid codex").is_err());
+    }
+
+    #[test]
+    fn process_elapsed_time_formats() {
+        assert_eq!(elapsed_seconds("00:01"), Some(1));
+        assert_eq!(elapsed_seconds("19:08:09"), Some(68889));
+        assert_eq!(elapsed_seconds("2-01:02:03"), Some(176523));
+        for invalid in ["", "invalid", "1-02:03", "00:60", "1:99:00"] {
+            assert_eq!(elapsed_seconds(invalid), None);
+        }
     }
 
     #[test]
