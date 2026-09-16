@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.5.0](https://github.com/inkless/triage/compare/v0.4.3...v0.5.0) (2026-09-16)
+
+
+### Features
+
+* report quiet Codex turns and add guarded interrupt ([cbeb994](https://github.com/inkless/triage/commit/cbeb99481d45a0bc4baf4cef671f20e49e4306f8))
+
+
+### Bug Fixes
+
+* **ci:** format tmux expression ([804c353](https://github.com/inkless/triage/commit/804c353df5a3c464421c9fcf68cdd36c2ccea86d))
+* **codex:** keep active turns out of done state ([#17](https://github.com/inkless/triage/issues/17)) ([e3f893a](https://github.com/inkless/triage/commit/e3f893aa54ea2b69142c3fe52a1adbe2327b4496))
+* distinguish Codex composer animation from drafts ([350e7fb](https://github.com/inkless/triage/commit/350e7fbf68274ecc0b67c2b843a7a76b14705034))
+* protect Codex drafts during message delivery ([0042ed7](https://github.com/inkless/triage/commit/0042ed7de14f110be19a97980887aba9080f32f6))
+* surface Codex discovery failures explicitly ([29415c3](https://github.com/inkless/triage/commit/29415c39c3382d8da7e594ace108990f1bedf25c))
+
 ## [0.4.3](https://github.com/inkless/triage/compare/v0.4.2...v0.4.3) (2026-09-04)
 
 
