@@ -11,6 +11,7 @@ mod models;
 mod notify_os;
 mod peer_hooks;
 mod persist;
+mod reconcile;
 mod snapshot;
 mod spawn_agent;
 mod tmux;

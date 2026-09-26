@@ -3,9 +3,8 @@
 //! config, never spawn subprocesses, never write to stderr except the Claude
 //! waiter's delivery, and always exit 0 on error (logging to `hook.log`).
 
-use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -25,7 +24,6 @@ const WAITER_DEADLINE_MARGIN: Duration = Duration::from_secs(60);
 const WAITER_HANDOFF_WAIT: Duration = Duration::from_secs(10);
 const RESCAN_INTERVAL: Duration = Duration::from_secs(1);
 const DRAIN_TIME_LIMIT: Duration = Duration::from_secs(3);
-const MAX_TRANSCRIPT_SCAN_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_PAYLOAD_BYTES: u64 = 1024 * 1024;
 const MAX_HOST_HOPS: usize = 32;
 const EXIT_WAKE: i32 = 2;
@@ -142,7 +140,7 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
     let mailbox = store.mailbox(&agent)?;
     match (hook.provider, hook.event) {
         (Provider::Claude, Event::SessionStart | Event::Stop) => {
-            confirm_waiter_deliveries(&mailbox, payload.transcript_path.as_deref())?;
+            crate::reconcile::reconcile_agent(store, &agent)?;
             if !hook.wait {
                 return Ok(0);
             }
@@ -447,7 +445,7 @@ fn drain(
         nonce: String::new(),
         claimed_at_ms: 0,
         waiter_pid: std::process::id(),
-        waiter_start: 0,
+        waiter_start: mailbox::proc_info(std::process::id()).map_or(0, |i| i.start),
         transcript_path: String::new(),
         transcript_offset: 0,
         printed_at_ms: None,
@@ -481,85 +479,6 @@ fn drain(
         }
     }
     written.map(|()| 0)
-}
-
-/// A waiter's delivery is confirmed once its header (message id plus the
-/// claim's stored nonce) shows up in a rewake record in the transcript.
-fn confirm_waiter_deliveries(
-    mailbox: &Mailbox,
-    current_transcript: Option<&Path>,
-) -> io::Result<()> {
-    for inflight in mailbox.inflight() {
-        let Some(claim) = mailbox.read_claim(&inflight) else {
-            continue;
-        };
-        if claim.printed_at_ms.is_none() || claim.transcript_path.is_empty() {
-            continue;
-        }
-        let marker = format!("[id={} n={}", inflight.id, claim.nonce);
-        let claim_transcript = PathBuf::from(&claim.transcript_path);
-        let mut found = transcript_has_rewake(&claim_transcript, claim.transcript_offset, &marker)
-            == Some(true);
-        if !found
-            && let Some(current) = current_transcript
-            && current != claim_transcript
-        {
-            found = transcript_has_rewake(current, 0, &marker) == Some(true);
-        }
-        if found {
-            let to = if claim.head_only {
-                State::Notified
-            } else {
-                State::Delivered
-            };
-            mailbox.commit(&inflight, to, DeliveredVia::ClaudeWaiter, mailbox::now_ms())?;
-        }
-    }
-    Ok(())
-}
-
-/// `None` means unknown (unreadable, or too much to scan), which must never be
-/// read as "not delivered".
-fn transcript_has_rewake(path: &Path, offset: u64, marker: &str) -> Option<bool> {
-    let mut file = File::open(path).ok()?;
-    let len = file.metadata().ok()?.len();
-    let start = offset.min(len);
-    if len - start > MAX_TRANSCRIPT_SCAN_BYTES {
-        return None;
-    }
-    file.seek(SeekFrom::Start(start)).ok()?;
-    for line in BufReader::new(file).lines() {
-        let line = line.ok()?;
-        if !line.contains(marker) {
-            continue;
-        }
-        let Ok(record) = serde_json::from_str::<Value>(&line) else {
-            continue;
-        };
-        if rewake_text(&record)
-            .is_some_and(|text| text.starts_with("<task-notification>") && text.contains(marker))
-        {
-            return Some(true);
-        }
-    }
-    Some(false)
-}
-
-/// The model-visible text of a rewake: a user record when the session was
-/// idle, a `queued_command` attachment when it was folded into a running turn.
-fn rewake_text(record: &Value) -> Option<&str> {
-    match record.get("type").and_then(Value::as_str)? {
-        "user" => record.pointer("/message/content").and_then(Value::as_str),
-        "attachment" => {
-            let attachment = record.get("attachment")?;
-            (attachment.get("type").and_then(Value::as_str) == Some("queued_command")
-                && attachment.get("commandMode").and_then(Value::as_str)
-                    == Some("task-notification"))
-            .then(|| attachment.get("prompt").and_then(Value::as_str))
-            .flatten()
-        }
-        _ => None,
-    }
 }
 
 /// Claude SIGTERMs every waiter on `/exit`; one landing between claiming mail

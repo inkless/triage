@@ -400,6 +400,13 @@ impl CliError {
         }
     }
 
+    fn wait_timeout(msg: impl Into<String>) -> Self {
+        Self {
+            code: 5,
+            message: msg.into(),
+        }
+    }
+
     fn runtime(msg: impl Into<String>) -> Self {
         Self {
             code: 1,
@@ -425,7 +432,10 @@ struct SendArgs {
     positional: Vec<String>,
     dry_run: bool,
     mode: Option<SendMode>,
+    wait_secs: Option<u64>,
 }
+
+const DEFAULT_WAIT_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Serialize)]
 struct AgentRow {
@@ -465,6 +475,7 @@ fn run_agents(args: &[String]) -> Result<(), CliError> {
     snapshot::sort_sessions(&mut sessions);
     let current_pane = (!args.include_self).then(current_tmux_pane_id).flatten();
     let store = Store::open_default();
+    reconcile_quietly(&store);
 
     let rows = sessions
         .iter()
@@ -608,6 +619,7 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
     let body = read_message_body(&args)?;
     let body = validate_body(&body)?;
     let store = Store::open_default();
+    reconcile_quietly(&store);
     let target = resolve_send_target(&store, &sessions, selector)?;
     if target.pid == caller.pid {
         return Err(CliError::usage("cannot send a message to yourself"));
@@ -644,26 +656,99 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
                 )
             })?;
             let short = mailbox::short_id(&to.agent);
+            let msg = new_message(&from, caller, &to, &body);
+            if !hook_capable(&store, &to) {
+                let item = RenderItem {
+                    msg: &msg,
+                    nonce: None,
+                    sent_before_clear: false,
+                };
+                let text = mailbox::render_batch(&[item], usize::MAX).0;
+                let result = deliver_to(target, selector, &sender, &text, args.dry_run)?;
+                if !args.dry_run
+                    && let Err(e) = store
+                        .mailbox(&to.agent)
+                        .and_then(|mailbox| mailbox.record_pasted(&msg, mailbox::now_ms()))
+                {
+                    eprintln!("warning: failed to record the message in the mailbox: {e}");
+                }
+                return Ok(format!(
+                    "{result} (target has no triage hooks, so the message was pasted)"
+                ));
+            }
             if args.dry_run {
                 return Ok(format!(
                     "dry-run: would queue from {sender} to {} (agent {short})",
                     target_label(target)
                 ));
             }
-            let msg = new_message(&from, caller, &to, &body);
-            store
+            let recipient = store
                 .mailbox(&to.agent)
-                .and_then(|mailbox| mailbox.enqueue(&msg))
+                .map_err(|e| CliError::runtime(e.to_string()))?;
+            recipient
+                .enqueue(&msg)
                 .map_err(|e| CliError::delivery(format!("failed to queue message: {e}")))?;
             if let Err(e) = crate::transport::nudge_helper(&store, &to.agent) {
                 eprintln!("warning: queued, but could not start the wake helper: {e}");
             }
-            Ok(format!(
-                "queued for {} (agent {short}) id={}",
-                target_label(target),
-                msg.id
-            ))
+            let label = target_label(target);
+            match args.wait_secs {
+                None => Ok(format!("queued for {label} (agent {short}) id={}", msg.id)),
+                Some(secs) => wait_for_delivery(&store, &recipient, &msg.id, secs)
+                    .map(|how| format!("{how} to {label} (agent {short}) id={}", msg.id)),
+            }
         }
+    }
+}
+
+fn reconcile_quietly(store: &Store) {
+    if let Err(e) = crate::reconcile::reconcile_all(store) {
+        store.log_hook_error("reconcile", &e);
+    }
+}
+
+/// A target takes mailbox delivery only while its host process is alive and
+/// runs triage's hooks; anything else gets legacy paste.
+fn hook_capable(store: &Store, to: &AgentIdentity) -> bool {
+    to.host.is_some_and(|host| {
+        store
+            .read_host(host)
+            .is_some_and(|record| record.hook_version == crate::peer_hooks::HOOK_VERSION)
+            && mailbox::liveness(host) == mailbox::Liveness::Alive
+    })
+}
+
+fn wait_for_delivery(
+    store: &Store,
+    mailbox: &mailbox::Mailbox,
+    id: &str,
+    secs: u64,
+) -> Result<&'static str, CliError> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+    const RECONCILE_EVERY: u32 = 8;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut tick = 0u32;
+    loop {
+        match mailbox.locate(id) {
+            Some(State::Delivered | State::Read) => return Ok("delivered"),
+            Some(State::Notified) => return Ok("delivered (head only)"),
+            Some(State::Undeliverable) => {
+                return Err(CliError::delivery(format!(
+                    "message {id} bounced: the target session ended before reading it"
+                )));
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(CliError::wait_timeout(format!(
+                "timed out after {secs}s; message {id} is still queued"
+            )));
+        }
+        tick += 1;
+        if tick.is_multiple_of(RECONCILE_EVERY) {
+            reconcile_quietly(store);
+        }
+        std::thread::sleep(POLL);
     }
 }
 
@@ -715,6 +800,7 @@ fn run_inbox(args: &[String]) -> Result<(), CliError> {
         None => resolve_caller(&sessions, std::process::id(), &parents)?,
     };
     let store = Store::open_default();
+    reconcile_quietly(&store);
     let identity = agent_identity(&store, caller).ok_or_else(|| {
         CliError::runtime("the calling session has no mailbox identity (session id is not a UUID)")
     })?;
@@ -752,7 +838,7 @@ fn inbox_list(
             nonce: mailbox::new_nonce(),
             claimed_at_ms: mailbox::now_ms(),
             waiter_pid: std::process::id(),
-            waiter_start: 0,
+            waiter_start: mailbox::proc_info(std::process::id()).map_or(0, |i| i.start),
             transcript_path: String::new(),
             transcript_offset: 0,
             printed_at_ms: None,
@@ -1130,6 +1216,13 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, CliError> {
                     })?));
             }
             "--dry-run" => out.dry_run = true,
+            "--wait" => out.wait_secs = Some(DEFAULT_WAIT_SECS),
+            wait if wait.starts_with("--wait=") => {
+                let secs = &wait["--wait=".len()..];
+                out.wait_secs = Some(secs.parse().map_err(|_| {
+                    CliError::usage(send_usage(format!("invalid --wait value {secs:?}")))
+                })?);
+            }
             "--mode" => {
                 i += 1;
                 let value = args
@@ -1544,7 +1637,7 @@ fn agents_usage(prefix: impl Into<String>) -> String {
 
 fn send_usage(prefix: impl Into<String>) -> String {
     let prefix = prefix.into();
-    let usage = "usage: triage send --to TARGET (--message TEXT | --file PATH | - | TEXT...) [--mode legacy|mailbox] [--dry-run]\n       TARGET: pane id, pane target, name, agent id or its last 8 characters";
+    let usage = "usage: triage send --to TARGET (--message TEXT | --file PATH | - | TEXT...) [--mode legacy|mailbox] [--wait[=SECS]] [--dry-run]\n       TARGET: pane id, pane target, name, agent id or its last 8 characters";
     if prefix.is_empty() {
         usage.to_string()
     } else {

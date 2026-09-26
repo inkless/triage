@@ -19,6 +19,13 @@ const OVERFLOW_HEAD_CHARS: usize = 500;
 const MAX_LABEL_CHARS: usize = 32;
 
 pub fn now_ms() -> u64 {
+    if cfg!(debug_assertions)
+        && let Some(ms) = std::env::var("TRIAGE_TEST_NOW_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    {
+        return ms;
+    }
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -403,6 +410,14 @@ impl Store {
         }
     }
 
+    /// Agents that have a mailbox directory.
+    pub fn agents(&self) -> Vec<String> {
+        list_names(&self.root.join("mail"))
+            .into_iter()
+            .filter(|name| is_uuid(name))
+            .collect()
+    }
+
     pub fn hosts(&self) -> Vec<(HostId, HostRecord)> {
         let mut hosts: Vec<_> = list_names(&self.root.join("hosts"))
             .into_iter()
@@ -659,6 +674,65 @@ impl Mailbox {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(true),
         }
+    }
+
+    /// Atomic move between states. `Ok(false)` means another process moved
+    /// it first, so exactly one caller acts on a given transition.
+    pub fn move_state(&self, id: &str, from: State, to: State) -> io::Result<bool> {
+        check_uuid("message id", id)?;
+        ensure_dir(&self.state_dir(to))?;
+        match fs::rename(self.path(from, id), self.path(to, id)) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Where a message currently is, if anywhere (claimed counts as inflight).
+    pub fn locate(&self, id: &str) -> Option<State> {
+        if !is_uuid(id) {
+            return None;
+        }
+        if self.inflight().iter().any(|i| i.id == id) {
+            return Some(State::Inflight);
+        }
+        [
+            State::Pending,
+            State::Delivered,
+            State::Notified,
+            State::Read,
+            State::Undeliverable,
+            State::Pasted,
+        ]
+        .into_iter()
+        .find(|&state| self.path(state, id).exists())
+    }
+
+    /// Staging files a crashed writer left behind.
+    pub fn sweep_tmp(&self, older_than_ms: u64) {
+        let tmp = self.dir.join("tmp");
+        let now = SystemTime::now();
+        for name in list_names(&tmp) {
+            let path = tmp.join(name);
+            let stale = fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| now.duration_since(t).ok())
+                .is_some_and(|age| age.as_millis() as u64 > older_than_ms);
+            if stale {
+                let _ = fs::remove_file(path);
+            }
+        }
+    }
+
+    pub fn inflight_age_ms(&self, inflight: &Inflight) -> Option<u64> {
+        let modified = fs::metadata(self.inflight_path(inflight))
+            .and_then(|m| m.modified())
+            .ok()?;
+        SystemTime::now()
+            .duration_since(modified)
+            .ok()
+            .map(|d| d.as_millis() as u64)
     }
 
     pub fn remove(&self, state: State, id: &str) -> io::Result<()> {

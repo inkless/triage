@@ -99,6 +99,36 @@ esac
             .collect()
     }
 
+    /// What the target's hooks would have written: a live host record.
+    #[cfg(target_os = "macos")]
+    fn make_hook_capable(&self) {
+        let pid = self.target.id();
+        write_json(
+            &self.dir.join(format!(
+                "state/triage/hosts/{pid}-{}.json",
+                process_start(pid)
+            )),
+            serde_json::json!({
+                "v": 1, "provider": "codex", "hook_version": "v1",
+                "current_session": TARGET_SESSION, "updated_at_ms": 1
+            }),
+        );
+    }
+
+    fn run_at(&self, now_ms: u64, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_triage"))
+            .args(args)
+            .env("HOME", &self.dir)
+            .env("XDG_STATE_HOME", self.dir.join("state"))
+            .env("PATH", &self.dir)
+            .env("TMUX_PANE", "%other")
+            .env("CALLER_PID", std::process::id().to_string())
+            .env("TARGET_PID", self.target.id().to_string())
+            .env("TRIAGE_TEST_NOW_MS", now_ms.to_string())
+            .output()
+            .unwrap()
+    }
+
     fn keys(&self) -> String {
         fs::read_to_string(self.dir.join("keys")).unwrap_or_default()
     }
@@ -150,9 +180,11 @@ fn agents_json_reports_the_mailbox_agent_id() {
     assert_eq!(target["agent_id"], TARGET_SESSION);
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn mailbox_send_queues_without_touching_the_pane() {
     let fx = Fixture::new("mailbox_send_queues_without_touching_the_pane");
+    fx.make_hook_capable();
     let short = &TARGET_SESSION[TARGET_SESSION.len() - 8..];
     let out = ok(&fx.run(&["send", "--to", short, "--mode", "mailbox", "-m", "hi"]));
     assert!(out.contains("queued"), "{out}");
@@ -163,6 +195,125 @@ fn mailbox_send_queues_without_touching_the_pane() {
     assert_eq!(pending[0]["from"]["provider"], "codex");
     assert_eq!(pending[0]["to"]["agent"], TARGET_SESSION);
     assert_eq!(fx.keys(), "");
+}
+
+#[test]
+fn a_target_without_hooks_gets_the_message_pasted() {
+    let fx = Fixture::new("fallback");
+    let out = ok(&fx.run(&["send", "--to", "%42", "--mode", "mailbox", "-m", "hi"]));
+    assert!(out.contains("pasted"), "{out}");
+    assert!(fx.keys().contains("paste-buffer"), "{}", fx.keys());
+    assert!(fx.mail(TARGET_SESSION, "pending").is_empty());
+    let pasted = fx.mail(TARGET_SESSION, "pasted");
+    assert_eq!(pasted.len(), 1);
+    assert_eq!(pasted[0]["delivered_via"], "legacy-paste");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn wait_returns_once_delivered_and_exits_5_while_still_queued() {
+    let fx = Fixture::new("wait");
+    fx.make_hook_capable();
+    let queued = fx.run(&[
+        "send", "--to", "%42", "--mode", "mailbox", "--wait=1", "-m", "a",
+    ]);
+    assert_eq!(queued.status.code(), Some(5));
+    assert_eq!(fx.mail(TARGET_SESSION, "pending").len(), 1);
+
+    let mail = fx.dir.join("state/triage/mail").join(TARGET_SESSION);
+    let deliverer = {
+        let mail = mail.clone();
+        std::thread::spawn(move || {
+            for _ in 0..100 {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let pending: Vec<_> = fs::read_dir(mail.join("pending"))
+                    .unwrap()
+                    .map(|e| e.unwrap().path())
+                    .collect();
+                if pending.len() == 2 {
+                    fs::create_dir_all(mail.join("delivered")).unwrap();
+                    for path in pending {
+                        fs::rename(
+                            &path,
+                            mail.join("delivered").join(path.file_name().unwrap()),
+                        )
+                        .unwrap();
+                    }
+                    return;
+                }
+            }
+        })
+    };
+    let delivered = ok(&fx.run(&[
+        "send",
+        "--to",
+        "%42",
+        "--mode",
+        "mailbox",
+        "--wait=10",
+        "-m",
+        "b",
+    ]));
+    assert!(delivered.starts_with("delivered"), "{delivered}");
+    deliverer.join().unwrap();
+}
+
+#[test]
+fn mail_for_a_host_dead_over_30s_bounces_to_the_sender_once() {
+    let fx = Fixture::new("bounce");
+    let dead_agent = "01a0dbf1-52ad-7e22-9ecd-54582d4a3009";
+    write_json(
+        &fx.dir.join("state/triage/hosts/99999999-1.json"),
+        serde_json::json!({
+            "v": 1, "provider": "claude", "hook_version": "v1",
+            "current_session": dead_agent, "updated_at_ms": 1
+        }),
+    );
+    for (id, bounce_of) in [
+        (
+            "01900000-0000-7000-8000-000000000001",
+            serde_json::Value::Null,
+        ),
+        (
+            "01900000-0000-7000-8000-000000000002",
+            serde_json::json!("01900000-0000-7000-8000-0000000000aa"),
+        ),
+    ] {
+        write_json(
+            &fx.dir
+                .join("state/triage/mail")
+                .join(dead_agent)
+                .join(format!("pending/{id}.json")),
+            serde_json::json!({
+                "v": 1, "id": id, "created_at_ms": 1,
+                "from": {"agent": CALLER_SESSION, "session": CALLER_SESSION, "provider": "codex", "label": "me"},
+                "to": {"agent": dead_agent, "session_at_send": dead_agent},
+                "body": "secret body", "attempt": 0, "bounce_of": bounce_of
+            }),
+        );
+    }
+    let t0 = 1_800_000_000_000;
+    ok(&fx.run_at(t0, &["agents", "--json"]));
+    assert_eq!(
+        fx.mail(dead_agent, "pending").len(),
+        2,
+        "not dead long enough yet"
+    );
+    ok(&fx.run_at(t0 + 31_000, &["agents", "--json"]));
+    ok(&fx.run_at(t0 + 62_000, &["agents", "--json"]));
+    assert!(fx.mail(dead_agent, "pending").is_empty());
+    assert_eq!(fx.mail(dead_agent, "undeliverable").len(), 2);
+    let bounces = fx.mail(CALLER_SESSION, "pending");
+    assert_eq!(
+        bounces.len(),
+        1,
+        "one bounce, and a bounce is never bounced"
+    );
+    assert_eq!(
+        bounces[0]["bounce_of"],
+        "01900000-0000-7000-8000-000000000001"
+    );
+    assert!(!bounces[0]["body"].as_str().unwrap().contains("secret body"));
 }
 
 #[test]
