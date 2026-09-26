@@ -7,6 +7,7 @@ mod config;
 mod cost_rollup;
 mod discovery;
 mod mailbox;
+mod messages;
 mod models;
 mod notify_os;
 mod peer_hooks;
@@ -145,6 +146,12 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Review peer messages across agents, or `purge` old ones
+    #[command(disable_help_flag = true)]
+    Messages {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Interrupt a Codex turn with no observable progress for at least 15 minutes
     #[command(disable_help_flag = true)]
     Interrupt {
@@ -184,6 +191,7 @@ fn main() -> io::Result<()> {
             Command::Send { args } => std::process::exit(agent_comm::cli_send(&args)),
             Command::Hooks { args } => std::process::exit(approval::cli_hooks(&args)),
             Command::Inbox { args } => std::process::exit(agent_comm::cli_inbox(&args)),
+            Command::Messages { args } => std::process::exit(messages::cli(&args)),
             Command::Interrupt { args } => std::process::exit(agent_comm::cli_interrupt(&args)),
             Command::Launch { args } => std::process::exit(spawn_agent::cli_launch(&args)),
         }
