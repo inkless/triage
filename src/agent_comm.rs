@@ -948,11 +948,28 @@ fn validate_body(body: &str) -> Result<String, CliError> {
     Ok(body)
 }
 
-fn format_message(sender: &str, body: &str) -> String {
+const LEGACY_MESSAGE_PREFIX: &str = "[triage message from ";
+pub const PEER_MESSAGE_PREFIX: &str = "📨 Peer message from ";
+pub const WAKE_POINTER_PREFIX: &str = "📨 triage: ";
+
+/// Text triage injected into an agent's input rather than something the user
+/// typed; transcript parsers must not treat it as a prompt.
+pub fn is_triage_delivery(text: &str) -> bool {
+    let text = text.trim_start();
+    [
+        LEGACY_MESSAGE_PREFIX,
+        PEER_MESSAGE_PREFIX,
+        WAKE_POINTER_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+}
+
+pub(crate) fn format_message(sender: &str, body: &str) -> String {
     if body.contains('\n') {
-        format!("[triage message from {sender}]\n{body}")
+        format!("{LEGACY_MESSAGE_PREFIX}{sender}]\n{body}")
     } else {
-        format!("[triage message from {sender}] {body}")
+        format!("{LEGACY_MESSAGE_PREFIX}{sender}] {body}")
     }
 }
 

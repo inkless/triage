@@ -365,8 +365,10 @@ pub fn locate_transcript(cwd: &Path, session_id: &str) -> Option<PathBuf> {
 /// ~few MB). For v1, full-read is fine; tail-read can come later if it matters.
 pub fn digest(path: &Path) -> Option<TranscriptDigest> {
     let bytes = fs::read(path).ok()?;
-    let text = String::from_utf8_lossy(&bytes);
+    Some(digest_text(path, &String::from_utf8_lossy(&bytes)))
+}
 
+fn digest_text(path: &Path, text: &str) -> TranscriptDigest {
     let mut headline: Option<(SystemTime, String)> = None;
     let mut last_prompt: Option<String> = None;
     let mut last_prompt_at: Option<SystemTime> = None;
@@ -425,7 +427,9 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
                 // last-prompt events have no timestamp, but they carry the canonical
                 // prompt text. Use as a fallback source for last_prompt; timestamp
                 // comes from the user-text events below.
-                if let Some(p) = v.get("lastPrompt").and_then(|p| p.as_str()) {
+                if let Some(p) = v.get("lastPrompt").and_then(|p| p.as_str())
+                    && !crate::agent_comm::is_triage_delivery(p)
+                {
                     last_prompt = Some(p.to_string());
                 }
             }
@@ -564,7 +568,7 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
         .find(|(id, _, _)| id.is_empty() || !completed_tool_ids.contains(id))
         .map(|(_, name, brief)| (name, brief));
 
-    Some(TranscriptDigest {
+    TranscriptDigest {
         path: path.to_path_buf(),
         headline: headline_text,
         headline_at,
@@ -586,7 +590,7 @@ pub fn digest(path: &Path) -> Option<TranscriptDigest> {
         peak_context_tokens,
         latest_model,
         latest_assistant_text: latest_assistant_text.map(|(_, t)| t),
-    })
+    }
 }
 
 pub fn enrich(session: &mut Session, now: SystemTime, cache: &mut DigestCache) {
@@ -675,7 +679,8 @@ fn extract_user_text(content: &Value) -> Option<String> {
 }
 
 /// Drop auto-generated noise that arrives in user events: image-attachment
-/// metadata, slash-command sentinels, and interrupt markers. Returns None if
+/// metadata, slash-command sentinels, interrupt markers, task notifications
+/// and triage-delivered messages. Returns None if
 /// the trimmed text is empty or pure noise.
 fn clean_prompt_text(s: &str) -> Option<String> {
     let trimmed = s.trim();
@@ -693,6 +698,12 @@ fn clean_prompt_text(s: &str) -> Option<String> {
     // `<local-command-stdout>...`, `<local-command-caveat>...` etc.). Skip them
     // so they don't masquerade as prompts.
     if trimmed.starts_with("<command-") || trimmed.starts_with("<local-command-") {
+        return None;
+    }
+    // Background-task completions and asyncRewake hook wakes (peer mail) arrive
+    // as user records wrapped in <task-notification>.
+    if trimmed.starts_with("<task-notification>") || crate::agent_comm::is_triage_delivery(trimmed)
+    {
         return None;
     }
     Some(trimmed.to_string())
@@ -730,4 +741,57 @@ fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as u64 + 2) / 5 + d as u64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     era * 146097 + doe as i64 - 719468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent_comm::format_message;
+
+    const PROMPT_TS: &str = "2026-09-26T04:17:30.000Z";
+
+    fn user_record(ts: &str, content: &str) -> String {
+        serde_json::json!({
+            "type": "user",
+            "timestamp": ts,
+            "message": {"role": "user", "content": content},
+        })
+        .to_string()
+    }
+
+    fn digest_of(text: &str) -> TranscriptDigest {
+        digest_text(Path::new("session.jsonl"), text)
+    }
+
+    fn assert_only_real_prompt(d: &TranscriptDigest) {
+        assert_eq!(d.last_prompt.as_deref(), Some("run the tests"));
+        assert_eq!(d.last_prompt_at, parse_ts(PROMPT_TS));
+        assert_eq!(d.user_prompt_count, 1);
+    }
+
+    #[test]
+    fn peer_mail_wake_is_not_a_user_prompt() {
+        let text = format!(
+            "{}\n{}",
+            user_record(PROMPT_TS, "run the tests"),
+            include_str!("../tests/fixtures/tri149/claude-rewake.jsonl")
+        );
+        assert_only_real_prompt(&digest_of(&text));
+    }
+
+    #[test]
+    fn pasted_triage_messages_are_not_user_prompts() {
+        for pasted in [
+            format_message("TRI-148 (%12)", "please rebase onto main"),
+            "📨 Peer message from TRI-148 (claude · agent 0000beef), delivered by triage. [id=01900000-0000-7000-8000-000000000001]\nplease rebase".to_string(),
+        ] {
+            let text = [
+                user_record(PROMPT_TS, "run the tests"),
+                user_record("2026-09-26T04:18:00.000Z", &pasted),
+                serde_json::json!({"type": "last-prompt", "lastPrompt": pasted}).to_string(),
+            ]
+            .join("\n");
+            assert_only_real_prompt(&digest_of(&text));
+        }
+    }
 }
