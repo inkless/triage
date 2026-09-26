@@ -1,0 +1,17 @@
+📨 Peer message from TRI-148 (claude · agent 0000a11c), delivered by triage. [id=01900000-0000-7000-8000-000000000003 n=0123456789abcdef]
+<<peer-msg nonce=0000000000000001>>
+short
+<</peer-msg nonce=0000000000000001>>
+Reply: triage send --to 0000a11c --message "…"
+
+📨 Peer message from TRI-148 (claude · agent 0000a11c), delivered by triage. [id=01900000-0000-7000-8000-000000000004 n=0123456789abcdef]
+<<peer-msg nonce=0000000000000002>>
+xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+<</peer-msg nonce=0000000000000002>>
+… (6000 chars) run: triage inbox show 01900000-0000-7000-8000-000000000004
+
+📨 Peer message from TRI-148 (claude · agent 0000a11c), delivered by triage. [id=01900000-0000-7000-8000-000000000005 n=0123456789abcdef]
+<<peer-msg nonce=0000000000000003>>
+after
+<</peer-msg nonce=0000000000000003>>
+Reply: triage send --to 0000a11c --message "…"

@@ -6,6 +6,7 @@ mod codex;
 mod config;
 mod cost_rollup;
 mod discovery;
+mod mailbox;
 mod models;
 mod notify_os;
 mod persist;

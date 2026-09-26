@@ -1,0 +1,5 @@
+📨 Peer message from TRI-148 (claude · agent 0000a11c), delivered by triage. [id=01900000-0000-7000-8000-000000000002; re-delivery attempt 2, ignore if already handled; sent before this session was cleared]
+<<peer-msg nonce=0000000000000001>>
+again
+<</peer-msg nonce=0000000000000001>>
+Reply: triage send --to 0000a11c --message "…"
