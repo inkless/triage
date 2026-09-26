@@ -7,6 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+use crate::config::{Config, SendMode};
+use crate::mailbox::{self, Claim, DeliveredVia, HostId, Message, RenderItem, State, Store};
 use crate::models::{AttentionState, Provider, Session, session_display_label};
 use crate::persist::{self, AliasKey};
 use crate::{classifier, codex, snapshot, tmux, transcript};
@@ -17,7 +19,7 @@ pub fn cli_agents(args: &[String]) -> i32 {
     match run_agents(args) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("{}", e.message);
+            eprintln!("{}", with_sandbox_hint(&e.message));
             e.code
         }
     }
@@ -30,7 +32,22 @@ pub fn cli_send(args: &[String]) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("{}", e.message);
+            eprintln!("{}", with_sandbox_hint(&e.message));
+            e.code
+        }
+    }
+}
+
+pub fn cli_inbox(args: &[String]) -> i32 {
+    match args.first().map(String::as_str) {
+        Some("--hook") => return crate::peer_hooks::cli(&args[1..]),
+        Some("--helper") => return crate::transport::cli_helper(&args[1..]),
+        _ => {}
+    }
+    match run_inbox(args) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{}", with_sandbox_hint(&e.message));
             e.code
         }
     }
@@ -43,7 +60,7 @@ pub fn cli_interrupt(args: &[String]) -> i32 {
             0
         }
         Err(error) => {
-            eprintln!("{}", error.message);
+            eprintln!("{}", with_sandbox_hint(&error.message));
             error.code
         }
     }
@@ -342,6 +359,19 @@ fn live_children_in_ps(pid: u32, quiet_seconds: u64, text: &str) -> Result<bool,
     Ok(false)
 }
 
+/// Inside a sandbox (Codex's, typically) triage can neither list processes
+/// nor write its state dir; say how to get out rather than leave an agent to
+/// guess.
+fn with_sandbox_hint(message: &str) -> String {
+    if message.contains("Operation not permitted") {
+        format!(
+            "{message}\nhint: this looks like a sandbox blocking triage; run the command outside it (in Codex, request escalated permissions)"
+        )
+    } else {
+        message.to_string()
+    }
+}
+
 #[derive(Debug)]
 struct CliError {
     code: i32,
@@ -370,6 +400,13 @@ impl CliError {
         }
     }
 
+    fn wait_timeout(msg: impl Into<String>) -> Self {
+        Self {
+            code: 5,
+            message: msg.into(),
+        }
+    }
+
     fn runtime(msg: impl Into<String>) -> Self {
         Self {
             code: 1,
@@ -394,11 +431,16 @@ struct SendArgs {
     stdin: bool,
     positional: Vec<String>,
     dry_run: bool,
+    mode: Option<SendMode>,
+    wait_secs: Option<u64>,
 }
+
+const DEFAULT_WAIT_SECS: u64 = 60;
 
 #[derive(Debug, Clone, Serialize)]
 struct AgentRow {
     id: String,
+    agent_id: Option<String>,
     provider: String,
     name: String,
     cwd: String,
@@ -432,6 +474,8 @@ fn run_agents(args: &[String]) -> Result<(), CliError> {
     let mut sessions = load_snapshot()?;
     snapshot::sort_sessions(&mut sessions);
     let current_pane = (!args.include_self).then(current_tmux_pane_id).flatten();
+    let store = Store::open_default();
+    reconcile_quietly(&store);
 
     let rows = sessions
         .iter()
@@ -446,7 +490,7 @@ fn run_agents(args: &[String]) -> Result<(), CliError> {
                 .is_none_or(|p| provider_matches(s.provider, p))
         })
         .filter(|s| args.cwd.as_ref().is_none_or(|cwd| &s.cwd == cwd))
-        .map(agent_row)
+        .map(|s| agent_row(&store, s))
         .collect::<Vec<_>>();
 
     if args.json {
@@ -506,10 +550,11 @@ fn run_whoami(args: &[String]) -> Result<(), CliError> {
     // The caller's own session is the one paired to this pane.
     let mut sessions = load_snapshot()?;
     snapshot::sort_sessions(&mut sessions);
+    let store = Store::open_default();
     let row = sessions
         .iter()
         .find(|s| s.pane.as_ref().is_some_and(|p| p.pane_id == pane_id))
-        .map(agent_row);
+        .map(|s| agent_row(&store, s));
 
     if json {
         let value = match &row {
@@ -566,15 +611,445 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
         .to
         .as_deref()
         .ok_or_else(|| CliError::usage(send_usage("missing --to")))?;
+    let mode = args.mode.unwrap_or_else(|| Config::load().send.mode);
     let sessions = load_snapshot()?;
     let parents = tmux::build_ppid_map();
     let caller = resolve_caller(&sessions, std::process::id(), &parents)?;
     let sender = format!("{} ({})", session_display_label(caller), target_id(caller));
     let body = read_message_body(&args)?;
     let body = validate_body(&body)?;
-    let formatted = format_message(&sender, &body);
+    let store = Store::open_default();
+    reconcile_quietly(&store);
+    let target = resolve_send_target(&store, &sessions, selector)?;
+    if target.pid == caller.pid {
+        return Err(CliError::usage("cannot send a message to yourself"));
+    }
+    let from = agent_identity(&store, caller);
+    let to = agent_identity(&store, target);
 
-    deliver_message(selector, &sender, &formatted, args.dry_run)
+    match mode {
+        SendMode::Legacy => {
+            let formatted = format_message(&sender, &body);
+            let result = deliver_to(target, selector, &sender, &formatted, args.dry_run)?;
+            if !args.dry_run
+                && let (Some(from), Some(to)) = (&from, &to)
+            {
+                let msg = new_message(from, caller, to, &body);
+                if let Err(e) = store
+                    .mailbox(&to.agent)
+                    .and_then(|mailbox| mailbox.record_pasted(&msg, mailbox::now_ms()))
+                {
+                    eprintln!("warning: failed to record the message in the mailbox: {e}");
+                }
+            }
+            Ok(result)
+        }
+        SendMode::Mailbox => {
+            let (Some(from), Some(to)) = (from, to) else {
+                let formatted = format_message(&sender, &body);
+                return deliver_to(target, selector, &sender, &formatted, args.dry_run);
+            };
+            let short = mailbox::short_id(&to.agent);
+            let msg = new_message(&from, caller, &to, &body);
+            if !hook_capable(&store, &to) {
+                let item = RenderItem {
+                    msg: &msg,
+                    nonce: None,
+                    sent_before_clear: false,
+                };
+                let text = mailbox::render_batch(&[item], usize::MAX).0;
+                let result = deliver_to(target, selector, &sender, &text, args.dry_run)?;
+                if !args.dry_run
+                    && let Err(e) = store
+                        .mailbox(&to.agent)
+                        .and_then(|mailbox| mailbox.record_pasted(&msg, mailbox::now_ms()))
+                {
+                    eprintln!("warning: failed to record the message in the mailbox: {e}");
+                }
+                return Ok(format!(
+                    "{result} (target has no triage hooks, so the message was pasted)"
+                ));
+            }
+            if args.dry_run {
+                return Ok(format!(
+                    "dry-run: would queue from {sender} to {} (agent {short})",
+                    target_label(target)
+                ));
+            }
+            let recipient = store
+                .mailbox(&to.agent)
+                .map_err(|e| CliError::runtime(e.to_string()))?;
+            recipient
+                .enqueue(&msg)
+                .map_err(|e| CliError::delivery(format!("failed to queue message: {e}")))?;
+            if let Err(e) = crate::transport::nudge_helper(&store, &to.agent) {
+                eprintln!("warning: queued, but could not start the wake helper: {e}");
+            }
+            let label = target_label(target);
+            match args.wait_secs {
+                None => Ok(format!("queued for {label} (agent {short}) id={}", msg.id)),
+                Some(secs) => wait_for_delivery(&store, &recipient, &msg.id, secs)
+                    .map(|how| format!("{how} to {label} (agent {short}) id={}", msg.id)),
+            }
+        }
+    }
+}
+
+fn reconcile_quietly(store: &Store) {
+    if let Err(e) = crate::reconcile::reconcile_all(store) {
+        store.log_hook_error("reconcile", &e);
+    }
+}
+
+/// A target takes mailbox delivery only while its host process is alive and
+/// runs triage's hooks; anything else gets legacy paste.
+fn hook_capable(store: &Store, to: &AgentIdentity) -> bool {
+    to.host.is_some_and(|host| {
+        store
+            .read_host(host)
+            .is_some_and(|record| record.hook_version == crate::peer_hooks::HOOK_VERSION)
+            && mailbox::liveness(host) == mailbox::Liveness::Alive
+    })
+}
+
+fn wait_for_delivery(
+    store: &Store,
+    mailbox: &mailbox::Mailbox,
+    id: &str,
+    secs: u64,
+) -> Result<&'static str, CliError> {
+    const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+    const RECONCILE_EVERY: u32 = 8;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut tick = 0u32;
+    loop {
+        match mailbox.locate(id) {
+            Some(State::Delivered | State::Read) => return Ok("delivered"),
+            Some(State::Notified) => return Ok("delivered (head only)"),
+            Some(State::Undeliverable) => {
+                return Err(CliError::delivery(format!(
+                    "message {id} bounced: the target session ended before reading it"
+                )));
+            }
+            _ => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(CliError::wait_timeout(format!(
+                "timed out after {secs}s; message {id} is still queued"
+            )));
+        }
+        tick += 1;
+        if tick.is_multiple_of(RECONCILE_EVERY) {
+            reconcile_quietly(store);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+fn run_inbox(args: &[String]) -> Result<(), CliError> {
+    let mut json = false;
+    let mut show: Option<String> = None;
+    let mut session_arg: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--json" => json = true,
+            "--help" | "-h" => {
+                println!("{}", inbox_usage(""));
+                return Ok(());
+            }
+            "show" if show.is_none() && i == 0 => {
+                i += 1;
+                let id = args
+                    .get(i)
+                    .ok_or_else(|| CliError::usage(inbox_usage("missing message id")))?;
+                if !mailbox::is_uuid(id) {
+                    return Err(CliError::usage(format!("invalid message id {id:?}")));
+                }
+                show = Some(id.clone());
+            }
+            "--session" if show.is_some() => {
+                i += 1;
+                let session = args
+                    .get(i)
+                    .ok_or_else(|| CliError::usage(inbox_usage("missing --session value")))?;
+                if !mailbox::is_uuid(session) {
+                    return Err(CliError::usage(format!("invalid session id {session:?}")));
+                }
+                session_arg = Some(session.clone());
+            }
+            other => {
+                return Err(CliError::usage(inbox_usage(format!(
+                    "unknown arg {other:?}"
+                ))));
+            }
+        }
+        i += 1;
+    }
+
+    let sessions = load_snapshot()?;
+    let parents = tmux::build_ppid_map();
+    let caller = match &session_arg {
+        Some(session) => session_in_caller_chain(&sessions, session, &parents)?,
+        None => resolve_caller(&sessions, std::process::id(), &parents)?,
+    };
+    let store = Store::open_default();
+    reconcile_quietly(&store);
+    let identity = agent_identity(&store, caller).ok_or_else(|| {
+        CliError::runtime("the calling session has no mailbox identity (session id is not a UUID)")
+    })?;
+    let is_current = caller.session_id == identity.session;
+    let mailbox = store
+        .mailbox(&identity.agent)
+        .map_err(|e| CliError::runtime(e.to_string()))?;
+    match show {
+        Some(id) => inbox_show(&mailbox, &id, is_current, json),
+        None => inbox_list(&mailbox, caller, &identity, is_current, json),
+    }
+}
+
+/// Only the agent's current session commits: a stale session (cleared, or
+/// superseded in another host) may read its mail but must not mark it
+/// delivered on the new session's behalf.
+fn inbox_list(
+    mailbox: &mailbox::Mailbox,
+    caller: &Session,
+    identity: &AgentIdentity,
+    is_current: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let runtime = |e: io::Error| CliError::runtime(format!("mailbox error: {e}"));
+    let mut claimed = Vec::new();
+    let mut messages = Vec::new();
+    for id in mailbox.ids(State::Pending) {
+        if !is_current {
+            if let Ok(msg) = mailbox.read(State::Pending, &id) {
+                messages.push(msg);
+            }
+            continue;
+        }
+        let claim = Claim {
+            nonce: mailbox::new_nonce(),
+            claimed_at_ms: mailbox::now_ms(),
+            waiter_pid: std::process::id(),
+            waiter_start: mailbox::proc_info(std::process::id()).map_or(0, |i| i.start),
+            transcript_path: String::new(),
+            transcript_offset: 0,
+            printed_at_ms: None,
+            head_only: false,
+        };
+        let host = identity.host.unwrap_or(HostId {
+            pid: caller.pid,
+            start: 0,
+        });
+        if let Some(inflight) = mailbox
+            .claim(&id, &caller.session_id, host, &claim)
+            .map_err(runtime)?
+        {
+            messages.push(mailbox.read_inflight(&inflight).map_err(runtime)?);
+            claimed.push(inflight);
+        }
+    }
+
+    let output = if json {
+        serde_json::to_string_pretty(&messages)
+            .map_err(|e| CliError::runtime(format!("failed to render JSON: {e}")))?
+    } else if messages.is_empty() {
+        "No pending messages.".to_string()
+    } else {
+        let items: Vec<RenderItem> = messages
+            .iter()
+            .map(|msg| RenderItem {
+                msg,
+                nonce: None,
+                sent_before_clear: msg.to.session_at_send != identity.session,
+            })
+            .collect();
+        let (mut text, _) = mailbox::render_batch(&items, usize::MAX);
+        if !is_current {
+            text.push_str(
+                "\n\n(read-only: this session is not the agent's current session, so nothing was marked delivered)",
+            );
+        }
+        text
+    };
+    let printed = writeln!(io::stdout().lock(), "{output}").and_then(|()| io::stdout().flush());
+    for inflight in &claimed {
+        let settled = if printed.is_ok() {
+            mailbox.commit(
+                inflight,
+                State::Delivered,
+                DeliveredVia::Inbox,
+                mailbox::now_ms(),
+            )
+        } else {
+            mailbox.revert(inflight)
+        };
+        settled.map_err(runtime)?;
+    }
+    printed.map_err(|e| CliError::runtime(format!("failed to print messages: {e}")))
+}
+
+fn inbox_show(
+    mailbox: &mailbox::Mailbox,
+    id: &str,
+    is_current: bool,
+    json: bool,
+) -> Result<(), CliError> {
+    let states = [
+        State::Notified,
+        State::Pending,
+        State::Delivered,
+        State::Read,
+        State::Undeliverable,
+        State::Pasted,
+    ];
+    let Some((state, msg)) = states
+        .into_iter()
+        .find_map(|state| mailbox.read(state, id).ok().map(|msg| (state, msg)))
+    else {
+        return Err(CliError::usage(format!(
+            "no message {id} in this agent's mailbox"
+        )));
+    };
+    let output = if json {
+        serde_json::to_string_pretty(&msg)
+            .map_err(|e| CliError::runtime(format!("failed to render JSON: {e}")))?
+    } else {
+        let item = RenderItem {
+            msg: &msg,
+            nonce: None,
+            sent_before_clear: false,
+        };
+        mailbox::render_batch(&[item], usize::MAX).0
+    };
+    writeln!(io::stdout().lock(), "{output}")
+        .and_then(|()| io::stdout().flush())
+        .map_err(|e| CliError::runtime(format!("failed to print message: {e}")))?;
+    if state == State::Notified && is_current {
+        mailbox
+            .transition(
+                id,
+                State::Notified,
+                State::Read,
+                Some((DeliveredVia::InboxShow, mailbox::now_ms())),
+            )
+            .map_err(|e| CliError::runtime(format!("mailbox error: {e}")))?;
+    }
+    Ok(())
+}
+
+/// `--session` names a session explicitly, but only one whose process is an
+/// ancestor of this command, so a caller can't act as an unrelated agent.
+fn session_in_caller_chain<'a>(
+    sessions: &'a [Session],
+    session_id: &str,
+    parents: &HashMap<u32, u32>,
+) -> Result<&'a Session, CliError> {
+    let mut chain = std::collections::HashSet::new();
+    let mut current = std::process::id();
+    while current > 1 && chain.insert(current) {
+        match parents.get(&current) {
+            Some(parent) => current = *parent,
+            None => break,
+        }
+    }
+    sessions
+        .iter()
+        .find(|s| s.session_id == session_id && chain.contains(&s.pid))
+        .ok_or_else(|| {
+            CliError::denied(format!(
+                "session {session_id} is not an agent session this command runs under"
+            ))
+        })
+}
+
+fn inbox_usage(prefix: impl Into<String>) -> String {
+    let prefix = prefix.into();
+    let usage =
+        "usage: triage inbox [--json]\n       triage inbox show ID [--session UUID] [--json]";
+    if prefix.is_empty() {
+        usage.to_string()
+    } else {
+        format!("{prefix}\n{usage}")
+    }
+}
+
+/// The stable mailbox identity behind a live session: its host process, the
+/// host's current session and that session's lineage root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentIdentity {
+    agent: String,
+    session: String,
+    host: Option<HostId>,
+}
+
+fn agent_identity(store: &Store, s: &Session) -> Option<AgentIdentity> {
+    let host = mailbox::proc_info(s.pid).ok().map(|info| HostId {
+        pid: s.pid,
+        start: info.start,
+    });
+    let session = host
+        .and_then(|host| store.read_host(host))
+        .map(|record| record.current_session)
+        .unwrap_or_else(|| s.session_id.clone());
+    if !mailbox::is_uuid(&session) {
+        return None;
+    }
+    let agent = store
+        .lineage_root(&session)
+        .unwrap_or_else(|| session.clone());
+    Some(AgentIdentity {
+        agent,
+        session,
+        host,
+    })
+}
+
+pub(crate) fn session_agent_id(store: &Store, s: &Session) -> Option<String> {
+    agent_identity(store, s).map(|identity| identity.agent)
+}
+
+fn new_message(from: &AgentIdentity, caller: &Session, to: &AgentIdentity, body: &str) -> Message {
+    Message {
+        v: 1,
+        id: mailbox::new_message_id(),
+        created_at_ms: mailbox::now_ms(),
+        from: mailbox::Sender {
+            agent: from.agent.clone(),
+            session: from.session.clone(),
+            provider: caller.provider,
+            label: session_display_label(caller),
+        },
+        to: mailbox::Recipient {
+            agent: to.agent.clone(),
+            session_at_send: to.session.clone(),
+        },
+        body: body.to_string(),
+        attempt: 0,
+        bounce_of: None,
+        delivered_at_ms: None,
+        delivered_via: None,
+    }
+}
+
+fn resolve_send_target<'a>(
+    store: &Store,
+    sessions: &'a [Session],
+    selector: &str,
+) -> Result<&'a Session, CliError> {
+    let by_agent = |s: &Session| {
+        agent_identity(store, s).is_some_and(|identity| {
+            identity.agent == selector
+                || identity.session == selector
+                || mailbox::short_id(&identity.agent) == selector
+        })
+    };
+    let matches = sessions
+        .iter()
+        .filter(|s| selector_matches(s, selector) || by_agent(s))
+        .collect::<Vec<_>>();
+    single_target(matches, selector)
 }
 
 pub fn send_user_reply(selector: &str, body: &str) -> Result<String, String> {
@@ -590,6 +1065,29 @@ fn format_user_reply(body: &str) -> Result<String, CliError> {
     Ok(body)
 }
 
+/// Claude backstop wake for a session whose waiter is gone: the same pointer
+/// text a Codex session gets, pasted only if the session is idle and the
+/// usual send gate passes.
+pub fn paste_wake_pointer(host_pid: u32, text: &str) -> Result<(), String> {
+    let sessions = load_snapshot().map_err(|e| e.message)?;
+    let target = sessions
+        .iter()
+        .find(|s| s.pid == host_pid)
+        .ok_or_else(|| format!("no tracked session for pid {host_pid}"))?;
+    if target.status == "busy" {
+        return Ok(());
+    }
+    let gate = evaluate_send_gate(target);
+    if !gate.can_send {
+        return Ok(());
+    }
+    let pane = target
+        .pane
+        .as_ref()
+        .ok_or_else(|| "target has no tmux pane".to_string())?;
+    tmux::paste_text_and_enter(&pane.pane_id, text).map_err(|e| e.to_string())
+}
+
 fn deliver_message(
     selector: &str,
     sender: &str,
@@ -598,6 +1096,16 @@ fn deliver_message(
 ) -> Result<String, CliError> {
     let sessions = load_snapshot()?;
     let target = resolve_target(&sessions, selector)?;
+    deliver_to(target, selector, sender, message, dry_run)
+}
+
+fn deliver_to(
+    target: &Session,
+    selector: &str,
+    sender: &str,
+    message: &str,
+    dry_run: bool,
+) -> Result<String, CliError> {
     let gate = evaluate_send_gate(target);
     if !gate.can_send {
         let _ = append_message_audit(&AuditEntry::denied(sender, selector, target, &gate.reason));
@@ -706,6 +1214,22 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, CliError> {
                     })?));
             }
             "--dry-run" => out.dry_run = true,
+            "--wait" => out.wait_secs = Some(DEFAULT_WAIT_SECS),
+            wait if wait.starts_with("--wait=") => {
+                let secs = &wait["--wait=".len()..];
+                out.wait_secs = Some(secs.parse().map_err(|_| {
+                    CliError::usage(send_usage(format!("invalid --wait value {secs:?}")))
+                })?);
+            }
+            "--mode" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| CliError::usage(send_usage("missing --mode value")))?;
+                out.mode = Some(SendMode::parse(value).ok_or_else(|| {
+                    CliError::usage(send_usage(format!("unknown --mode {value:?}")))
+                })?);
+            }
             "--help" | "-h" => return Err(CliError::usage(send_usage(""))),
             "-" => out.stdin = true,
             other if other.starts_with('-') => {
@@ -748,6 +1272,10 @@ fn resolve_target<'a>(sessions: &'a [Session], selector: &str) -> Result<&'a Ses
         .iter()
         .filter(|s| selector_matches(s, selector))
         .collect::<Vec<_>>();
+    single_target(matches, selector)
+}
+
+fn single_target<'a>(matches: Vec<&'a Session>, selector: &str) -> Result<&'a Session, CliError> {
     match matches.as_slice() {
         [one] => Ok(one),
         [] => Err(CliError::usage(format!(
@@ -840,10 +1368,11 @@ fn blocked(reason: &str) -> GateResult {
     }
 }
 
-fn agent_row(s: &Session) -> AgentRow {
+fn agent_row(store: &Store, s: &Session) -> AgentRow {
     let gate = evaluate_send_gate(s);
     AgentRow {
         id: target_id(s),
+        agent_id: agent_identity(store, s).map(|identity| identity.agent),
         provider: s.provider.label().to_string(),
         name: session_display_label(s),
         cwd: s.cwd.display().to_string(),
@@ -948,11 +1477,28 @@ fn validate_body(body: &str) -> Result<String, CliError> {
     Ok(body)
 }
 
-fn format_message(sender: &str, body: &str) -> String {
+const LEGACY_MESSAGE_PREFIX: &str = "[triage message from ";
+pub const PEER_MESSAGE_PREFIX: &str = "📨 Peer message from ";
+pub const WAKE_POINTER_PREFIX: &str = "📨 triage: ";
+
+/// Text triage injected into an agent's input rather than something the user
+/// typed; transcript parsers must not treat it as a prompt.
+pub fn is_triage_delivery(text: &str) -> bool {
+    let text = text.trim_start();
+    [
+        LEGACY_MESSAGE_PREFIX,
+        PEER_MESSAGE_PREFIX,
+        WAKE_POINTER_PREFIX,
+    ]
+    .iter()
+    .any(|prefix| text.starts_with(prefix))
+}
+
+pub(crate) fn format_message(sender: &str, body: &str) -> String {
     if body.contains('\n') {
-        format!("[triage message from {sender}]\n{body}")
+        format!("{LEGACY_MESSAGE_PREFIX}{sender}]\n{body}")
     } else {
-        format!("[triage message from {sender}] {body}")
+        format!("{LEGACY_MESSAGE_PREFIX}{sender}] {body}")
     }
 }
 
@@ -1089,8 +1635,7 @@ fn agents_usage(prefix: impl Into<String>) -> String {
 
 fn send_usage(prefix: impl Into<String>) -> String {
     let prefix = prefix.into();
-    let usage =
-        "usage: triage send --to TARGET (--message TEXT | --file PATH | - | TEXT...) [--dry-run]";
+    let usage = "usage: triage send --to TARGET (--message TEXT | --file PATH | - | TEXT...) [--mode legacy|mailbox] [--wait[=SECS]] [--dry-run]\n       TARGET: pane id, pane target, name, agent id or its last 8 characters";
     if prefix.is_empty() {
         usage.to_string()
     } else {

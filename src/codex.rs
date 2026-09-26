@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use serde_json::Value;
 
+use crate::agent_comm::is_triage_delivery;
 use crate::models::{Pane, Provider, Session};
 use crate::tmux;
 use crate::transcript::parse_timestamp;
@@ -634,14 +635,16 @@ fn parse_rollout(path: &Path, text: &str, mtime: SystemTime) -> Option<CodexDige
                                 ts,
                             );
                         }
-                        "user_message" => {
-                            if turn_active.is_some() {
-                                turn_active = Some(true);
-                            }
-                            if let Some(message) = payload.get("message").and_then(|m| m.as_str()) {
-                                last_prompt = Some(message.to_string());
-                                last_prompt_at = ts;
-                                user_prompt_count += 1;
+                        "user_message" | "item_completed" => {
+                            if let Some(message) = user_message_text(payload) {
+                                if turn_active.is_some() {
+                                    turn_active = Some(true);
+                                }
+                                if !is_triage_delivery(&message) {
+                                    last_prompt = Some(message);
+                                    last_prompt_at = ts;
+                                    user_prompt_count += 1;
+                                }
                                 mark_latest(
                                     &mut latest_kind,
                                     &mut latest_kind_at,
@@ -846,7 +849,7 @@ fn is_progress_event(event: &Value, turn_active: Option<bool>) -> bool {
                     | "turn_aborted"
                     | "agent_message"
                     | "agent_reasoning"
-            ) || (kind == "user_message" && turn_active != Some(true))
+            ) || (turn_active != Some(true) && user_message_text(payload).is_some())
         }
         Some("response_item") => {
             matches!(
@@ -859,6 +862,18 @@ fn is_progress_event(event: &Value, turn_active: Option<bool>) -> bool {
             ) || (kind == "message" && payload["role"] == "assistant")
         }
         _ => false,
+    }
+}
+
+/// User input from an `event_msg` payload. Older rollouts record it as
+/// `user_message`; newer user threads only as a completed `UserMessage` item.
+fn user_message_text(payload: &Value) -> Option<String> {
+    match payload["type"].as_str()? {
+        "user_message" => payload["message"].as_str().map(ToString::to_string),
+        "item_completed" if payload["item"]["type"] == "UserMessage" => {
+            content_text(&payload["item"]["content"], "text")
+        }
+        _ => None,
     }
 }
 
@@ -1050,6 +1065,54 @@ fn system_time_ms(t: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(ts: &str) -> Option<SystemTime> {
+        parse_timestamp(ts)
+    }
+
+    #[test]
+    fn completed_user_message_items_are_prompts_but_wake_pointer_is_not() {
+        let digest = parse_rollout(
+            Path::new("rollout.jsonl"),
+            include_str!("../tests/fixtures/tri149/codex-rollout-pointer-turn.jsonl"),
+            SystemTime::UNIX_EPOCH,
+        )
+        .unwrap();
+        assert_eq!(
+            digest.last_prompt.as_deref(),
+            Some("Run the shell command `echo hello` and then reply briefly.")
+        );
+        assert_eq!(digest.last_prompt_at, at("2026-09-26T04:20:39.471Z"));
+        assert_eq!(digest.user_prompt_count, 1);
+    }
+
+    #[test]
+    fn wake_pointer_still_counts_as_turn_progress() {
+        let text = format!(
+            "{}\n{}",
+            r#"{"timestamp":"2026-09-26T04:20:44Z","type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"hello"}]}}"#,
+            include_str!("../tests/fixtures/tri149/codex-pointer-item-completed.jsonl")
+        );
+        let digest =
+            parse_rollout(Path::new("rollout.jsonl"), &text, SystemTime::UNIX_EPOCH).unwrap();
+        assert_eq!(digest.last_progress_at, at("2026-09-26T04:21:07.868Z"));
+        assert_eq!(digest.status(), "busy");
+        assert_eq!(digest.user_prompt_count, 0);
+    }
+
+    #[test]
+    fn legacy_triage_paste_is_not_a_prompt() {
+        let pasted = crate::agent_comm::format_message("TRI-148 (%12)", "please rebase");
+        let text = [
+            r#"{"timestamp":"2026-05-30T16:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"run tests"}}"#.to_string(),
+            serde_json::json!({"timestamp":"2026-05-30T16:00:05Z","type":"event_msg","payload":{"type":"user_message","message": pasted}}).to_string(),
+        ]
+        .join("\n");
+        let digest =
+            parse_rollout(Path::new("rollout.jsonl"), &text, SystemTime::UNIX_EPOCH).unwrap();
+        assert_eq!(digest.last_prompt.as_deref(), Some("run tests"));
+        assert_eq!(digest.user_prompt_count, 1);
+    }
 
     #[test]
     fn work_after_final_answer_reopens_turn_until_explicit_completion() {

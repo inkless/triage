@@ -6,13 +6,19 @@ mod codex;
 mod config;
 mod cost_rollup;
 mod discovery;
+mod mail_view;
+mod mailbox;
+mod messages;
 mod models;
 mod notify_os;
+mod peer_hooks;
 mod persist;
+mod reconcile;
 mod snapshot;
 mod spawn_agent;
 mod tmux;
 mod transcript;
+mod transport;
 mod ui;
 mod watcher;
 
@@ -129,6 +135,24 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Install, remove or inspect triage's Claude hooks
+    #[command(disable_help_flag = true)]
+    Hooks {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Show peer messages queued for the calling agent
+    #[command(disable_help_flag = true)]
+    Inbox {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Review peer messages across agents, or `purge` old ones
+    #[command(disable_help_flag = true)]
+    Messages {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Interrupt a Codex turn with no observable progress for at least 15 minutes
     #[command(disable_help_flag = true)]
     Interrupt {
@@ -150,7 +174,7 @@ instance in the current tmux session).
 In-TUI keybindings:
   ⏎ jump · a/d approve/deny · A toggle auto mode · p preview · > flip preview side
   P phone push · Space detail · r reply · m mute · w watch · * pin · R rename · N new agent · / filter
-  l audit log · $ cost overlay · ? keys · q quit
+  l audit log · $ cost overlay · M peer mail · ? keys · q quit
 
 Docs:
   README:      https://github.com/inkless/triage
@@ -166,6 +190,9 @@ fn main() -> io::Result<()> {
             Command::Cost { args } => return cost_rollup::cli_cost(&args),
             Command::Agents { args } => std::process::exit(agent_comm::cli_agents(&args)),
             Command::Send { args } => std::process::exit(agent_comm::cli_send(&args)),
+            Command::Hooks { args } => std::process::exit(approval::cli_hooks(&args)),
+            Command::Inbox { args } => std::process::exit(agent_comm::cli_inbox(&args)),
+            Command::Messages { args } => std::process::exit(messages::cli(&args)),
             Command::Interrupt { args } => std::process::exit(agent_comm::cli_interrupt(&args)),
             Command::Launch { args } => std::process::exit(spawn_agent::cli_launch(&args)),
         }
@@ -574,6 +601,28 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         }
         return true;
     }
+    if app.mail.open {
+        match code {
+            KeyCode::Char('q') => return false,
+            KeyCode::Char('c') if mods.contains(KeyModifiers::CONTROL) => return false,
+            KeyCode::Char('M') | KeyCode::Esc => app.mail.close(),
+            KeyCode::Up | KeyCode::Char('k') => app.mail.move_selection(-1),
+            KeyCode::Down | KeyCode::Char('j') => app.mail.move_selection(1),
+            KeyCode::PageDown => app.mail.offset = app.mail.offset.saturating_add(10),
+            KeyCode::PageUp => app.mail.offset = app.mail.offset.saturating_sub(10),
+            KeyCode::Char('d') if mods.contains(KeyModifiers::CONTROL) => {
+                app.mail.offset = app.mail.offset.saturating_add(10);
+            }
+            KeyCode::Char('u') if mods.contains(KeyModifiers::CONTROL) => {
+                app.mail.offset = app.mail.offset.saturating_sub(10);
+            }
+            KeyCode::Char('p') => app.mail.toggle_pending_only(),
+            KeyCode::Char('a') => app.mail.toggle_agent_filter(),
+            KeyCode::Enter => jump_to_mail_party(app),
+            _ => {}
+        }
+        return true;
+    }
     if app.audit_log_open {
         // `g` is special — it might be the first half of a `gg` chord, OR a
         // standalone half-page-down (`Ctrl-d` shape) on its own. We use `gg`
@@ -683,6 +732,10 @@ fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
         }
         KeyCode::Char('m') => {
             app.toggle_mute_selected();
+        }
+        KeyCode::Char('M') => {
+            let hovered = app.selected_session().map(|s| s.pid);
+            app.mail.open(&app.sessions, hovered);
         }
         KeyCode::Char('*') => {
             if let Some((now_pinned, label)) = app.toggle_pin_selected() {
@@ -1028,6 +1081,7 @@ fn refresh(app: &mut AppState) {
     app.notifications_armed = true;
 
     app.sessions = sessions;
+    maintain_mailbox(app);
     app.clamp_selection();
     app.status_msg = None;
 }
@@ -1379,6 +1433,76 @@ fn delete_prev_word(s: &mut String) {
 /// and the jump succeeded (popup-launch lifecycle). On success the filter
 /// is cleared so the next visit starts unfiltered; on failure the filter
 /// stays so the user can retry without retyping.
+fn jump_to_mail_party(app: &mut AppState) {
+    let target = app
+        .mail
+        .jump_pid()
+        .and_then(|pid| app.sessions.iter().find(|s| s.pid == pid))
+        .and_then(|s| s.pane.as_ref())
+        .map(|p| p.target.clone());
+    let Some(target) = target else {
+        app.status_msg = Some("that agent has no live pane".to_string());
+        return;
+    };
+    match tmux::jump_to(&target, app.should_zoom_on_jump()) {
+        Ok(()) => {
+            app.mail.close();
+            app.status_msg = Some(format!("jumped → {target}"));
+        }
+        Err(e) => app.status_msg = Some(format!("jump failed: {e}")),
+    }
+}
+
+/// Reconcile, nudge wake helpers for mail that has waited, and apply
+/// retention once a day — off the draw thread, one pass at a time.
+fn maintain_mailbox(app: &mut AppState) {
+    use std::sync::atomic::Ordering;
+    const NUDGE_AFTER_MS: u64 = 10_000;
+    const PURGE_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+    if app.mail.due() {
+        app.mail.rescan(&app.sessions);
+    } else {
+        return;
+    }
+    if app.mail_worker_busy.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let purge_days = app
+        .mail_purged_at
+        .is_none_or(|t| t.elapsed() >= PURGE_EVERY)
+        .then_some(app.config.send.retention_days);
+    if purge_days.is_some() {
+        app.mail_purged_at = Some(std::time::Instant::now());
+    }
+    let busy = app.mail_worker_busy.clone();
+    std::thread::spawn(move || {
+        let store = mailbox::Store::open_default();
+        if let Err(e) = reconcile::reconcile_all(&store) {
+            store.log_hook_error("tui reconcile", &e);
+        }
+        let now = mailbox::now_ms();
+        for agent in store.agents() {
+            let Ok(mailbox) = store.mailbox(&agent) else {
+                continue;
+            };
+            let waited = mailbox.ids(mailbox::State::Pending).iter().any(|id| {
+                mailbox
+                    .read(mailbox::State::Pending, id)
+                    .is_ok_and(|m| now.saturating_sub(m.created_at_ms) >= NUDGE_AFTER_MS)
+            });
+            if waited && let Err(e) = transport::nudge_helper(&store, &agent) {
+                store.log_hook_error("tui nudge", &e);
+            }
+        }
+        if let Some(days) = purge_days
+            && let Err(e) = messages::purge(&store, days)
+        {
+            store.log_hook_error("tui purge", &e);
+        }
+        busy.store(false, Ordering::SeqCst);
+    });
+}
+
 fn jump_to_selected(app: &mut AppState) -> bool {
     let Some(s) = app.selected_session() else {
         return true;

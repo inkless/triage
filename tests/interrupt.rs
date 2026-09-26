@@ -7,6 +7,12 @@ fn interrupt_only_sends_escape_after_all_guards_pass() {
     let dir = std::env::temp_dir().join(format!("triage-interrupt-{}", std::process::id()));
     fs::create_dir_all(dir.join(".codex/sessions")).unwrap();
     let rollout = dir.join(".codex/sessions/rollout-test.jsonl");
+    let caller_rollout = dir.join(".codex/sessions/rollout-caller.jsonl");
+    fs::write(
+        &caller_rollout,
+        "{\"timestamp\":\"2000-01-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"caller\",\"source\":\"cli\"}}\n",
+    )
+    .unwrap();
     let events = concat!(
         "{\"timestamp\":\"2000-01-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"test\",\"source\":\"cli\"}}\n",
         "{\"timestamp\":\"2000-01-01T00:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n"
@@ -42,13 +48,21 @@ case "$*" in
   [ "$SCENARIO" = child ] && echo "999999 $FIXTURE_PID S 00:00 sleep 60"
   [ "$SCENARIO" = changed ] && printf '\n{}\n' >> "$FIXTURE_ROLLOUT"
   ;;
-*comm*) echo "$FIXTURE_PID codex" ;;
-*) echo "$FIXTURE_PID 1"; echo "$PPID $FIXTURE_PID" ;;
+*comm*) echo "$FIXTURE_PID codex"; echo "999998 codex" ;;
+*) echo "$FIXTURE_PID 1"; echo "999998 1"; echo "$PPID 999998" ;;
 esac
 exit 0
 "#,
         ),
-        ("lsof", "echo \"n$FIXTURE_ROLLOUT\""),
+        (
+            "lsof",
+            r#"
+case "$3" in
+999998) echo "n$FIXTURE_CALLER_ROLLOUT" ;;
+*) echo "n$FIXTURE_ROLLOUT" ;;
+esac
+"#,
+        ),
     ] {
         let path = dir.join(name);
         fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -63,6 +77,7 @@ exit 0
             .env("TRIAGE_AGENT", "wrong-sender")
             .env("FIXTURE_PID", std::process::id().to_string())
             .env("FIXTURE_ROLLOUT", &rollout)
+            .env("FIXTURE_CALLER_ROLLOUT", &caller_rollout)
             .env("SCENARIO", scenario)
             .env(
                 "FIXTURE_CAPTURE",
@@ -119,7 +134,7 @@ exit 0
             "{scenario}: {}",
             String::from_utf8_lossy(&send.stderr)
         );
-        assert!(String::from_utf8_lossy(&send.stdout).contains("from fixture (%42)"));
+        assert!(String::from_utf8_lossy(&send.stdout).contains("(cx:caller) to %42"));
         assert!(!String::from_utf8_lossy(&send.stdout).contains("wrong-sender"));
         assert!(!dir.join("keys").exists());
     }

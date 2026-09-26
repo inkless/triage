@@ -26,6 +26,41 @@ pub struct Config {
     pub model: ModelConfig,
     pub new_agent: NewAgentConfig,
     pub approval_mode: ApprovalMode,
+    pub send: SendConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SendMode {
+    Legacy,
+    #[default]
+    Mailbox,
+}
+
+impl SendMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Some(SendMode::Legacy),
+            "mailbox" => Some(SendMode::Mailbox),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SendConfig {
+    pub mode: SendMode,
+    pub pointer_grace_secs: u64,
+    pub retention_days: u64,
+}
+
+impl Default for SendConfig {
+    fn default() -> Self {
+        Self {
+            mode: SendMode::default(),
+            pointer_grace_secs: 3,
+            retention_days: 30,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,6 +161,18 @@ struct DiskConfig {
     new_agent: Option<DiskNewAgent>,
     #[serde(default)]
     approval: Option<DiskApproval>,
+    #[serde(default)]
+    send: Option<DiskSend>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DiskSend {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    pointer_grace_secs: Option<u64>,
+    #[serde(default)]
+    retention_days: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -283,6 +330,23 @@ impl From<DiskConfig> for Config {
                 ),
             }
         }
+        if let Some(send) = d.send {
+            if let Some(mode) = send.mode {
+                match SendMode::parse(&mode) {
+                    Some(mode) => cfg.send.mode = mode,
+                    None => eprintln!(
+                        "[warn] unknown [send].mode {:?}; using default",
+                        mode.trim()
+                    ),
+                }
+            }
+            if let Some(secs) = send.pointer_grace_secs {
+                cfg.send.pointer_grace_secs = secs;
+            }
+            if let Some(days) = send.retention_days {
+                cfg.send.retention_days = days;
+            }
+        }
         cfg
     }
 }
@@ -305,6 +369,13 @@ fn infer_new_agent_provider_from_command(command: &str) -> Option<NewAgentProvid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_defaults_to_mailbox_and_legacy_can_be_chosen() {
+        assert_eq!(Config::default().send.mode, SendMode::Mailbox);
+        let disk: DiskConfig = toml::from_str("[send]\nmode = \"legacy\"\n").unwrap();
+        assert_eq!(Config::from(disk).send.mode, SendMode::Legacy);
+    }
 
     #[test]
     fn new_agent_defaults_to_claude() {
