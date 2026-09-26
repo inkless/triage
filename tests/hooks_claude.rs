@@ -189,6 +189,33 @@ fn waiter_wakes_with_rendered_mail_and_commits_once_the_transcript_shows_it() {
 }
 
 #[test]
+fn a_wake_folded_into_a_running_turn_is_confirmed_from_its_attachment() {
+    let env = Env::new("midturn-wake");
+    let id = "01900000-0000-7000-8000-000000000005";
+    env.write_mail(S1, id, "while you were busy");
+    let woke = env.hook("stop", true, S1);
+    assert_eq!(woke.status.code(), Some(2));
+    let text = String::from_utf8(woke.stderr).unwrap();
+    let prompt = format!(
+        "<task-notification>\n<summary>Stop hook feedback</summary>\n</task-notification>\n<system-reminder>\nStop hook blocking error from command \"Stop\": {text}\n</system-reminder>"
+    );
+
+    let enqueued =
+        serde_json::json!({"type": "queue-operation", "operation": "enqueue", "content": prompt});
+    append(&env.transcript(S1), &format!("{enqueued}\n"));
+    assert_eq!(env.hook("stop", false, S1).status.code(), Some(0));
+    assert_eq!(env.mail(S1, "inflight").len(), 1, "queued is not yet seen");
+
+    let folded = serde_json::json!({
+        "type": "attachment",
+        "attachment": {"type": "queued_command", "commandMode": "task-notification", "prompt": prompt},
+    });
+    append(&env.transcript(S1), &format!("{folded}\n"));
+    assert_eq!(env.hook("stop", false, S1).status.code(), Some(0));
+    assert_eq!(env.mail(S1, "delivered").len(), 1);
+}
+
+#[test]
 fn one_waiter_per_agent_and_a_cleared_session_hands_the_lock_over() {
     let env = Env::new("handoff");
     let first = env.spawn_hook("stop", true, S1);

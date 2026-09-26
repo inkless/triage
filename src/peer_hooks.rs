@@ -505,14 +505,30 @@ fn transcript_has_rewake(path: &Path, offset: u64, marker: &str) -> Option<bool>
         let Ok(record) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let content = record.pointer("/message/content").and_then(Value::as_str);
-        if record.get("type").and_then(Value::as_str) == Some("user")
-            && content.is_some_and(|c| c.starts_with("<task-notification>") && c.contains(marker))
+        if rewake_text(&record)
+            .is_some_and(|text| text.starts_with("<task-notification>") && text.contains(marker))
         {
             return Some(true);
         }
     }
     Some(false)
+}
+
+/// The model-visible text of a rewake: a user record when the session was
+/// idle, a `queued_command` attachment when it was folded into a running turn.
+fn rewake_text(record: &Value) -> Option<&str> {
+    match record.get("type").and_then(Value::as_str)? {
+        "user" => record.pointer("/message/content").and_then(Value::as_str),
+        "attachment" => {
+            let attachment = record.get("attachment")?;
+            (attachment.get("type").and_then(Value::as_str) == Some("queued_command")
+                && attachment.get("commandMode").and_then(Value::as_str)
+                    == Some("task-notification"))
+            .then(|| attachment.get("prompt").and_then(Value::as_str))
+            .flatten()
+        }
+        _ => None,
+    }
 }
 
 /// Claude SIGTERMs every waiter on `/exit`; one landing between claiming mail
