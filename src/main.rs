@@ -15,6 +15,7 @@ mod snapshot;
 mod spawn_agent;
 mod tmux;
 mod transcript;
+mod transport;
 mod ui;
 mod watcher;
 

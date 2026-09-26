@@ -394,11 +394,6 @@ pub fn attach_to_sessions(
     }
 }
 
-/// Path to `~/.claude/settings.json`. None when HOME is unset.
-fn settings_json_path() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".claude/settings.json"))
-}
-
 /// Bash hook content, embedded at compile time. `--install-hooks` writes this
 /// to `hook_install_path()` so the hook is decoupled from the source-repo
 /// location — `cargo install triage` users no longer need a checkout.
@@ -538,12 +533,13 @@ enum Action {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Selection {
     claude: bool,
+    codex: bool,
     approval: bool,
     midturn: bool,
 }
 
-const HOOKS_USAGE: &str = "usage: triage hooks install|uninstall|status [--claude] [--approval] [--midturn] [--dry-run]\n\
-  With no hook flags: the Claude peer-messaging hooks.\n\
+const HOOKS_USAGE: &str = "usage: triage hooks install|uninstall|status [--claude] [--codex] [--approval] [--midturn] [--dry-run]\n\
+  With no hook flags: the Claude and Codex peer-messaging hooks.\n\
   --approval   the PreToolUse approval hook (same as --install-hooks)\n\
   --midturn    also deliver mail between tool calls (PostToolUse drain)";
 
@@ -558,6 +554,7 @@ pub fn cli_hooks(args: &[String]) -> i32 {
             "uninstall" if action.is_none() => action = Some(Action::Uninstall),
             "status" if action.is_none() => action = Some(Action::Status),
             "--claude" => selection.claude = true,
+            "--codex" => selection.codex = true,
             "--approval" => selection.approval = true,
             "--midturn" => selection.midturn = true,
             "--dry-run" => dry_run = true,
@@ -575,11 +572,12 @@ pub fn cli_hooks(args: &[String]) -> i32 {
         eprintln!("{HOOKS_USAGE}");
         return 2;
     };
-    if !selection.claude && !selection.approval {
+    if !selection.claude && !selection.codex && !selection.approval {
         selection.claude = true;
+        selection.codex = true;
     }
-    if selection.midturn && (action != Action::Install || !selection.claude) {
-        eprintln!("--midturn only applies to installing the Claude messaging hooks\n{HOOKS_USAGE}");
+    if selection.midturn && (action != Action::Install || !(selection.claude || selection.codex)) {
+        eprintln!("--midturn only applies to installing the messaging hooks\n{HOOKS_USAGE}");
         return 2;
     }
     match run_hooks_action(action, selection, dry_run) {
@@ -591,13 +589,22 @@ pub fn cli_hooks(args: &[String]) -> i32 {
     }
 }
 
+struct Target {
+    name: &'static str,
+    path: PathBuf,
+    specs: Vec<HookSpec>,
+    positional: bool,
+    messaging: Option<Provider>,
+}
+
 fn run_hooks_action(action: Action, selection: Selection, dry_run: bool) -> io::Result<()> {
-    let settings_path = settings_json_path()
-        .ok_or_else(|| io::Error::other("HOME is unset; cannot locate settings.json"))?;
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| io::Error::other("HOME is unset; cannot locate hook settings"))?;
     let script = hook_install_path()
         .ok_or_else(|| io::Error::other("HOME is unset; cannot locate install path"))?;
     let script_str = script.display().to_string();
-    let triage = if selection.claude && action != Action::Uninstall {
+    let triage = if (selection.claude || selection.codex) && action != Action::Uninstall {
         let (path, warning) = triage_command_path();
         if let Some(warning) = warning {
             eprintln!("warning: {warning}");
@@ -607,72 +614,112 @@ fn run_hooks_action(action: Action, selection: Selection, dry_run: bool) -> io::
         String::new()
     };
 
-    let mut specs = Vec::new();
-    if selection.approval {
-        specs.extend(approval_specs(action, &script_str));
+    let mut targets = Vec::new();
+    if selection.approval || selection.claude {
+        let mut specs = Vec::new();
+        if selection.approval {
+            specs.extend(approval_specs(action, &script_str));
+        }
+        if selection.claude {
+            specs.extend(claude_messaging_specs(action, &triage, selection.midturn));
+        }
+        targets.push(Target {
+            name: "Claude",
+            path: home.join(".claude/settings.json"),
+            specs,
+            positional: false,
+            messaging: selection.claude.then_some(Provider::Claude),
+        });
     }
-    if selection.claude {
-        specs.extend(claude_messaging_specs(action, &triage, selection.midturn));
+    if selection.codex {
+        if home.join(".codex").is_dir() {
+            targets.push(Target {
+                name: "Codex",
+                path: home.join(".codex/hooks.json"),
+                specs: codex_messaging_specs(action, &triage, selection.midturn),
+                positional: true,
+                messaging: Some(Provider::Codex),
+            });
+        } else {
+            println!("Codex: ~/.codex not found; skipping");
+        }
     }
 
-    let original = read_settings_json(&settings_path)?;
+    for target in &targets {
+        run_target(action, target, dry_run)?;
+    }
+    if action == Action::Status && (selection.claude || selection.codex) {
+        print_waiters();
+    }
+
+    if selection.approval {
+        match action {
+            Action::Install => {
+                if write_hook_script(&script, dry_run)? && !dry_run {
+                    println!("Refreshed hook script at {script_str}");
+                }
+            }
+            Action::Uninstall if script.exists() => {
+                if dry_run {
+                    println!("DRY RUN — would remove hook script {}", script.display());
+                } else {
+                    fs::remove_file(&script)?;
+                    println!("Removed hook script {}", script.display());
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn run_target(action: Action, target: &Target, dry_run: bool) -> io::Result<()> {
+    let original = read_settings_json(&target.path)?;
     if action == Action::Status {
-        print_status(&original, &specs);
-        if selection.claude {
-            print_waiters();
+        println!("{} ({}):", target.name, target.path.display());
+        print_status(&original, &target.specs);
+        if target.messaging == Some(Provider::Codex) {
+            println!(
+                "  Codex asks you to trust new hooks once; a hook-capable Codex session below means they ran."
+            );
         }
         return Ok(());
     }
-
-    let (edited, changes) = edit_settings(&original, &specs)?;
-    let script_changed = match (selection.approval, action) {
-        (true, Action::Install) => write_hook_script(&script, dry_run)?,
-        _ => false,
-    };
+    let (edited, changes) = edit_hooks(&original, &target.specs, target.positional)?;
     if changes.is_empty() {
-        if script_changed {
-            println!("Refreshed hook script at {script_str} (settings.json unchanged)");
-        } else {
-            println!(
-                "{} already up to date (no changes)",
-                settings_path.display()
-            );
-        }
+        println!(
+            "{}: {} already up to date (no changes)",
+            target.name,
+            target.path.display()
+        );
     } else if dry_run {
-        println!("DRY RUN — would update {}:", settings_path.display());
+        println!("DRY RUN — would update {}:", target.path.display());
         for change in &changes {
             println!("  {change}");
         }
         println!();
         println!("{}", serde_json::to_string_pretty(&edited)?);
     } else {
-        let backup = write_settings_json(&settings_path, &edited)?;
-        println!("Updated {}:", settings_path.display());
+        let backup = write_settings_json(&target.path, &edited)?;
+        println!("Updated {}:", target.path.display());
         for change in &changes {
             println!("  {change}");
         }
         if let Some(backup) = backup {
             println!("  backup: {}", backup.display());
         }
-        if selection.claude && action == Action::Install {
+        if action == Action::Install && target.messaging.is_some() {
             println!(
-                "Claude reads hooks at startup: sessions started before now keep legacy paste until restarted."
+                "  {} reads hooks at startup: sessions started before now keep legacy paste until restarted.",
+                target.name
             );
         }
     }
-
-    if action == Action::Uninstall {
-        if selection.approval && script.exists() {
-            if dry_run {
-                println!("DRY RUN — would remove hook script {}", script.display());
-            } else {
-                fs::remove_file(&script)?;
-                println!("Removed hook script {}", script.display());
-            }
-        }
-        if selection.claude && !dry_run {
-            clear_host_records(Provider::Claude)?;
-        }
+    if action == Action::Uninstall
+        && !dry_run
+        && let Some(provider) = target.messaging
+    {
+        clear_host_records(provider)?;
     }
     Ok(())
 }
@@ -743,6 +790,37 @@ fn claude_messaging_specs(action: Action, triage: &str, midturn: bool) -> Vec<Ho
     ]
 }
 
+fn codex_messaging_specs(action: Action, triage: &str, midturn: bool) -> Vec<HookSpec> {
+    let drain = |event: &str| {
+        serde_json::json!({
+            "type": "command",
+            "command": format!("{triage} inbox --hook codex {event} {MESSAGING_HOOK_MARKER}"),
+            "timeout": 5,
+        })
+    };
+    let install = action != Action::Uninstall;
+    vec![
+        HookSpec {
+            label: "Codex SessionStart session record",
+            event: "SessionStart",
+            is_ours: |c| is_messaging_command(c, "codex session-start"),
+            desired: install.then(|| (None, drain("session-start"))),
+        },
+        HookSpec {
+            label: "Codex UserPromptSubmit mail drain",
+            event: "UserPromptSubmit",
+            is_ours: |c| is_messaging_command(c, "codex user-prompt-submit"),
+            desired: install.then(|| (None, drain("user-prompt-submit"))),
+        },
+        HookSpec {
+            label: "Codex PostToolUse mail drain (--midturn)",
+            event: "PostToolUse",
+            is_ours: |c| is_messaging_command(c, "codex post-tool-use"),
+            desired: (install && midturn).then(|| (None, drain("post-tool-use"))),
+        },
+    ]
+}
+
 /// Any version of the marker counts as ours, so an upgrade replaces old
 /// entries instead of stacking new ones beside them.
 fn is_messaging_command(command: &str, hook: &str) -> bool {
@@ -758,7 +836,15 @@ fn shape_error(what: &str) -> io::Error {
 
 /// Applies every spec to a copy of `input`. Other tools' entries are never
 /// touched, and an unexpected shape is an error rather than a rewrite.
-fn edit_settings(input: &Value, specs: &[HookSpec]) -> io::Result<(Value, Vec<String>)> {
+///
+/// `positional` is for Codex, which keys hook trust by group and hook index:
+/// existing entries are updated in place and new ones appended, so no other
+/// entry moves; a removal that shifts later groups is called out.
+fn edit_hooks(
+    input: &Value,
+    specs: &[HookSpec],
+    positional: bool,
+) -> io::Result<(Value, Vec<String>)> {
     let mut root = match input {
         Value::Object(_) => input.clone(),
         Value::Null => Value::Object(serde_json::Map::new()),
@@ -818,6 +904,29 @@ fn edit_settings(input: &Value, specs: &[HookSpec]) -> io::Result<(Value, Vec<St
         if spec.desired.is_none() && ours.is_empty() {
             continue;
         }
+        if positional
+            && let Some((matcher, handler)) = &spec.desired
+            && let Some(&(gi, hi)) = ours.first()
+        {
+            groups[gi]["hooks"][hi] = handler.clone();
+            match matcher {
+                Some(m) => groups[gi]["matcher"] = Value::String((*m).to_string()),
+                None => {
+                    if let Some(group) = groups[gi].as_object_mut() {
+                        group.remove("matcher");
+                    }
+                }
+            }
+            for &(dgi, dhi) in ours[1..].iter().rev() {
+                if let Some(handlers) = groups[dgi]["hooks"].as_array_mut() {
+                    handlers.remove(dhi);
+                }
+            }
+            let shifted = drop_emptied_groups(groups, &ours[1..]);
+            changes.push(format!("update {}{}", spec.label, shift_note(shifted)));
+            continue;
+        }
+        let groups_before = groups.len();
         for group in groups.iter_mut() {
             if let Some(handlers) = group.get_mut("hooks").and_then(Value::as_array_mut) {
                 let before = handlers.len();
@@ -831,7 +940,14 @@ fn edit_settings(input: &Value, specs: &[HookSpec]) -> io::Result<(Value, Vec<St
                 }
             }
         }
+        let removed_positions: Vec<usize> = groups
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| g["hooks"].is_null())
+            .map(|(i, _)| i)
+            .collect();
         groups.retain(|group| !group["hooks"].is_null());
+        let shifted = positional && later_group_moves(&removed_positions, groups_before);
         match &spec.desired {
             Some((matcher, handler)) => {
                 let mut group = serde_json::Map::new();
@@ -843,7 +959,7 @@ fn edit_settings(input: &Value, specs: &[HookSpec]) -> io::Result<(Value, Vec<St
                 let verb = if ours.is_empty() { "add" } else { "update" };
                 changes.push(format!("{verb} {}", spec.label));
             }
-            None => changes.push(format!("remove {}", spec.label)),
+            None => changes.push(format!("remove {}{}", spec.label, shift_note(shifted))),
         }
         if groups.is_empty() {
             hooks.remove(spec.event);
@@ -853,6 +969,38 @@ fn edit_settings(input: &Value, specs: &[HookSpec]) -> io::Result<(Value, Vec<St
         }
     }
     Ok((root, changes))
+}
+
+/// Removes groups left empty by deleting our duplicate handlers; true when a
+/// group after them moved up.
+fn drop_emptied_groups(groups: &mut Vec<Value>, removed_from: &[(usize, usize)]) -> bool {
+    let mut emptied: Vec<usize> = removed_from
+        .iter()
+        .map(|&(gi, _)| gi)
+        .filter(|&gi| groups[gi]["hooks"].as_array().is_some_and(Vec::is_empty))
+        .collect();
+    emptied.sort_unstable();
+    emptied.dedup();
+    let shifted = later_group_moves(&emptied, groups.len());
+    for gi in emptied.into_iter().rev() {
+        groups.remove(gi);
+    }
+    shifted
+}
+
+/// Whether any group survives after the first removed one (and so moves up).
+fn later_group_moves(removed: &[usize], len: usize) -> bool {
+    removed
+        .first()
+        .is_some_and(|&first| (first..len).any(|i| !removed.contains(&i)))
+}
+
+fn shift_note(shifted: bool) -> &'static str {
+    if shifted {
+        " (later hooks move position; Codex will ask you to trust them again)"
+    } else {
+        ""
+    }
 }
 
 fn root_obj_remove_hooks(root: &mut Value) {
@@ -1144,7 +1292,7 @@ mod tests {
             "/home/u/.config/triage/hooks/triage-preuse.sh",
         );
         specs.extend(claude_messaging_specs(Action::Install, TRIAGE, midturn));
-        edit_settings(input, &specs).unwrap()
+        edit_hooks(input, &specs, false).unwrap()
     }
 
     fn handlers<'a>(v: &'a Value, event: &str) -> Vec<&'a str> {
@@ -1202,7 +1350,7 @@ mod tests {
             .into_iter()
             .filter(|s| s.event == "Stop")
             .collect::<Vec<_>>();
-        let (_, changes) = edit_settings(&installed, &stop).unwrap();
+        let (_, changes) = edit_hooks(&installed, &stop, false).unwrap();
         assert!(changes.is_empty(), "{changes:?}");
         let _ = fs::remove_dir_all(dir);
     }
@@ -1233,7 +1381,7 @@ mod tests {
             json!({"hooks": {"Stop": [{"command": "x"}]}}),
         ] {
             let specs = claude_messaging_specs(Action::Install, TRIAGE, false);
-            assert!(edit_settings(&bad, &specs).is_err(), "{bad}");
+            assert!(edit_hooks(&bad, &specs, false).is_err(), "{bad}");
         }
     }
 
@@ -1243,16 +1391,18 @@ mod tests {
             {"type": "command", "command": "navi-stop.sh"},
             {"type": "command", "command": "/opt/homebrew/bin/triage inbox --hook claude stop --wait --triage-hook=v1"}
         ]}]}});
-        let (out, changes) = edit_settings(
+        let (out, changes) = edit_hooks(
             &shared,
             &claude_messaging_specs(Action::Uninstall, "", false),
+            false,
         )
         .unwrap();
         assert_eq!(changes, ["remove Claude Stop mail waiter"]);
         assert_eq!(handlers(&out, "Stop"), ["navi-stop.sh"]);
-        let (clean, _) = edit_settings(
+        let (clean, _) = edit_hooks(
             &install(&json!({}), true).0,
             &claude_messaging_specs(Action::Uninstall, "", false),
+            false,
         )
         .unwrap();
         assert_eq!(clean["hooks"]["PreToolUse"].as_array().unwrap().len(), 1);
@@ -1282,6 +1432,81 @@ mod tests {
             ["remove Claude PostToolUse mail drain (--midturn)"]
         );
         assert!(without["hooks"].get("PostToolUse").is_none());
+    }
+
+    fn codex_commands(v: &Value, event: &str) -> Vec<String> {
+        handlers(v, event).into_iter().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn codex_entries_are_appended_and_updated_in_place() {
+        let user = json!({"hooks": {"UserPromptSubmit": [
+            {"hooks": [{"type": "command", "command": "user-hook-a.sh"}]},
+            {"hooks": [{"type": "command", "command": "/old/triage inbox --hook codex user-prompt-submit --triage-hook=v0"}]},
+            {"hooks": [{"type": "command", "command": "user-hook-b.sh"}]}
+        ]}});
+        let (out, changes) = edit_hooks(
+            &user,
+            &codex_messaging_specs(Action::Install, TRIAGE, false),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            codex_commands(&out, "UserPromptSubmit"),
+            [
+                "user-hook-a.sh",
+                "/opt/homebrew/bin/triage inbox --hook codex user-prompt-submit --triage-hook=v1",
+                "user-hook-b.sh",
+            ]
+        );
+        assert!(changes.contains(&"update Codex UserPromptSubmit mail drain".to_string()));
+        let (again, changes) = edit_hooks(
+            &out,
+            &codex_messaging_specs(Action::Install, TRIAGE, false),
+            true,
+        )
+        .unwrap();
+        assert!(changes.is_empty(), "{changes:?}");
+        assert_eq!(again, out);
+    }
+
+    #[test]
+    fn codex_removal_flags_only_a_real_shift() {
+        let (installed, _) = edit_hooks(
+            &json!({"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "first.sh"}]}]}}),
+            &codex_messaging_specs(Action::Install, TRIAGE, false),
+            true,
+        )
+        .unwrap();
+        let (_, changes) = edit_hooks(
+            &installed,
+            &codex_messaging_specs(Action::Uninstall, "", false),
+            true,
+        )
+        .unwrap();
+        assert!(changes.iter().all(|c| !c.contains("trust")), "{changes:?}");
+
+        let mut shifted = installed.clone();
+        shifted["hooks"]["SessionStart"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"hooks": [{"type": "command", "command": "after.sh"}]}));
+        let (out, changes) = edit_hooks(
+            &shifted,
+            &codex_messaging_specs(Action::Uninstall, "", false),
+            true,
+        )
+        .unwrap();
+        assert!(
+            changes
+                .iter()
+                .any(|c| c.starts_with("remove Codex SessionStart") && c.contains("trust")),
+            "{changes:?}"
+        );
+        assert_eq!(
+            codex_commands(&out, "SessionStart"),
+            ["first.sh", "after.sh"]
+        );
     }
 
     #[test]

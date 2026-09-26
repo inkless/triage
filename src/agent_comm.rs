@@ -39,8 +39,10 @@ pub fn cli_send(args: &[String]) -> i32 {
 }
 
 pub fn cli_inbox(args: &[String]) -> i32 {
-    if args.first().map(String::as_str) == Some("--hook") {
-        return crate::peer_hooks::cli(&args[1..]);
+    match args.first().map(String::as_str) {
+        Some("--hook") => return crate::peer_hooks::cli(&args[1..]),
+        Some("--helper") => return crate::transport::cli_helper(&args[1..]),
+        _ => {}
     }
     match run_inbox(args) {
         Ok(()) => 0,
@@ -640,6 +642,9 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
                 .mailbox(&to.agent)
                 .and_then(|mailbox| mailbox.enqueue(&msg))
                 .map_err(|e| CliError::delivery(format!("failed to queue message: {e}")))?;
+            if let Err(e) = crate::transport::nudge_helper(&store, &to.agent) {
+                eprintln!("warning: queued, but could not start the wake helper: {e}");
+            }
             Ok(format!(
                 "queued for {} (agent {short}) id={}",
                 target_label(target),
@@ -961,6 +966,29 @@ fn format_user_reply(body: &str) -> Result<String, CliError> {
         return Err(CliError::usage("reply must be a single line"));
     }
     Ok(body)
+}
+
+/// Claude backstop wake for a session whose waiter is gone: the same pointer
+/// text a Codex session gets, pasted only if the session is idle and the
+/// usual send gate passes.
+pub fn paste_wake_pointer(host_pid: u32, text: &str) -> Result<(), String> {
+    let sessions = load_snapshot().map_err(|e| e.message)?;
+    let target = sessions
+        .iter()
+        .find(|s| s.pid == host_pid)
+        .ok_or_else(|| format!("no tracked session for pid {host_pid}"))?;
+    if target.status == "busy" {
+        return Ok(());
+    }
+    let gate = evaluate_send_gate(target);
+    if !gate.can_send {
+        return Ok(());
+    }
+    let pane = target
+        .pane
+        .as_ref()
+        .ok_or_else(|| "target has no tmux pane".to_string())?;
+    tmux::paste_text_and_enter(&pane.pane_id, text).map_err(|e| e.to_string())
 }
 
 fn deliver_message(

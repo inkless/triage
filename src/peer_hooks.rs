@@ -34,6 +34,7 @@ const EXIT_WAKE: i32 = 2;
 enum Event {
     SessionStart,
     Stop,
+    UserPromptSubmit,
     PostToolUse,
 }
 
@@ -79,6 +80,7 @@ fn parse_args(args: &[String]) -> io::Result<HookArgs> {
     let event = match args.get(1).map(String::as_str) {
         Some("session-start") => Event::SessionStart,
         Some("stop") => Event::Stop,
+        Some("user-prompt-submit") => Event::UserPromptSubmit,
         Some("post-tool-use") => Event::PostToolUse,
         _ => return Err(bad("unknown hook event")),
     };
@@ -154,7 +156,27 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
             "PostToolUse",
             DeliveredVia::ClaudePostToolUse,
         ),
-        (Provider::Codex, _) => Err(io::Error::other("Codex hooks are not supported yet")),
+        (Provider::Claude, Event::UserPromptSubmit) | (Provider::Codex, Event::Stop) => Err(
+            io::Error::other("no triage hook is installed for this event"),
+        ),
+        (Provider::Codex, Event::SessionStart) => Ok(0),
+        (Provider::Codex, Event::UserPromptSubmit | Event::PostToolUse) => {
+            if hook.event == Event::UserPromptSubmit {
+                crate::transport::clear_pointer(store, &agent);
+            }
+            if host_current_session(store, host).as_deref() != Some(payload.session.as_str()) {
+                crate::transport::clear_pointer(store, &agent);
+                crate::transport::nudge_helper(store, &agent)?;
+                return Ok(0);
+            }
+            let (name, via) = match hook.event {
+                Event::UserPromptSubmit => {
+                    ("UserPromptSubmit", DeliveredVia::CodexUserPromptSubmit)
+                }
+                _ => ("PostToolUse", DeliveredVia::CodexPostToolUse),
+            };
+            drain(store, &mailbox, host, &payload, name, via)
+        }
     }
 }
 
@@ -170,7 +192,7 @@ fn find_host(provider: Provider) -> Option<HostId> {
         let info = mailbox::proc_info(pid).ok()?;
         let is_host = match provider {
             Provider::Claude => sessions_dir.join(format!("{pid}.json")).exists(),
-            Provider::Codex => info.comm == "codex",
+            Provider::Codex => info.comm == "codex" || is_test_codex_host(pid),
         };
         if is_host {
             return Some(HostId {
@@ -181,6 +203,13 @@ fn find_host(provider: Provider) -> Option<HostId> {
         pid = info.ppid;
     }
     None
+}
+
+/// Integration tests can't run a real `codex`; debug builds let them name an
+/// ancestor pid that stands in for one.
+fn is_test_codex_host(pid: u32) -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("TRIAGE_TEST_CODEX_HOST").is_ok_and(|v| v == pid.to_string())
 }
 
 /// Links the session into its agent's lineage and records the host's current
@@ -206,7 +235,9 @@ fn register(
         }
     };
     let current_session = match (&record, event) {
-        (Some(r), Event::Stop | Event::PostToolUse) => r.current_session.clone(),
+        (Some(r), Event::Stop | Event::UserPromptSubmit | Event::PostToolUse) => {
+            r.current_session.clone()
+        }
         _ => session.to_string(),
     };
     store.write_host(
