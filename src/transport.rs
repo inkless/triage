@@ -140,20 +140,23 @@ fn helper_pass(store: &Store, agent: &str, grace: Duration) -> io::Result<()> {
     let Some((host, record)) = current_host(store, agent) else {
         return Ok(());
     };
-    let pending: Vec<_> = mailbox
-        .ids(State::Pending)
-        .into_iter()
-        .filter_map(|id| mailbox.read(State::Pending, &id).ok())
-        .collect();
-    let Some(oldest) = pending.iter().map(|m| m.created_at_ms).min() else {
+    let read_pending = || -> Vec<_> {
+        mailbox
+            .ids(State::Pending)
+            .into_iter()
+            .filter_map(|id| mailbox.read(State::Pending, &id).ok())
+            .collect()
+    };
+    let Some(oldest) = read_pending().iter().map(|m| m.created_at_ms).min() else {
         return Ok(());
     };
     let age = Duration::from_millis(mailbox::now_ms().saturating_sub(oldest));
     if age < grace {
         std::thread::sleep(grace - age);
-        if mailbox.ids(State::Pending).is_empty() {
-            return Ok(());
-        }
+    }
+    let pending = read_pending();
+    if pending.is_empty() {
+        return Ok(());
     }
     let senders: Vec<String> = pending
         .iter()

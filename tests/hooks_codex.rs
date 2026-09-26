@@ -73,10 +73,14 @@ impl Env {
     }
 
     fn write_mail(&self, agent: &str, id: &str, body: &str) {
+        self.write_mail_at(agent, id, body, 1);
+    }
+
+    fn write_mail_at(&self, agent: &str, id: &str, body: &str, created_at_ms: u128) {
         let path = self.state().join(format!("mail/{agent}/pending/{id}.json"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         let msg = serde_json::json!({
-            "v": 1, "id": id, "created_at_ms": 1,
+            "v": 1, "id": id, "created_at_ms": created_at_ms,
             "from": {"agent": SENDER, "session": SENDER, "provider": "claude", "label": "TRI-148"},
             "to": {"agent": agent, "session_at_send": agent},
             "body": body, "attempt": 0, "bounce_of": null
@@ -186,6 +190,29 @@ fn helper_queues_one_pointer_per_burst() {
 
     run_helper();
     assert_eq!(env.queue_calls().len(), 1, "a live pointer is not re-sent");
+}
+
+#[test]
+fn mail_arriving_during_the_grace_period_is_counted_in_the_pointer() {
+    let env = Env::new("grace");
+    env.hook("session-start", S1);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    env.write_mail_at(S1, "01900000-0000-7000-8000-000000000006", "first", now);
+    let helper = env.command(&["inbox", "--helper", S1]).spawn().unwrap();
+    std::thread::sleep(Duration::from_millis(1000));
+    env.write_mail_at(
+        S1,
+        "01900000-0000-7000-8000-000000000007",
+        "second",
+        now + 1000,
+    );
+    assert!(helper.wait_with_output().unwrap().status.success());
+    let calls = env.queue_calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].contains("2 peer message(s)"), "{calls:?}");
 }
 
 #[test]
