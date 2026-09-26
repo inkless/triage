@@ -652,12 +652,9 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
             let short = mailbox::short_id(&to.agent);
             let msg = new_message(&from, caller, &to, &body);
             if !hook_capable(&store, &to) {
-                let item = RenderItem {
-                    msg: &msg,
-                    nonce: None,
-                    sent_before_clear: false,
-                };
-                let text = mailbox::render_batch(&[item], usize::MAX).0;
+                // A paste lands in the target's history as a user prompt, so it
+                // uses the compact one-line form, not the fenced hook rendering.
+                let text = format_message(&sender, &body);
                 let result = deliver_to(target, selector, &sender, &text, args.dry_run)?;
                 if !args.dry_run
                     && let Err(e) = store
