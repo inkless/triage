@@ -645,16 +645,10 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
             Ok(result)
         }
         SendMode::Mailbox => {
-            let from = from.ok_or_else(|| {
-                CliError::runtime(
-                    "the calling session has no mailbox identity (session id is not a UUID)",
-                )
-            })?;
-            let to = to.ok_or_else(|| {
-                CliError::runtime(
-                    "the target session has no mailbox identity (session id is not a UUID)",
-                )
-            })?;
+            let (Some(from), Some(to)) = (from, to) else {
+                let formatted = format_message(&sender, &body);
+                return deliver_to(target, selector, &sender, &formatted, args.dry_run);
+            };
             let short = mailbox::short_id(&to.agent);
             let msg = new_message(&from, caller, &to, &body);
             if !hook_capable(&store, &to) {

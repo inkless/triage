@@ -31,8 +31,8 @@ pub struct Config {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SendMode {
-    #[default]
     Legacy,
+    #[default]
     Mailbox,
 }
 
@@ -369,6 +369,13 @@ fn infer_new_agent_provider_from_command(command: &str) -> Option<NewAgentProvid
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn send_defaults_to_mailbox_and_legacy_can_be_chosen() {
+        assert_eq!(Config::default().send.mode, SendMode::Mailbox);
+        let disk: DiskConfig = toml::from_str("[send]\nmode = \"legacy\"\n").unwrap();
+        assert_eq!(Config::from(disk).send.mode, SendMode::Legacy);
+    }
 
     #[test]
     fn new_agent_defaults_to_claude() {

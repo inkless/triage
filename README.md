@@ -45,6 +45,9 @@ triage              # launch the TUI
 triage --probe      # print the joined session table once (no TUI)
 triage agents --json # list peer agents and guarded send status
 triage send --to '%42' --message "can you check this?" # message a live agent
+triage inbox        # peer mail queued for the calling agent
+triage messages     # review peer mail across agents
+triage hooks install # Claude + Codex peer-mail hooks (restart agents afterwards)
 triage launch --cwd "$PWD" --provider codex # launch a new detached agent window
 triage notify "..." # one-shot ntfy push using config.toml's [ntfy] block
 triage cost         # daily/weekly Claude spend rollup across all transcripts
@@ -85,6 +88,48 @@ agent's terminal may queue the submitted line until its next input slot. The
 message body is pasted through an internal tmux buffer and submitted with a
 separate Enter, so agents can use either one-line text or a file/stdin body
 without caring about the transport.
+
+### Peer mail
+
+With `[send] mode = "mailbox"` (the default), `triage send` writes the message
+to the target's mailbox under `~/.local/state/triage` instead of typing it into
+the pane, so peer messages never show up as user prompts:
+
+- **Claude** sessions are woken by a background `asyncRewake` hook that
+  delivers the mail as a collapsed "Stop hook feedback" line; mail that arrives
+  mid-turn is folded into the running turn.
+- **Codex** sessions get the mail as hidden context on their next prompt. An
+  idle Codex session is woken by a single queued line,
+  `📨 triage: N peer message(s) from …`, sent once per burst.
+- Targets without triage's hooks (started before `triage hooks install`, or
+  not installed) get the message pasted as before, labelled as peer mail.
+
+The delivered text names the sender and ends with a reply command,
+`triage send --to <agent> --message "…"`. `--to` accepts a pane id, pane
+target, name, agent id, or the agent id's last 8 characters; agent ids follow a
+session through `/clear` and resume. Sending to yourself is an error (exit 2).
+
+```bash
+triage send --to 3f2a9c1d --message "rebased onto main" --wait   # block until delivered
+triage send --to '%42' --mode legacy --message "..."              # force the old paste
+triage inbox                 # read your queued mail by hand (marks it delivered)
+triage inbox show <id>       # a long message whose head was delivered
+triage messages --pending    # anything not yet delivered, across agents
+triage messages --thread <a> <b> --follow
+triage messages purge --older-than 30
+```
+
+`--wait[=SECS]` (default 60) exits 0 once delivered, 4 if the message bounced
+(the target session ended first; the sender gets a short bounce notice), and 5
+if it is still queued. Delivery is at least once: a message can be re-delivered
+after a crash, and says so. A session only acts on peer mail it has context
+for; agents launched for a coordinated fleet are told that peers may message
+them.
+
+Codex runs tools in a sandbox that blocks process discovery and writes outside
+the workspace, so `triage send` from a sandboxed Codex agent fails with
+"Operation not permitted"; triage then says to rerun it with escalated
+permissions.
 
 Codex turns with no recorded agent/tool progress for 15 minutes appear as
 `NoProgress` (`quiet` in the TUI, with “no progress Nm” in the headline).
@@ -155,12 +200,27 @@ bind-key -n M-p run-shell "triage --jump-to-self --zoom"
 
 **Zoom-on-Enter is auto-detected** by triage's current pane width. Tmux resizes panes to the smallest attached client, so when you're on a phone the pane is narrow (<100 cols) → Enter zooms; when on desktop it's wide → Enter doesn't zoom. No flag needed, no per-device launch dance. If you want to force zoom on a wider pane, pass `--zoom-on-jump`. `--exit-on-jump` (popup pattern, exits triage after Enter) implies zoom too.
 
-## Optional: PreToolUse hook
+## Optional: hooks
+
+Peer mail (see [Peer mail](#peer-mail)) needs triage's messaging hooks:
+
+```bash
+triage hooks install           # Claude (~/.claude/settings.json) and Codex (~/.codex/hooks.json)
+triage hooks install --midturn # also deliver between tool calls, not just at turn boundaries
+triage hooks status            # entries, and which live sessions are hook-capable
+triage hooks uninstall
+```
+
+Agents read hooks at startup, so restart running sessions afterwards; until
+then they keep receiving pasted messages. Codex asks you to trust new hooks the
+first time they run. Install is idempotent, leaves other tools' hooks alone,
+keeps five timestamped backups, and refuses to edit a settings file whose shape
+it doesn't recognize.
 
 Install the PreToolUse hook so Claude manual `a`/`d` and auto-mode verdicts route through Claude's clean approval channel instead of tmux send-keys:
 
 ```bash
-triage --install-hooks         # idempotent merge into ~/.claude/settings.json
+triage --install-hooks         # same as: triage hooks install --approval
 triage --install-hooks --dry-run   # preview
 triage --uninstall-hooks       # remove
 ```
@@ -199,6 +259,9 @@ Filter & overlays:
   R                rename selected row in triage only; ^U clears the old value while editing
   l                open / close audit-log overlay (auto-mode decision history); H also works
   $                open / close cost overlay (cross-session spend rollup)
+  M                open / close peer-mail overlay: conversations between agents
+                   j k choose · ^d/^u scroll · p pending only · a this agent / all
+                   ⏎ jump to the other agent · Esc close
 
 Overlay navigation (H / $):
   j k / ↑↓         scroll one line
@@ -243,7 +306,7 @@ Toggle with `space`. Three zones:
 
 - **Header** — `state · pane · model (1M) · uptime`.
 - **Body** — agent's latest text (Claude's reasoning, often the *why* before the next tool call), pending tool + full input, recap (`away_summary`), last user prompt.
-- **Stats footer** — auditor decision (when auto mode is on, with cost + duration), session cost + tokens + context-window % (yellow ≥80%, red ≥95%), event timing.
+- **Stats footer** — auditor decision (when auto mode is on, with cost + duration), peer mail for this agent (`✉ N pending / M`; `M` opens it), session cost + tokens + context-window % (yellow ≥80%, red ≥95%), event timing.
 
 ## Codex support
 
@@ -294,7 +357,7 @@ triage --uninstall-hooks       # remove from settings.json + delete the script f
 
 The hook is zero-cost when triage isn't running (single file-existence check + `kill -0`, ~3ms). With auto mode on, it waits up to 60s (vs the default 3s) for the auditor's verdict via a claim-file handshake. Re-running `--install-hooks` after a triage upgrade refreshes the on-disk script if its content changed.
 
-Without the hook installed, `h` falls back to `tmux` mode which sends keystrokes to Claude's pane — works regardless of managed-policy settings. Codex approval routing always uses the tmux path because there is no Codex hook integration yet.
+Without the hook installed, `h` falls back to `tmux` mode which sends keystrokes to Claude's pane — works regardless of managed-policy settings. Codex approval routing always uses the tmux path; triage's Codex hooks only deliver peer mail.
 
 ## Cost & context-window tracking
 
@@ -336,6 +399,11 @@ context_window = 1000000   # bypass auto-detect (use the 1M window)
 [approval]
 mode = "hook"  # "hook" or "tmux"; Claude only. Codex approvals always use tmux.
 
+[send]
+mode = "mailbox"        # "mailbox" (default) or "legacy" (paste into the pane)
+pointer_grace_secs = 3  # how long Codex mail waits for the next prompt before a wake line
+retention_days = 30     # `triage messages purge` default; the TUI applies it daily
+
 [new_agent]
 provider = "claude"   # "claude" or "codex"; defaults to claude
 command = "claude"    # optional override; provider default is "claude" / "codex"
@@ -346,7 +414,7 @@ Pressing `N` in the TUI opens a cwd picker built from current triage sessions,
 then runs the same launch path in a new attached tmux window with `-c <cwd>`.
 If there are no sessions yet, the picker offers `$HOME`.
 
-**Security**: `chmod 600 ~/.config/triage/config.toml`. Triage refuses to load and warns if perms allow group/other read — the `[ntfy].token` field would otherwise be leakable.
+**Security**: `chmod 600 ~/.config/triage/config.toml`. Triage refuses to load and warns if perms allow group/other read — the `[ntfy].token` field would otherwise be leakable. Every section then falls back to its default, including `[send]`.
 
 The auditor system prompt lives separately at `~/.config/triage/auditor-prompt.md` (markdown, easier to hand-edit than embedded TOML strings). Empty/missing falls through to the compiled-in default.
 
