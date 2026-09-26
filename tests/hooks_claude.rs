@@ -168,11 +168,16 @@ fn waiter_wakes_with_rendered_mail_and_commits_once_the_transcript_shows_it() {
         "message": {"role": "assistant", "content": format!("<task-notification>{text}")},
     });
     append(&env.transcript(S1), &format!("{quoted}\n"));
+    let pasted_by_user = serde_json::json!({
+        "type": "user",
+        "message": {"role": "user", "content": format!("what does this mean? {text}")},
+    });
+    append(&env.transcript(S1), &format!("{pasted_by_user}\n"));
     assert_eq!(env.hook("stop", false, S1).status.code(), Some(0));
     assert_eq!(
         env.mail(S1, "inflight").len(),
         1,
-        "neither a wrong nonce nor the model quoting the header confirms"
+        "only a rewake record with the claim nonce confirms"
     );
 
     append(&env.transcript(S1), &rewake_record(&text));
