@@ -78,6 +78,40 @@ impl Env {
         )
     }
 
+    /// Like `spawn_hook`, but with an extra env var on the hook process —
+    /// used to simulate triage's own internal auditor call setting
+    /// `TRIAGE_INTERNAL_AUDITOR` on its `claude` child.
+    fn spawn_hook_with_env(
+        &self,
+        event: &str,
+        wait: bool,
+        session: &str,
+        extra_env: &[(&str, &str)],
+    ) -> Child {
+        let mut args = vec!["inbox", "--hook", "claude", event];
+        if wait {
+            args.push("--wait");
+        }
+        args.push("--triage-hook=v1");
+        let mut cmd = self.command(&args);
+        for (k, v) in extra_env {
+            cmd.env(k, v);
+        }
+        let mut child = cmd.spawn().unwrap();
+        let payload = serde_json::json!({
+            "session_id": session,
+            "transcript_path": self.transcript(session),
+            "hook_event_name": event,
+        });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        child
+    }
+
     fn transcript(&self, session: &str) -> PathBuf {
         self.dir.join(format!("{session}.jsonl"))
     }
@@ -380,5 +414,31 @@ fn hooks_install_uses_the_path_binary_and_is_idempotent() {
     assert_eq!(
         fs::metadata(&settings).unwrap().permissions().mode() & 0o777,
         0o644
+    );
+}
+
+#[test]
+fn internal_auditor_marker_skips_registration_and_the_mailbox_waiter() {
+    // triage's own `claude -p --name triage-auditor` audit call sets
+    // TRIAGE_INTERNAL_AUDITOR=1 on its child so this hook bails before
+    // registering a host/agent or entering wait_for_mail. Without the
+    // marker, `session-start --wait` would park for up to ~24h waiting on
+    // mail that will never arrive for a throwaway one-shot session.
+    let env = Env::new("internal-auditor");
+    let out = finish(
+        env.spawn_hook_with_env(
+            "session-start",
+            true,
+            S1,
+            &[("TRIAGE_INTERNAL_AUDITOR", "1")],
+        ),
+        Duration::from_secs(2),
+    );
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.is_empty());
+    assert!(
+        !env.state().join("hosts").exists(),
+        "internal-auditor call must not register a host/agent"
     );
 }
