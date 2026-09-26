@@ -163,11 +163,16 @@ fn waiter_wakes_with_rendered_mail_and_commits_once_the_transcript_shows_it() {
         &env.transcript(S1),
         &rewake_record(&text.replace(&nonce, "ffffffffffffffff")),
     );
+    let quoted = serde_json::json!({
+        "type": "assistant",
+        "message": {"role": "assistant", "content": format!("<task-notification>{text}")},
+    });
+    append(&env.transcript(S1), &format!("{quoted}\n"));
     assert_eq!(env.hook("stop", false, S1).status.code(), Some(0));
     assert_eq!(
         env.mail(S1, "inflight").len(),
         1,
-        "a wrong nonce must not confirm"
+        "neither a wrong nonce nor the model quoting the header confirms"
     );
 
     append(&env.transcript(S1), &rewake_record(&text));
@@ -233,6 +238,35 @@ fn drain_answers_only_for_the_current_session() {
     let delivered = env.mail(S1, "delivered");
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0]["delivered_via"], "claude-post-tool-use");
+}
+
+#[test]
+fn an_entry_from_another_hook_version_does_nothing() {
+    let env = Env::new("version");
+    env.write_mail(S1, "01900000-0000-7000-8000-000000000004", "hi");
+    let mut child = env
+        .command(&[
+            "inbox",
+            "--hook",
+            "claude",
+            "stop",
+            "--wait",
+            "--triage-hook=v0",
+        ])
+        .spawn()
+        .unwrap();
+    let payload = serde_json::json!({"session_id": S1});
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload.to_string().as_bytes())
+        .unwrap();
+    let out = finish(child, Duration::from_secs(5));
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stderr.is_empty());
+    assert_eq!(env.mail(S1, "pending").len(), 1);
+    assert!(!env.state().join("hosts").exists());
 }
 
 #[test]

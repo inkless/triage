@@ -1261,6 +1261,18 @@ mod tests {
     }
 
     #[test]
+    fn a_narrowed_matcher_is_restored() {
+        let (mut installed, _) = install(&json!({}), true);
+        installed["hooks"]["PostToolUse"][0]["matcher"] = json!("Bash");
+        let (out, changes) = install(&installed, true);
+        assert_eq!(
+            changes,
+            ["update Claude PostToolUse mail drain (--midturn)"]
+        );
+        assert_eq!(out["hooks"]["PostToolUse"][0]["matcher"], ".*");
+    }
+
+    #[test]
     fn midturn_is_declarative() {
         let (with, _) = install(&json!({}), true);
         assert_eq!(handlers(&with, "PostToolUse").len(), 1);

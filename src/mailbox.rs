@@ -1215,7 +1215,16 @@ mod tests {
         assert!(store.try_lock(LockKind::Waiter, BOB).unwrap().is_none());
         assert!(store.try_lock(LockKind::Helper, BOB).unwrap().is_some());
         drop(held);
-        assert!(store.try_lock(LockKind::Waiter, BOB).unwrap().is_some());
+        // Another test forking concurrently keeps the lock's open file
+        // description alive in its child until that child execs.
+        let reacquired = (0..100).any(|_| {
+            let got = store.try_lock(LockKind::Waiter, BOB).unwrap().is_some();
+            if !got {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            got
+        });
+        assert!(reacquired);
         let _ = fs::remove_dir_all(store.root());
     }
 
