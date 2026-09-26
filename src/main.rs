@@ -130,6 +130,12 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Show peer messages queued for the calling agent
+    #[command(disable_help_flag = true)]
+    Inbox {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Interrupt a Codex turn with no observable progress for at least 15 minutes
     #[command(disable_help_flag = true)]
     Interrupt {
@@ -167,6 +173,7 @@ fn main() -> io::Result<()> {
             Command::Cost { args } => return cost_rollup::cli_cost(&args),
             Command::Agents { args } => std::process::exit(agent_comm::cli_agents(&args)),
             Command::Send { args } => std::process::exit(agent_comm::cli_send(&args)),
+            Command::Inbox { args } => std::process::exit(agent_comm::cli_inbox(&args)),
             Command::Interrupt { args } => std::process::exit(agent_comm::cli_interrupt(&args)),
             Command::Launch { args } => std::process::exit(spawn_agent::cli_launch(&args)),
         }

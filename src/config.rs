@@ -26,6 +26,41 @@ pub struct Config {
     pub model: ModelConfig,
     pub new_agent: NewAgentConfig,
     pub approval_mode: ApprovalMode,
+    pub send: SendConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SendMode {
+    #[default]
+    Legacy,
+    Mailbox,
+}
+
+impl SendMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "legacy" => Some(SendMode::Legacy),
+            "mailbox" => Some(SendMode::Mailbox),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SendConfig {
+    pub mode: SendMode,
+    pub pointer_grace_secs: u64,
+    pub retention_days: u64,
+}
+
+impl Default for SendConfig {
+    fn default() -> Self {
+        Self {
+            mode: SendMode::default(),
+            pointer_grace_secs: 3,
+            retention_days: 30,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,6 +161,18 @@ struct DiskConfig {
     new_agent: Option<DiskNewAgent>,
     #[serde(default)]
     approval: Option<DiskApproval>,
+    #[serde(default)]
+    send: Option<DiskSend>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct DiskSend {
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    pointer_grace_secs: Option<u64>,
+    #[serde(default)]
+    retention_days: Option<u64>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -281,6 +328,23 @@ impl From<DiskConfig> for Config {
                     "[warn] unknown [approval].mode {:?}; using default",
                     mode.trim()
                 ),
+            }
+        }
+        if let Some(send) = d.send {
+            if let Some(mode) = send.mode {
+                match SendMode::parse(&mode) {
+                    Some(mode) => cfg.send.mode = mode,
+                    None => eprintln!(
+                        "[warn] unknown [send].mode {:?}; using default",
+                        mode.trim()
+                    ),
+                }
+            }
+            if let Some(secs) = send.pointer_grace_secs {
+                cfg.send.pointer_grace_secs = secs;
+            }
+            if let Some(days) = send.retention_days {
+                cfg.send.retention_days = days;
             }
         }
         cfg
