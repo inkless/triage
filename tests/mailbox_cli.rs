@@ -297,8 +297,10 @@ fn mail_for_a_host_dead_over_30s_bounces_to_the_sender_once() {
     assert_eq!(
         fx.mail(dead_agent, "pending").len(),
         2,
-        "not dead long enough yet"
+        "first sighting only"
     );
+    ok(&fx.run_at(t0 + 10_000, &["agents", "--json"]));
+    assert_eq!(fx.mail(dead_agent, "pending").len(), 2, "dead under 30s");
     ok(&fx.run_at(t0 + 31_000, &["agents", "--json"]));
     ok(&fx.run_at(t0 + 62_000, &["agents", "--json"]));
     assert!(fx.mail(dead_agent, "pending").is_empty());
