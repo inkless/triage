@@ -44,7 +44,8 @@ list-panes)
   echo "fixture|1.0|$CALLER_PID|/dev/null|codex|/tmp|1|%41|caller"
   echo "fixture|2.0|$TARGET_PID|/dev/null|codex|/tmp|1|%42|target" ;;
 capture-pane) printf '› \n' ;;
-send-keys|load-buffer|paste-buffer) echo "$*" >> "$HOME/keys" ;;
+load-buffer) /bin/cat "$4" >> "$HOME/pasted"; echo "$*" >> "$HOME/keys" ;;
+send-keys|paste-buffer) echo "$*" >> "$HOME/keys" ;;
 esac
 "#,
             ),
@@ -203,6 +204,11 @@ fn a_target_without_hooks_gets_the_message_pasted() {
     let out = ok(&fx.run(&["send", "--to", "%42", "--mode", "mailbox", "-m", "hi"]));
     assert!(out.contains("pasted"), "{out}");
     assert!(fx.keys().contains("paste-buffer"), "{}", fx.keys());
+    let pasted_text = fs::read_to_string(fx.dir.join("pasted")).unwrap();
+    assert!(
+        pasted_text.starts_with("[triage message from ") && pasted_text.ends_with("] hi"),
+        "a paste is the compact one-liner: {pasted_text:?}"
+    );
     assert!(fx.mail(TARGET_SESSION, "pending").is_empty());
     let pasted = fx.mail(TARGET_SESSION, "pasted");
     assert_eq!(pasted.len(), 1);
