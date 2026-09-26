@@ -77,6 +77,26 @@ impl Env {
                 None,
                 "lost",
             ),
+            (
+                "01900000-0000-7000-8000-000000000006",
+                A,
+                "TRI-1",
+                UNLINKED,
+                "pending",
+                NOW - DAY / 24,
+                None,
+                "just sent",
+            ),
+            (
+                "01900000-0000-7000-8000-000000000007",
+                B,
+                "TRI-2",
+                C,
+                "delivered",
+                NOW - DAY,
+                Some("codex-user-prompt-submit"),
+                "recent",
+            ),
         ];
         for (id, from, label, to, state, created, via, body) in mail {
             let mut msg = serde_json::json!({
@@ -132,7 +152,7 @@ impl Env {
 fn lists_every_message_with_both_labels_and_its_state() {
     let env = Env::new("list");
     let lines = env.lines(&["messages"]);
-    assert_eq!(lines.len(), 5, "{lines:?}");
+    assert_eq!(lines.len(), 7, "{lines:?}");
     assert!(
         lines[0].contains(
             "TRI-1 (000000a1) → TRI-2 (000000b2)  [delivered via claude-waiter · 7s]  hello b"
@@ -151,11 +171,11 @@ fn lists_every_message_with_both_labels_and_its_state() {
 #[test]
 fn filters_by_agent_thread_and_pending() {
     let env = Env::new("filter");
-    assert_eq!(env.lines(&["messages", "--with", "000000c3"]).len(), 2);
+    assert_eq!(env.lines(&["messages", "--with", "000000c3"]).len(), 3);
     let thread = env.lines(&["messages", "--thread", A, "000000b2"]);
     assert_eq!(thread.len(), 2, "both directions: {thread:?}");
     let pending = env.lines(&["messages", "--pending"]);
-    assert_eq!(pending.len(), 3, "{pending:?}");
+    assert_eq!(pending.len(), 4, "{pending:?}");
     assert!(
         pending
             .iter()
@@ -166,6 +186,12 @@ fn filters_by_agent_thread_and_pending() {
             .iter()
             .any(|l| l.contains("unlinked 24h+") && l.contains("lost")),
         "{pending:?}"
+    );
+    assert!(
+        pending
+            .iter()
+            .any(|l| !l.contains("unlinked") && l.contains("just sent")),
+        "fresh unlinked mail isn't flagged yet: {pending:?}"
     );
     assert_eq!(
         env.run(&["messages", "--with", "../x"]).status.code(),
@@ -202,7 +228,11 @@ fn purge_removes_only_settled_mail_and_old_legacy_lines() {
         ["Removed 2 message(s) and 1 legacy log line(s) older than 30 day(s)."]
     );
     let left = env.lines(&["messages"]);
-    assert_eq!(left.len(), 3, "{left:?}");
+    assert_eq!(left.len(), 5, "{left:?}");
+    assert!(
+        left.iter().any(|l| l.contains("recent")),
+        "recent settled mail survives"
+    );
     assert!(
         left.iter().any(|l| l.contains("[notified]")),
         "notified mail is never purged"
