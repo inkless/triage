@@ -19,7 +19,7 @@ pub fn cli_agents(args: &[String]) -> i32 {
     match run_agents(args) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("{}", e.message);
+            eprintln!("{}", with_sandbox_hint(&e.message));
             e.code
         }
     }
@@ -32,7 +32,7 @@ pub fn cli_send(args: &[String]) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("{}", e.message);
+            eprintln!("{}", with_sandbox_hint(&e.message));
             e.code
         }
     }
@@ -47,7 +47,7 @@ pub fn cli_inbox(args: &[String]) -> i32 {
     match run_inbox(args) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("{}", e.message);
+            eprintln!("{}", with_sandbox_hint(&e.message));
             e.code
         }
     }
@@ -60,7 +60,7 @@ pub fn cli_interrupt(args: &[String]) -> i32 {
             0
         }
         Err(error) => {
-            eprintln!("{}", error.message);
+            eprintln!("{}", with_sandbox_hint(&error.message));
             error.code
         }
     }
@@ -357,6 +357,19 @@ fn live_children_in_ps(pid: u32, quiet_seconds: u64, text: &str) -> Result<bool,
         }
     }
     Ok(false)
+}
+
+/// Inside a sandbox (Codex's, typically) triage can neither list processes
+/// nor write its state dir; say how to get out rather than leave an agent to
+/// guess.
+fn with_sandbox_hint(message: &str) -> String {
+    if message.contains("Operation not permitted") {
+        format!(
+            "{message}\nhint: this looks like a sandbox blocking triage; run the command outside it (in Codex, request escalated permissions)"
+        )
+    } else {
+        message.to_string()
+    }
 }
 
 #[derive(Debug)]

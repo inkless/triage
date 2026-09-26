@@ -51,6 +51,7 @@ esac
             (
                 "ps",
                 r#"
+[ -n "$SANDBOXED" ] && { echo "ps: Operation not permitted" >&2; exit 1; }
 case "$*" in
 *comm*) echo "$CALLER_PID codex"; echo "$TARGET_PID codex" ;;
 *) echo "$CALLER_PID 1"; echo "$TARGET_PID 1"; echo "$PPID $CALLER_PID" ;;
@@ -174,6 +175,25 @@ fn legacy_send_pastes_and_records_the_message() {
     assert_eq!(pasted[0]["body"], "hello");
     assert_eq!(pasted[0]["delivered_via"], "legacy-paste");
     assert!(fx.mail(TARGET_SESSION, "pending").is_empty());
+}
+
+#[test]
+fn a_sandboxed_send_says_to_run_outside_the_sandbox() {
+    let fx = Fixture::new("sandboxed");
+    let out = Command::new(env!("CARGO_BIN_EXE_triage"))
+        .args(["send", "--to", "%42", "--mode", "mailbox", "-m", "hi"])
+        .env("HOME", &fx.dir)
+        .env("XDG_STATE_HOME", fx.dir.join("state"))
+        .env("PATH", &fx.dir)
+        .env("TMUX_PANE", "%other")
+        .env("CALLER_PID", std::process::id().to_string())
+        .env("TARGET_PID", fx.target.id().to_string())
+        .env("SANDBOXED", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("request escalated permissions"), "{stderr}");
 }
 
 #[test]
