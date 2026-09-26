@@ -1287,7 +1287,7 @@ mod tests {
             .map(|n| {
                 message(
                     &format!("01900000-0000-7000-8000-00000000001{n}"),
-                    &"y".repeat(900),
+                    &"y".repeat(if n == 7 { 1 } else { 900 }),
                 )
             })
             .collect();
