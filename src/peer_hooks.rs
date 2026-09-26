@@ -50,6 +50,14 @@ struct Payload {
 /// `triage inbox --hook <claude|codex> <event> [--wait] --triage-hook=v1`.
 /// Returns the process exit code.
 pub fn cli(args: &[String]) -> i32 {
+    // Triage's own one-shot `claude -p --name triage-auditor` audit call
+    // (see `auditor::run_claude`) sets this on its child so this hook never
+    // registers it as a mailbox agent or parks it in `wait_for_mail` — that
+    // throwaway session will never receive peer mail, and without this bail
+    // the installed `--wait` SessionStart hook wedges it for up to ~24h.
+    if std::env::var_os(crate::auditor::INTERNAL_AUDITOR_ENV).is_some() {
+        return 0;
+    }
     let store = Store::open_default();
     let context = args.join(" ");
     let result = parse_args(args).and_then(|hook| {

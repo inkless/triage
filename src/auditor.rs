@@ -13,7 +13,10 @@ use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::SystemTime;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::time::{Duration, SystemTime};
 
 use serde_json::Value;
 
@@ -63,6 +66,23 @@ REASON: <one sentence>
 /// own Claude process never appears in triage's list (and never gets audited
 /// recursively).
 pub const AUDITOR_NAME: &str = "triage-auditor";
+
+/// Set on the auditor's `claude` child so `triage inbox --hook ...`
+/// (`peer_hooks::cli`) recognizes this as triage's own throwaway audit call
+/// and skips mailbox registration / the SessionStart-Stop waiter entirely.
+/// That call is a one-shot `--no-session-persistence` session that will
+/// never receive peer mail; without this, the installed `--wait`
+/// SessionStart hook parks it in `wait_for_mail` for up to ~24h.
+/// Hook subprocesses inherit their parent's environment, so setting this on
+/// the `claude` child is enough for the hook process it spawns to see it.
+pub const INTERNAL_AUDITOR_ENV: &str = "TRIAGE_INTERNAL_AUDITOR";
+
+/// Wall-clock bound on the auditor subprocess. Comfortably above the
+/// documented 10-25s Sonnet turnaround (see `--max-budget-usd` comment
+/// below); anything past this is treated as wedged rather than waited out,
+/// so a stuck call degrades to a `WAIT` verdict instead of leaking the
+/// worker thread and its `audit_in_flight` slot forever.
+const AUDIT_TIMEOUT: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone)]
 pub struct Verdict {
@@ -211,7 +231,42 @@ fn run_claude(system_prompt: &str, user_prompt: &str) -> io::Result<String> {
     cmd.arg("--system-prompt").arg(system_prompt);
     cmd.arg(user_prompt);
     cmd.stdin(Stdio::null());
-    let output = cmd.output()?;
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.env(INTERNAL_AUDITOR_ENV, "1");
+
+    let child = cmd.spawn()?;
+    let pid = child.id();
+    let timed_out = Arc::new(AtomicBool::new(false));
+    let watchdog_timed_out = Arc::clone(&timed_out);
+    // `done_tx` fires the moment `wait_with_output` below returns, so the
+    // watchdog's `recv_timeout` short-circuits instead of sleeping out the
+    // full budget on the (overwhelmingly common) case where claude finishes
+    // normally.
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let watchdog = std::thread::spawn(move || {
+        if done_rx.recv_timeout(AUDIT_TIMEOUT).is_err() {
+            watchdog_timed_out.store(true, Ordering::SeqCst);
+            // Best-effort: the child may have already exited right as the
+            // timeout fired (a benign race) — an ESRCH from a dead pid is
+            // fine to ignore.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    });
+
+    let wait_result = child.wait_with_output();
+    let _ = done_tx.send(());
+    let _ = watchdog.join();
+    let output = wait_result?;
+
+    if timed_out.load(Ordering::SeqCst) {
+        return Err(io::Error::other(format!(
+            "claude timed out after {}s and was killed",
+            AUDIT_TIMEOUT.as_secs()
+        )));
+    }
     if !output.status.success() {
         // Budget-exceeded and similar errors print to stdout, not stderr, and
         // the exit message is empty. Include both streams so audit-log entries
