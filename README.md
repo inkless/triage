@@ -69,10 +69,12 @@ inventory/debug view.
 
 ```bash
 triage agents --json
-triage send --to '%42' --from TRI-106 --message "Can you check whether your branch touched codex.rs?"
-triage send --to '%42' --from TRI-106 --file /tmp/question.md
-printf '%s\n' "short message" | triage send --to '%42' --from TRI-106 -
+triage send --to '%42' --message "Can you check whether your branch touched codex.rs?"
+triage send --to '%42' --file /tmp/question.md
+printf '%s\n' "short message" | triage send --to '%42' -
 ```
+
+Agent messages derive their sender from the calling process’s tracked agent session, including its pane ID. Run `triage send` from the agent’s tool shell; unresolved or ambiguous identities are rejected. `--from` is no longer supported and `TRIAGE_AGENT` does not override identity. Do not add a sender prefix to the message body.
 
 `send` recomputes a fresh snapshot, refuses ambiguous/no-pane/unknown targets,
 and denies delivery when the target is on a visible Claude/Codex permission

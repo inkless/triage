@@ -389,7 +389,6 @@ struct AgentsArgs {
 #[derive(Default)]
 struct SendArgs {
     to: Option<String>,
-    from: Option<String>,
     message: Option<String>,
     file: Option<PathBuf>,
     stdin: bool,
@@ -419,7 +418,7 @@ struct AgentRow {
 fn run_agents(args: &[String]) -> Result<(), CliError> {
     // `triage agents whoami [--json]` — introspect the caller's own row, which
     // the plain listing deliberately omits. Lets an agent learn how triage
-    // sees it (pane id/target to use as a `--from` token, resolved name,
+    // sees it (pane id/target, resolved name,
     // state) rather than just the bare $TMUX_PANE. Checked before the shared
     // --help so `agents whoami --help` reaches the subcommand's own usage.
     if args.first().map(String::as_str) == Some("whoami") {
@@ -567,7 +566,10 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
         .to
         .as_deref()
         .ok_or_else(|| CliError::usage(send_usage("missing --to")))?;
-    let sender = resolve_sender(args.from.clone())?;
+    let sessions = load_snapshot()?;
+    let parents = tmux::build_ppid_map();
+    let caller = resolve_caller(&sessions, std::process::id(), &parents)?;
+    let sender = format!("{} ({})", session_display_label(caller), target_id(caller));
     let body = read_message_body(&args)?;
     let body = validate_body(&body)?;
     let formatted = format_message(&sender, &body);
@@ -604,7 +606,7 @@ fn deliver_message(
 
     if dry_run {
         return Ok(format!(
-            "dry-run: would send to {} ({})",
+            "dry-run: would send from {sender} to {} ({})",
             target_id(target),
             target_label(target)
         ));
@@ -684,12 +686,9 @@ fn parse_send_args(args: &[String]) -> Result<SendArgs, CliError> {
                 );
             }
             "--from" => {
-                i += 1;
-                out.from = Some(
-                    args.get(i)
-                        .ok_or_else(|| CliError::usage(send_usage("missing --from value")))?
-                        .clone(),
-                );
+                return Err(CliError::usage(
+                    "--from is no longer supported; triage derives the sender from the calling agent session. Remove --from and any manual sender prefix.",
+                ));
             }
             "--message" | "-m" => {
                 i += 1;
@@ -957,45 +956,31 @@ fn format_message(sender: &str, body: &str) -> String {
     }
 }
 
-fn resolve_sender(explicit: Option<String>) -> Result<String, CliError> {
-    let raw = explicit
-        .or_else(|| std::env::var("TRIAGE_AGENT").ok())
-        .or_else(current_tmux_window_name)
-        .unwrap_or_else(|| "unknown".to_string());
-    let sender = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-    if sender.is_empty() {
-        return Err(CliError::usage("sender is empty"));
-    }
-    validate_sender(&sender)?;
-    Ok(sender)
-}
-
-fn validate_sender(sender: &str) -> Result<(), CliError> {
-    if sender.chars().count() > 80 {
-        return Err(CliError::usage("sender is too long"));
-    }
-    for c in sender.chars() {
-        if !c.is_control() {
-            continue;
+fn resolve_caller<'a>(
+    sessions: &'a [Session],
+    pid: u32,
+    parents: &HashMap<u32, u32>,
+) -> Result<&'a Session, CliError> {
+    let mut current = pid;
+    let mut seen = std::collections::HashSet::new();
+    while current > 1 && seen.insert(current) {
+        let mut matches = sessions.iter().filter(|session| session.pid == current);
+        if let Some(session) = matches.next() {
+            if matches.next().is_some() {
+                return Err(CliError::denied(
+                    "calling process matches multiple agent sessions; refresh session discovery before sending",
+                ));
+            }
+            return Ok(session);
         }
-        return Err(CliError::usage(format!(
-            "sender contains unsupported control character U+{:04X}",
-            c as u32
-        )));
+        let Some(parent) = parents.get(&current) else {
+            break;
+        };
+        current = *parent;
     }
-    Ok(())
-}
-
-fn current_tmux_window_name() -> Option<String> {
-    let out = Command::new("tmux")
-        .args(["display-message", "-p", "#W"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!name.is_empty()).then_some(name)
+    Err(CliError::denied(
+        "cannot identify the calling agent session; run triage send from a tracked agent's tool shell and ensure process discovery is available",
+    ))
 }
 
 fn current_tmux_pane_id() -> Option<String> {
@@ -1104,7 +1089,8 @@ fn agents_usage(prefix: impl Into<String>) -> String {
 
 fn send_usage(prefix: impl Into<String>) -> String {
     let prefix = prefix.into();
-    let usage = "usage: triage send --to TARGET [--from NAME] (--message TEXT | --file PATH | - | TEXT...) [--dry-run]";
+    let usage =
+        "usage: triage send --to TARGET (--message TEXT | --file PATH | - | TEXT...) [--dry-run]";
     if prefix.is_empty() {
         usage.to_string()
     } else {
@@ -1116,6 +1102,46 @@ fn send_usage(prefix: impl Into<String>) -> String {
 mod tests {
     use super::*;
     use crate::models::{Pane, Provider, Session};
+
+    #[test]
+    fn sender_is_nearest_ancestor_not_another_session_in_same_window() {
+        let mut caller = session(AttentionState::Working);
+        caller.pid = 200;
+        caller.session_id = "caller".into();
+        let mut other = caller.clone();
+        other.pid = 300;
+        other.session_id = "other".into();
+        let sessions = vec![other, caller];
+        let parents = HashMap::from([(400, 350), (350, 200), (200, 300)]);
+        assert_eq!(
+            resolve_caller(&sessions, 400, &parents).unwrap().session_id,
+            "caller"
+        );
+    }
+
+    #[test]
+    fn sender_requires_unique_tracked_ancestor() {
+        let caller = session(AttentionState::Working);
+        let sessions = vec![caller.clone(), caller];
+        let parents = HashMap::from([(400, 123)]);
+        assert!(resolve_caller(&sessions, 400, &parents).is_err());
+        assert!(resolve_caller(&sessions[..1], 400, &HashMap::new()).is_err());
+        assert!(
+            resolve_caller(
+                &sessions[..1],
+                400,
+                &HashMap::from([(400, 401), (401, 400)])
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sender_override_is_rejected_with_migration_guidance() {
+        let args = ["--to", "%42", "--from", "someone", "--message", "hello"].map(str::to_string);
+        let error = parse_send_args(&args).err().unwrap();
+        assert!(error.message.contains("--from is no longer supported"));
+    }
 
     fn session(state: AttentionState) -> Session {
         let mut s = Session::new(

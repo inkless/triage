@@ -43,7 +43,7 @@ case "$*" in
   [ "$SCENARIO" = changed ] && printf '\n{}\n' >> "$FIXTURE_ROLLOUT"
   ;;
 *comm*) echo "$FIXTURE_PID codex" ;;
-*) echo "$FIXTURE_PID 1" ;;
+*) echo "$FIXTURE_PID 1"; echo "$PPID $FIXTURE_PID" ;;
 esac
 exit 0
 "#,
@@ -60,6 +60,7 @@ exit 0
             .env("HOME", &dir)
             .env("PATH", &dir)
             .env("TMUX_PANE", "%other")
+            .env("TRIAGE_AGENT", "wrong-sender")
             .env("FIXTURE_PID", std::process::id().to_string())
             .env("FIXTURE_ROLLOUT", &rollout)
             .env("SCENARIO", scenario)
@@ -96,18 +97,7 @@ exit 0
         assert!(rows.status.success());
         let rows: serde_json::Value = serde_json::from_slice(&rows.stdout).unwrap();
         assert_eq!(rows[0]["can_receive"], false, "{scenario}");
-        let send = run(
-            scenario,
-            &[
-                "send",
-                "--to",
-                "%42",
-                "--from",
-                "test",
-                "--message",
-                "hello",
-            ],
-        );
+        let send = run(scenario, &["send", "--to", "%42", "--message", "hello"]);
         assert_eq!(
             send.status.code(),
             Some(3),
@@ -122,22 +112,15 @@ exit 0
     for scenario in ["quiet", "placeholder", "animated"] {
         let send = run(
             scenario,
-            &[
-                "send",
-                "--to",
-                "%42",
-                "--from",
-                "test",
-                "--message",
-                "hello",
-                "--dry-run",
-            ],
+            &["send", "--to", "%42", "--message", "hello", "--dry-run"],
         );
         assert!(
             send.status.success(),
             "{scenario}: {}",
             String::from_utf8_lossy(&send.stderr)
         );
+        assert!(String::from_utf8_lossy(&send.stdout).contains("from fixture (%42)"));
+        assert!(!String::from_utf8_lossy(&send.stdout).contains("wrong-sender"));
         assert!(!dir.join("keys").exists());
     }
 
