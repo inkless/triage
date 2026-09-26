@@ -113,6 +113,13 @@ pub struct AppState {
     /// the session table. Toggle with `H` (only effective when autonomous
     /// mode is on — there's no history to look at otherwise).
     pub audit_log_open: bool,
+    /// The `M` peer-mail overlay, and the index behind the detail pane's
+    /// mail count.
+    pub mail: crate::mail_view::MailView,
+    /// One mailbox maintenance pass (reconcile, wake helpers, retention) at
+    /// a time on a worker thread.
+    pub mail_worker_busy: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub mail_purged_at: Option<std::time::Instant>,
     /// Full keybinding help view. Toggle with `?` from normal mode.
     pub key_help_open: bool,
     /// Scroll offset into the audit log (0 = newest entry at top).
@@ -221,6 +228,9 @@ impl AppState {
             audit_rx,
             default_model: crate::approval::read_default_model(),
             audit_log_open: false,
+            mail: crate::mail_view::MailView::default(),
+            mail_worker_busy: Default::default(),
+            mail_purged_at: None,
             key_help_open: false,
             audit_log_offset: 0,
             audit_log_total_lines: 0,
@@ -702,6 +712,20 @@ pub fn draw(f: &mut Frame, app: &mut AppState, now: SystemTime) {
             .split(f.area());
         draw_header(f, chunks[0], app);
         draw_spawn_picker(f, chunks[1], app);
+        draw_footer(f, chunks[2], app);
+        return;
+    }
+    if app.mail.open {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(5),
+                Constraint::Length(1),
+            ])
+            .split(f.area());
+        draw_header(f, chunks[0], app);
+        crate::mail_view::draw(f, chunks[1], &mut app.mail);
         draw_footer(f, chunks[2], app);
         return;
     }
@@ -1807,6 +1831,17 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
 
     let footer_start_idx = lines.len();
 
+    if let Some((pending, total)) = app.mail.counts_for(s.pid) {
+        let mut spans = vec![Span::styled("mail   ", dim())];
+        if pending > 0 {
+            spans.push(Span::styled(format!("✉ {pending} pending"), yellow()));
+            spans.push(Span::styled(format!(" / {total}  (M)"), dim()));
+        } else {
+            spans.push(Span::styled(format!("✉ {total}  (M)"), dim()));
+        }
+        lines.push(Line::from(spans));
+    }
+
     if let Some(start) = app.audit_in_flight.get(&s.pid) {
         let secs = now.duration_since(*start).map(|d| d.as_secs()).unwrap_or(0);
         lines.push(Line::from(vec![
@@ -2899,6 +2934,7 @@ fn draw_key_help(f: &mut Frame, area: Rect) {
         ]),
         Line::from("  p preview pane (live)          > flip right/bottom"),
         Line::from("  l audit log (or H)             $ cost overlay"),
+        Line::from("  M peer mail between agents"),
         Line::from(""),
         Line::from(vec![
             Span::raw("  "),
@@ -2951,6 +2987,16 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         f.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 hint.to_string(),
+                Style::default().fg(Color::DarkGray),
+            ))),
+            area,
+        );
+        return;
+    }
+    if app.mail.open {
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                crate::mail_view::FOOTER_HINT,
                 Style::default().fg(Color::DarkGray),
             ))),
             area,

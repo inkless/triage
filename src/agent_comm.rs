@@ -1012,6 +1012,10 @@ fn agent_identity(store: &Store, s: &Session) -> Option<AgentIdentity> {
     })
 }
 
+pub(crate) fn session_agent_id(store: &Store, s: &Session) -> Option<String> {
+    agent_identity(store, s).map(|identity| identity.agent)
+}
+
 fn new_message(from: &AgentIdentity, caller: &Session, to: &AgentIdentity, body: &str) -> Message {
     Message {
         v: 1,
