@@ -202,6 +202,9 @@ pub struct Claim {
     #[serde(default)]
     pub transcript_offset: u64,
     pub printed_at_ms: Option<u64>,
+    /// Only the head was delivered; confirmation moves it to `notified/`.
+    #[serde(default)]
+    pub head_only: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +302,12 @@ pub enum LockKind {
     Waiter,
     Wake,
     Helper,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaiterOwner {
+    pub session: String,
+    pub pid: u32,
 }
 
 /// Held until dropped; the kernel releases it if the holder dies.
@@ -404,6 +413,49 @@ impl Store {
             .collect();
         hosts.sort_by_key(|(host, _)| (host.pid, host.start));
         hosts
+    }
+
+    pub fn write_waiter_owner(&self, agent: &str, owner: &WaiterOwner) -> io::Result<()> {
+        check_uuid("agent id", agent)?;
+        let dir = self.root.join("locks");
+        ensure_dir(&dir)?;
+        replace_file(
+            &dir,
+            &format!("{agent}.waiter.owner"),
+            &serde_json::to_vec(owner)?,
+        )
+    }
+
+    pub fn read_waiter_owner(&self, agent: &str) -> Option<WaiterOwner> {
+        if !is_uuid(agent) {
+            return None;
+        }
+        let path = self
+            .root
+            .join("locks")
+            .join(format!("{agent}.waiter.owner"));
+        serde_json::from_slice(&fs::read(path).ok()?).ok()
+    }
+
+    /// Hooks never write to stderr (Claude would show it), so their errors
+    /// land here.
+    pub fn log_hook_error(&self, context: &str, error: &dyn std::fmt::Display) {
+        const MAX_LOG_BYTES: u64 = 1 << 20;
+        let path = self.root.join("hook.log");
+        if ensure_dir(&self.root).is_err() {
+            return;
+        }
+        if fs::metadata(&path).is_ok_and(|m| m.len() > MAX_LOG_BYTES) {
+            let _ = fs::rename(&path, self.root.join("hook.log.1"));
+        }
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)
+        {
+            let _ = writeln!(file, "{} {context}: {error}", now_ms());
+        }
     }
 
     pub fn try_lock(&self, kind: LockKind, agent: &str) -> io::Result<Option<FileLock>> {
@@ -566,6 +618,16 @@ impl Mailbox {
         self.drop_claim(inflight)
     }
 
+    /// Undoes a claim that was never shown to anyone, so it doesn't count as
+    /// a delivery attempt.
+    pub fn release(&self, inflight: &Inflight) -> io::Result<()> {
+        fs::rename(
+            self.inflight_path(inflight),
+            self.path(State::Pending, &inflight.id),
+        )?;
+        self.drop_claim(inflight)
+    }
+
     pub fn revert(&self, inflight: &Inflight) -> io::Result<()> {
         let mut msg = self.read_inflight(inflight)?;
         msg.attempt += 1;
@@ -596,6 +658,14 @@ impl Mailbox {
         match fs::remove_file(self.path(from, id)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(true),
+        }
+    }
+
+    pub fn remove(&self, state: State, id: &str) -> io::Result<()> {
+        check_uuid("message id", id)?;
+        match fs::remove_file(self.path(state, id)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
         }
     }
 
@@ -974,6 +1044,7 @@ mod tests {
             transcript_path: String::new(),
             transcript_offset: 0,
             printed_at_ms: None,
+            head_only: false,
         }
     }
 

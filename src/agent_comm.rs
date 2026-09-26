@@ -39,6 +39,9 @@ pub fn cli_send(args: &[String]) -> i32 {
 }
 
 pub fn cli_inbox(args: &[String]) -> i32 {
+    if args.first().map(String::as_str) == Some("--hook") {
+        return crate::peer_hooks::cli(&args[1..]);
+    }
     match run_inbox(args) {
         Ok(()) => 0,
         Err(e) => {
@@ -735,6 +738,7 @@ fn inbox_list(
             transcript_path: String::new(),
             transcript_offset: 0,
             printed_at_ms: None,
+            head_only: false,
         };
         let host = identity.host.unwrap_or(HostId {
             pid: caller.pid,
