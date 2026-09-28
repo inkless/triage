@@ -126,6 +126,14 @@ after a crash, and says so. A session only acts on peer mail it has context
 for; agents launched for a coordinated fleet are told that peers may message
 them.
 
+`agents --json` reports `send_message_name` for a Claude session that
+supports Claude Code's peer messaging: the session name its built-in
+`SendMessage` resolves. This can differ from `name`, which an alias or tmux
+window name replaces. When both the sender and the reader are Claude sessions,
+the reply line of a delivered message offers that name next to the
+`triage send` command. It is `null` for Codex sessions and for older Claude
+versions, which only `triage send` can reach.
+
 Codex runs tools in a sandbox that blocks process discovery and writes outside
 the workspace, so `triage send` from a sandboxed Codex agent fails with
 "Operation not permitted"; triage then says to rerun it with escalated

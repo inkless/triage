@@ -320,6 +320,7 @@ fn bounce(original: &Message, agent: &str, provider: crate::models::Provider) ->
             session: original.to.session_at_send.clone(),
             provider,
             label: "triage".to_string(),
+            send_message_name: None,
         },
         to: mailbox::Recipient {
             agent: original.from.agent.clone(),
