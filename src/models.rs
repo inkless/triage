@@ -61,6 +61,11 @@ pub struct Session {
     /// Claude marks its default generated name as `derived`. An absent marker
     /// means the name came from `--name` or `/rename` and should stay primary.
     pub name_is_derived: bool,
+    /// Claude Code's own session name, the address its built-in
+    /// `SendMessage` resolves. Kept apart from `name`, which aliases and tmux
+    /// window names overwrite. Set only for sessions that advertise Claude's
+    /// peer-messaging protocol.
+    pub send_message_name: Option<String>,
     pub status: String,
     /// `waitingFor` from sessions JSON — populated when `status == "waiting"`
     /// (e.g. `"approve Bash"`). This is Claude Code's own canonical signal that
@@ -170,6 +175,7 @@ impl Session {
             cwd,
             name,
             name_is_derived: false,
+            send_message_name: None,
             status,
             waiting_for,
             cli_version: None,

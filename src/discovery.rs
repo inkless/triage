@@ -32,6 +32,8 @@ struct RawSession {
     job_id: Option<String>,
     #[serde(rename = "parkedJobId", default)]
     parked_job_id: Option<String>,
+    #[serde(rename = "peerProtocol", default)]
+    peer_protocol: Option<u32>,
 }
 
 pub fn sessions_dir() -> PathBuf {
@@ -119,6 +121,10 @@ fn raw_to_session_with_background_jobs(
         active_background_jobs.contains(&(raw.cwd.clone(), job_id.to_string()))
     });
     let name_is_derived = raw.name_source.as_deref() == Some("derived");
+    let send_message_name = raw
+        .peer_protocol
+        .and(raw.name.clone())
+        .filter(|n| !n.trim().is_empty());
     let mut session = Session::new(
         Provider::Claude,
         raw.pid,
@@ -131,6 +137,7 @@ fn raw_to_session_with_background_jobs(
         raw.waiting_for,
     );
     session.name_is_derived = name_is_derived;
+    session.send_message_name = send_message_name;
     session.cli_version = raw.version;
     session.active_background_jobs = usize::from(active_background_job);
     Some(session)
@@ -195,6 +202,22 @@ mod tests {
         let kindless = raw(r#"{"pid":777,"sessionId":"old","cwd":"/repo/ux","name":"legacy"}"#);
         let session = raw_to_session(kindless).expect("kindless kept");
         assert!(!session.name_is_derived);
+    }
+
+    #[test]
+    fn send_message_name_requires_the_peer_protocol() {
+        let peer = raw(r#"{"pid":1,"sessionId":"a","cwd":"/repo/ux",
+                "name":"ux-dd","nameSource":"derived","peerProtocol":1}"#);
+        assert_eq!(
+            raw_to_session(peer).unwrap().send_message_name.as_deref(),
+            Some("ux-dd")
+        );
+
+        let legacy = raw(r#"{"pid":2,"sessionId":"b","cwd":"/repo/ux","name":"old"}"#);
+        assert_eq!(raw_to_session(legacy).unwrap().send_message_name, None);
+
+        let unnamed = raw(r#"{"pid":3,"sessionId":"c","cwd":"/repo/ux","peerProtocol":1}"#);
+        assert_eq!(raw_to_session(unnamed).unwrap().send_message_name, None);
     }
 
     #[test]

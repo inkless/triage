@@ -421,6 +421,7 @@ mod tests {
                     session: from.into(),
                     provider: Provider::Claude,
                     label: label.into(),
+                    send_message_name: None,
                 },
                 to: Recipient {
                     agent: to.into(),

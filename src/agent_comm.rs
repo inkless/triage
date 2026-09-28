@@ -443,6 +443,7 @@ struct AgentRow {
     agent_id: Option<String>,
     provider: String,
     name: String,
+    send_message_name: Option<String>,
     cwd: String,
     state: String,
     can_receive: bool,
@@ -800,7 +801,7 @@ fn run_inbox(args: &[String]) -> Result<(), CliError> {
         .mailbox(&identity.agent)
         .map_err(|e| CliError::runtime(e.to_string()))?;
     match show {
-        Some(id) => inbox_show(&mailbox, &id, is_current, json),
+        Some(id) => inbox_show(&mailbox, &id, caller.provider, is_current, json),
         None => inbox_list(&mailbox, caller, &identity, is_current, json),
     }
 }
@@ -860,6 +861,7 @@ fn inbox_list(
                 msg,
                 nonce: None,
                 sent_before_clear: msg.to.session_at_send != identity.session,
+                reader_is_claude: caller.provider == Provider::Claude,
             })
             .collect();
         let (mut text, _) = mailbox::render_batch(&items, usize::MAX);
@@ -890,6 +892,7 @@ fn inbox_list(
 fn inbox_show(
     mailbox: &mailbox::Mailbox,
     id: &str,
+    reader: Provider,
     is_current: bool,
     json: bool,
 ) -> Result<(), CliError> {
@@ -917,6 +920,7 @@ fn inbox_show(
             msg: &msg,
             nonce: None,
             sent_before_clear: false,
+            reader_is_claude: reader == Provider::Claude,
         };
         mailbox::render_batch(&[item], usize::MAX).0
     };
@@ -1017,6 +1021,7 @@ fn new_message(from: &AgentIdentity, caller: &Session, to: &AgentIdentity, body:
             session: from.session.clone(),
             provider: caller.provider,
             label: session_display_label(caller),
+            send_message_name: caller.send_message_name.clone(),
         },
         to: mailbox::Recipient {
             agent: to.agent.clone(),
@@ -1372,6 +1377,7 @@ fn agent_row(store: &Store, s: &Session) -> AgentRow {
         agent_id: agent_identity(store, s).map(|identity| identity.agent),
         provider: s.provider.label().to_string(),
         name: session_display_label(s),
+        send_message_name: s.send_message_name.clone(),
         cwd: s.cwd.display().to_string(),
         state: attention_state_name(s.state).to_string(),
         can_receive: gate.can_send,

@@ -159,6 +159,7 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
             &mailbox,
             host,
             &payload,
+            Provider::Claude,
             "PostToolUse",
             DeliveredVia::ClaudePostToolUse,
         ),
@@ -181,7 +182,7 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
                 }
                 _ => ("PostToolUse", DeliveredVia::CodexPostToolUse),
             };
-            drain(store, &mailbox, host, &payload, name, via)
+            drain(store, &mailbox, host, &payload, Provider::Codex, name, via)
         }
     }
 }
@@ -351,7 +352,13 @@ fn wait_for_mail(
                 printed_at_ms: None,
                 head_only: false,
             };
-            if let Some(batch) = claim_batch(mailbox, &payload.session, host, &claim_template)? {
+            if let Some(batch) = claim_batch(
+                mailbox,
+                &payload.session,
+                host,
+                Provider::Claude,
+                &claim_template,
+            )? {
                 let mut stderr = io::stderr().lock();
                 stderr.write_all(batch.text.as_bytes())?;
                 stderr.flush()?;
@@ -379,6 +386,7 @@ fn claim_batch(
     mailbox: &Mailbox,
     session: &str,
     host: HostId,
+    reader: Provider,
     template: &Claim,
 ) -> io::Result<Option<Batch>> {
     let mut claimed: Vec<(Inflight, Claim, Message)> = Vec::new();
@@ -399,7 +407,7 @@ fn claim_batch(
             }
         };
         claimed.push((inflight, claim, msg));
-        let (_, fits) = render(&claimed, session);
+        let (_, fits) = render(&claimed, session, reader);
         if fits.last() == Some(&Fit::Deferred) {
             let (inflight, _, _) = claimed.pop().expect("just pushed");
             mailbox.release(&inflight)?;
@@ -409,7 +417,7 @@ fn claim_batch(
     if claimed.is_empty() {
         return Ok(None);
     }
-    let (text, fits) = render(&claimed, session);
+    let (text, fits) = render(&claimed, session, reader);
     let mut claims = Vec::with_capacity(claimed.len());
     for ((inflight, mut claim, _), fit) in claimed.into_iter().zip(fits) {
         if fit == Fit::Head {
@@ -421,13 +429,18 @@ fn claim_batch(
     Ok(Some(Batch { text, claims }))
 }
 
-fn render(claimed: &[(Inflight, Claim, Message)], session: &str) -> (String, Vec<Fit>) {
+fn render(
+    claimed: &[(Inflight, Claim, Message)],
+    session: &str,
+    reader: Provider,
+) -> (String, Vec<Fit>) {
     let items: Vec<RenderItem> = claimed
         .iter()
         .map(|(_, claim, msg)| RenderItem {
             msg,
             nonce: Some(&claim.nonce),
             sent_before_clear: msg.to.session_at_send != session,
+            reader_is_claude: reader == Provider::Claude,
         })
         .collect();
     mailbox::render_batch(&items, mailbox::DELIVERY_BUDGET_CHARS)
@@ -440,6 +453,7 @@ fn drain(
     mailbox: &Mailbox,
     host: HostId,
     payload: &Payload,
+    reader: Provider,
     hook_event_name: &str,
     via: DeliveredVia,
 ) -> io::Result<i32> {
@@ -462,7 +476,7 @@ fn drain(
     if started.elapsed() >= DRAIN_TIME_LIMIT {
         return Ok(0);
     }
-    let Some(batch) = claim_batch(mailbox, &payload.session, host, &template)? else {
+    let Some(batch) = claim_batch(mailbox, &payload.session, host, reader, &template)? else {
         return Ok(0);
     };
     let output = serde_json::json!({

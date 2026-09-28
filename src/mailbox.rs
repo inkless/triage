@@ -162,6 +162,8 @@ pub struct Sender {
     pub session: String,
     pub provider: Provider,
     pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_message_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -889,6 +891,9 @@ pub struct RenderItem<'a> {
     /// The claim's header nonce; absent for legacy fallback paste.
     pub nonce: Option<&'a str>,
     pub sent_before_clear: bool,
+    /// Whether the reader is a Claude session, the only harness with a
+    /// built-in `SendMessage` to offer as a reply channel.
+    pub reader_is_claude: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -977,7 +982,14 @@ fn render_one(item: &RenderItem, fence: &str, head_only: bool) -> String {
     let footer = if head_only {
         format!("… ({total_chars} chars) run: triage inbox show {}", msg.id)
     } else {
-        format!("Reply: triage send --to {from} --message \"…\"")
+        let send_message = item
+            .reader_is_claude
+            .then_some(())
+            .and(msg.from.send_message_name.as_deref())
+            .filter(|name| display_label(name) == *name)
+            .map(|name| format!(" (or SendMessage to \"{name}\")"))
+            .unwrap_or_default();
+        format!("Reply: triage send --to {from} --message \"…\"{send_message}")
     };
     format!(
         "{prefix}{label} ({provider} · agent {from}), delivered by triage. [{marker}]\n\
@@ -1096,6 +1108,7 @@ mod tests {
                 session: ALICE.to_string(),
                 provider: Provider::Claude,
                 label: "TRI-148".to_string(),
+                send_message_name: None,
             },
             to: Recipient {
                 agent: BOB.to_string(),
@@ -1387,6 +1400,7 @@ mod tests {
             msg: &msg,
             nonce: Some("0123456789abcdef"),
             sent_before_clear: false,
+            reader_is_claude: true,
         }];
         let (text, fits) = render_batch_with(&items, DELIVERY_BUDGET_CHARS, &mut fixed_nonces());
         assert_eq!(fits, vec![Fit::Full]);
@@ -1398,6 +1412,40 @@ mod tests {
     }
 
     #[test]
+    fn offers_send_message_only_to_a_claude_reader_with_a_valid_name() {
+        let mut msg = message("01900000-0000-7000-8000-000000000009", "hi");
+        msg.from.send_message_name = Some("agent-ABC-3".to_string());
+        let footer = |msg: &Message, reader_is_claude: bool| {
+            let items = [RenderItem {
+                msg,
+                nonce: None,
+                sent_before_clear: false,
+                reader_is_claude,
+            }];
+            let (text, _) = render_batch(&items, DELIVERY_BUDGET_CHARS);
+            text.lines().last().unwrap().to_string()
+        };
+        assert!(footer(&msg, true).ends_with("(or SendMessage to \"agent-ABC-3\")"));
+        assert!(!footer(&msg, false).contains("SendMessage"));
+
+        msg.from.send_message_name = Some("bad name\"; rm".to_string());
+        assert!(!footer(&msg, true).contains("SendMessage"));
+    }
+
+    #[test]
+    fn sender_without_send_message_name_still_parses() {
+        let mut msg = message("01900000-0000-7000-8000-00000000000a", "old");
+        let mut json = serde_json::to_value(&msg).unwrap();
+        assert!(json["from"].get("send_message_name").is_none());
+        json["from"]["send_message_name"] = serde_json::Value::Null;
+        let parsed: Message = serde_json::from_value(json).unwrap();
+        assert_eq!(parsed, msg);
+        msg.from.send_message_name = Some("agent-ABC-3".to_string());
+        let round: Message = serde_json::from_value(serde_json::to_value(&msg).unwrap()).unwrap();
+        assert_eq!(round.from.send_message_name.as_deref(), Some("agent-ABC-3"));
+    }
+
+    #[test]
     fn renders_redelivery_and_cleared_suffixes_without_a_nonce() {
         let mut msg = message("01900000-0000-7000-8000-000000000002", "again");
         msg.attempt = 2;
@@ -1405,6 +1453,7 @@ mod tests {
             msg: &msg,
             nonce: None,
             sent_before_clear: true,
+            reader_is_claude: true,
         }];
         let (text, _) = render_batch_with(&items, DELIVERY_BUDGET_CHARS, &mut fixed_nonces());
         assert_eq!(
@@ -1424,6 +1473,7 @@ mod tests {
                 msg,
                 nonce: Some("0123456789abcdef"),
                 sent_before_clear: false,
+                reader_is_claude: true,
             })
             .collect();
         let (text, fits) = render_batch_with(&items, DELIVERY_BUDGET_CHARS, &mut fixed_nonces());
@@ -1451,6 +1501,7 @@ mod tests {
                 msg,
                 nonce: Some("0123456789abcdef"),
                 sent_before_clear: false,
+                reader_is_claude: true,
             })
             .collect();
         let (text, fits) = render_batch_with(&items, DELIVERY_BUDGET_CHARS, &mut fixed_nonces());
