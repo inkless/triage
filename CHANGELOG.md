@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.6.0](https://github.com/inkless/triage/compare/v0.5.0...v0.6.0) (2026-09-28)
+
+
+### Features
+
+* deliver peer messages through a mailbox and native agent hooks ([#19](https://github.com/inkless/triage/issues/19)) ([c5b26e8](https://github.com/inkless/triage/commit/c5b26e8e27af3827c42bcc8283b01ff816827ead))
+* offer SendMessage as a reply channel between Claude sessions ([#22](https://github.com/inkless/triage/issues/22)) ([045769f](https://github.com/inkless/triage/commit/045769fd6ea7493839fdc2175ea2c4ccd4454e3d))
+
+
+### Bug Fixes
+
+* bound the auditor subprocess and exempt it from the mailbox waiter ([#21](https://github.com/inkless/triage/issues/21)) ([b516568](https://github.com/inkless/triage/commit/b5165687928bc0a0dfa039da0a4ef1d0bf4b9b7a))
+* derive triage send sender from tracked agent session, not --from ([7d0f7eb](https://github.com/inkless/triage/commit/7d0f7ebc480ffbb93823f19788b494e9b770481c))
+* distinguish startup services from interrupt-blocking tasks ([d8e5ba6](https://github.com/inkless/triage/commit/d8e5ba6cdcfae7c00bc304251546738edf0252d8))
+* paste peer messages in the compact form when a target has no hooks ([#20](https://github.com/inkless/triage/issues/20)) ([988914f](https://github.com/inkless/triage/commit/988914f1c868c81696f6bbecbfea61fd5045cd68))
+* resume Codex lifecycle after continued work following final answer ([c730495](https://github.com/inkless/triage/commit/c73049580366c9f46f1650782a3729b1fa6f98db))
+
 ## [0.5.0](https://github.com/inkless/triage/compare/v0.4.3...v0.5.0) (2026-09-16)
 
 
