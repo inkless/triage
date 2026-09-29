@@ -116,6 +116,10 @@ pub fn discover_live_sessions(
             return out;
         }
     };
+    // Codex >= 0.158 can host threads in a pane-less `app-server` daemon
+    // while the `codex` TUI in tmux is only a client with no rollout open.
+    let mut paneless = Vec::new();
+    let mut clients = Vec::new();
     for pid in pids {
         let paths = match rollout_paths_for_pid(pid) {
             Ok(paths) => paths,
@@ -124,62 +128,300 @@ pub fn discover_live_sessions(
                 continue;
             }
         };
-        let Some((path, digest)) = select_rollout(paths, cache) else {
-            continue;
+        let pane = tmux::find_owning_pane(pid, panes, ppid_map, 8);
+        let selected = if pane.is_some() {
+            select_rollout(paths, cache).into_iter().collect()
+        } else {
+            daemon_rollouts(paths, cache)
         };
-        let cwd = digest
-            .cwd
-            .clone()
-            .or_else(|| panes.values().find(|p| p.pid == pid).map(|p| p.cwd.clone()))
-            .unwrap_or_default();
-        let started_at_ms = digest.started_at_ms;
-        let updated_at_ms = digest.updated_at_ms.max(started_at_ms);
-        let name = thread_titles
-            .get(&digest.session_id)
-            .and_then(CodexThreadTitle::display_label)
-            .or_else(|| {
-                codex_agent_label(
-                    digest.agent_nickname.as_deref(),
-                    digest.agent_role.as_deref(),
-                )
-            });
-        let mut session = Session::new(
-            Provider::Codex,
-            pid,
-            digest.session_id.clone(),
-            cwd,
-            name,
-            digest.status(),
-            started_at_ms,
-            updated_at_ms,
-            None,
-        );
-        session.alias_session_id = thread_roots
-            .get(&digest.session_id)
-            .cloned()
-            .or_else(|| Some(digest.session_id.clone()));
-        session.pane = tmux::find_owning_pane(pid, panes, ppid_map, 8);
-        session.transcript_path = Some(path);
-        session.headline = digest.headline.clone();
-        session.last_prompt = digest.last_prompt.clone();
-        session.last_prompt_at = digest.last_prompt_at;
-        session.last_event_at = digest.last_event_at;
-        session.last_progress_at = digest.last_progress_at;
-        session.last_stop_at = digest.last_stop_at();
-        session.user_prompt_count = digest.user_prompt_count;
-        session.last_tool_use = digest.last_tool_use.clone();
-        session.approval_prompt_pending = digest.pending_approval_tool;
-        session.total_tokens_in = digest.total_tokens_in;
-        session.total_tokens_out = digest.total_tokens_out;
-        session.total_tokens_cache_read = digest.total_tokens_cache_read;
-        session.latest_context_tokens = digest.latest_context_tokens;
-        session.context_window = digest.context_window;
-        session.peak_context_tokens = digest.peak_context_tokens;
-        session.latest_model = digest.latest_model.clone();
-        session.latest_assistant_text = digest.latest_assistant_text.clone();
-        out.push(session);
+        if selected.is_empty() {
+            if pane.is_some() {
+                clients.push(pid);
+            }
+            continue;
+        }
+        for (path, digest) in selected {
+            if pane.is_none() {
+                paneless.push(out.len());
+            }
+            let mut session =
+                build_session(pid, path, &digest, panes, &thread_titles, &thread_roots);
+            session.pane = pane.clone();
+            out.push(session);
+        }
+    }
+    if !paneless.is_empty() && !clients.is_empty() {
+        attach_daemon_clients(&mut out, &paneless, &clients, panes, ppid_map, cache);
     }
     out
+}
+
+fn build_session(
+    pid: u32,
+    path: PathBuf,
+    digest: &CodexDigest,
+    panes: &HashMap<u32, Pane>,
+    thread_titles: &HashMap<String, CodexThreadTitle>,
+    thread_roots: &HashMap<String, String>,
+) -> Session {
+    let cwd = digest
+        .cwd
+        .clone()
+        .or_else(|| panes.values().find(|p| p.pid == pid).map(|p| p.cwd.clone()))
+        .unwrap_or_default();
+    let started_at_ms = digest.started_at_ms;
+    let updated_at_ms = digest.updated_at_ms.max(started_at_ms);
+    let name = thread_titles
+        .get(&digest.session_id)
+        .and_then(CodexThreadTitle::display_label)
+        .or_else(|| {
+            codex_agent_label(
+                digest.agent_nickname.as_deref(),
+                digest.agent_role.as_deref(),
+            )
+        });
+    let mut session = Session::new(
+        Provider::Codex,
+        pid,
+        digest.session_id.clone(),
+        cwd,
+        name,
+        digest.status(),
+        started_at_ms,
+        updated_at_ms,
+        None,
+    );
+    session.alias_session_id = thread_roots
+        .get(&digest.session_id)
+        .cloned()
+        .or_else(|| Some(digest.session_id.clone()));
+    session.transcript_path = Some(path);
+    session.headline = digest.headline.clone();
+    session.last_prompt = digest.last_prompt.clone();
+    session.last_prompt_at = digest.last_prompt_at;
+    session.last_event_at = digest.last_event_at;
+    session.last_progress_at = digest.last_progress_at;
+    session.last_stop_at = digest.last_stop_at();
+    session.user_prompt_count = digest.user_prompt_count;
+    session.last_tool_use = digest.last_tool_use.clone();
+    session.approval_prompt_pending = digest.pending_approval_tool;
+    session.total_tokens_in = digest.total_tokens_in;
+    session.total_tokens_out = digest.total_tokens_out;
+    session.total_tokens_cache_read = digest.total_tokens_cache_read;
+    session.latest_context_tokens = digest.latest_context_tokens;
+    session.context_window = digest.context_window;
+    session.peak_context_tokens = digest.peak_context_tokens;
+    session.latest_model = digest.latest_model.clone();
+    session.latest_assistant_text = digest.latest_assistant_text.clone();
+    session
+}
+
+/// A pane-less process may be an app-server daemon hosting several user
+/// threads; anything else keeps the single best rollout.
+fn daemon_rollouts(
+    paths: Vec<PathBuf>,
+    cache: &mut CodexDigestCache,
+) -> Vec<(PathBuf, CodexDigest)> {
+    let digests: Vec<_> = paths
+        .into_iter()
+        .filter_map(|path| cache.get(&path).map(|digest| (path, digest)))
+        .collect();
+    if digests.iter().filter(|(_, d)| d.is_user_thread).count() > 1 {
+        return digests
+            .into_iter()
+            .filter(|(_, d)| d.is_user_thread)
+            .collect();
+    }
+    digests
+        .into_iter()
+        .max_by_key(|(_, digest)| (digest.is_user_thread, digest.updated_at_ms))
+        .into_iter()
+        .collect()
+}
+
+/// Gives daemon-hosted sessions the pane of the TUI client connected to the
+/// daemon's socket. The session keeps the daemon pid: tool and hook
+/// processes descend from it, so mailbox identity and caller lookup do too.
+fn attach_daemon_clients(
+    sessions: &mut [Session],
+    paneless: &[usize],
+    clients: &[u32],
+    panes: &HashMap<u32, Pane>,
+    ppid_map: &HashMap<u32, u32>,
+    cache: &mut CodexDigestCache,
+) {
+    let mut pids: Vec<u32> = paneless.iter().map(|&i| sessions[i].pid).collect();
+    pids.extend_from_slice(clients);
+    pids.sort_unstable();
+    pids.dedup();
+    let fds = match process_fds(&pids) {
+        Ok(fds) => fds,
+        Err(error) => {
+            cache.discovery_errors.push(error);
+            return;
+        }
+    };
+    let threads: Vec<HostedThread> = paneless
+        .iter()
+        .map(|&i| HostedThread {
+            daemon: sessions[i].pid,
+            cwd: sessions[i].cwd.clone(),
+        })
+        .collect();
+    for (thread, client) in match_daemon_clients(&threads, clients, &fds) {
+        let session = &mut sessions[paneless[thread]];
+        session.pane = tmux::find_owning_pane(client, panes, ppid_map, 8);
+    }
+}
+
+struct HostedThread {
+    daemon: u32,
+    cwd: PathBuf,
+}
+
+#[derive(Default)]
+struct ProcessFds {
+    cwd: Option<PathBuf>,
+    /// Kernel addresses of this process's unix sockets.
+    sockets: HashSet<String>,
+    /// Kernel addresses of the unix sockets this process's sockets point to.
+    peers: HashSet<String>,
+}
+
+fn process_fds(pids: &[u32]) -> Result<HashMap<u32, ProcessFds>, String> {
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    // lsof exits non-zero when any listed pid has gone; keep what it printed.
+    let out = Command::new("lsof")
+        .args(["-F", "pftdn", "-p", &list])
+        .output()
+        .map_err(|error| format!("lsof Codex daemon lookup failed: {error}"))?;
+    Ok(parse_process_fds(&String::from_utf8_lossy(&out.stdout)))
+}
+
+fn parse_process_fds(text: &str) -> HashMap<u32, ProcessFds> {
+    #[derive(Default)]
+    struct Fd {
+        fd: String,
+        kind: String,
+        device: String,
+        name: String,
+    }
+    fn flush(fd: &mut Option<Fd>, entry: Option<&mut ProcessFds>) {
+        let (Some(fd), Some(entry)) = (fd.take(), entry) else {
+            return;
+        };
+        if fd.fd == "cwd" {
+            entry.cwd = Some(PathBuf::from(fd.name));
+        } else if fd.kind == "unix" {
+            if let Some(peer) = fd.name.strip_prefix("->") {
+                entry.peers.insert(peer.to_string());
+            }
+            if !fd.device.is_empty() {
+                entry.sockets.insert(fd.device);
+            }
+        }
+    }
+    let mut out: HashMap<u32, ProcessFds> = HashMap::new();
+    let mut pid = None;
+    let mut fd: Option<Fd> = None;
+    for line in text.lines() {
+        let Some(tag) = line.chars().next() else {
+            continue;
+        };
+        let value = &line[tag.len_utf8()..];
+        match tag {
+            'p' => {
+                flush(&mut fd, pid.and_then(|p| out.get_mut(&p)));
+                pid = value.parse::<u32>().ok();
+                if let Some(p) = pid {
+                    out.entry(p).or_default();
+                }
+            }
+            'f' => {
+                flush(&mut fd, pid.and_then(|p| out.get_mut(&p)));
+                fd = Some(Fd {
+                    fd: value.to_string(),
+                    ..Fd::default()
+                });
+            }
+            't' => {
+                if let Some(fd) = fd.as_mut() {
+                    fd.kind = value.to_string();
+                }
+            }
+            'd' => {
+                if let Some(fd) = fd.as_mut() {
+                    fd.device = value.to_string();
+                }
+            }
+            'n' => {
+                if let Some(fd) = fd.as_mut() {
+                    fd.name = value.to_string();
+                }
+            }
+            _ => {}
+        }
+    }
+    flush(&mut fd, pid.and_then(|p| out.get_mut(&p)));
+    out
+}
+
+/// Pairs hosted threads (by index) with the client pids connected to their
+/// daemon. A daemon's lone thread and lone client pair outright; otherwise a
+/// thread pairs with the only client launched in its cwd. Unresolvable
+/// threads stay pane-less rather than risk jumping to the wrong pane.
+fn match_daemon_clients(
+    threads: &[HostedThread],
+    clients: &[u32],
+    fds: &HashMap<u32, ProcessFds>,
+) -> Vec<(usize, u32)> {
+    let mut daemons: Vec<u32> = threads.iter().map(|t| t.daemon).collect();
+    daemons.sort_unstable();
+    daemons.dedup();
+    let mut pairs = Vec::new();
+    for daemon in daemons {
+        let Some(daemon_fds) = fds.get(&daemon) else {
+            continue;
+        };
+        let mut open_clients: Vec<u32> = clients
+            .iter()
+            .copied()
+            .filter(|c| *c != daemon)
+            .filter(|c| {
+                fds.get(c)
+                    .is_some_and(|f| !f.peers.is_disjoint(&daemon_fds.sockets))
+            })
+            .collect();
+        let mut open_threads: Vec<usize> = (0..threads.len())
+            .filter(|&i| threads[i].daemon == daemon)
+            .collect();
+        open_threads.retain(|&i| {
+            let same_cwd: Vec<u32> = open_clients
+                .iter()
+                .copied()
+                .filter(|c| {
+                    fds.get(c)
+                        .and_then(|f| f.cwd.as_deref())
+                        .is_some_and(|cwd| cwd == threads[i].cwd)
+                })
+                .collect();
+            if let [client] = same_cwd[..] {
+                pairs.push((i, client));
+                open_clients.retain(|c| *c != client);
+                false
+            } else {
+                true
+            }
+        });
+        if let ([thread], [client]) = (&open_threads[..], &open_clients[..]) {
+            pairs.push((*thread, *client));
+        }
+    }
+    pairs
 }
 
 fn codex_state_path() -> Option<PathBuf> {
@@ -224,6 +466,9 @@ impl CodexStateStamp {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct CodexThreadTitle {
+    /// Codex's generated thread name (newer versions); `title` is the raw
+    /// first prompt, which can be a stray keystroke.
+    name: Option<String>,
     title: Option<String>,
     agent_nickname: Option<String>,
     agent_role: Option<String>,
@@ -231,9 +476,10 @@ struct CodexThreadTitle {
 
 impl CodexThreadTitle {
     fn display_label(&self) -> Option<String> {
-        self.title
+        self.name
             .as_deref()
             .and_then(normalize_codex_label)
+            .or_else(|| self.title.as_deref().and_then(normalize_codex_label))
             .or_else(|| {
                 codex_agent_label(self.agent_nickname.as_deref(), self.agent_role.as_deref())
             })
@@ -271,10 +517,17 @@ fn sqlite_rows(path: &Path, query: &str) -> Result<Vec<u8>, String> {
 }
 
 fn load_thread_titles(path: &Path) -> Result<HashMap<String, CodexThreadTitle>, String> {
+    // Older Codex state DBs predate the `name` column.
     sqlite_rows(
         path,
-        "select id, title, agent_nickname, agent_role from threads where archived = 0",
+        "select id, name, title, agent_nickname, agent_role from threads where archived = 0",
     )
+    .or_else(|_| {
+        sqlite_rows(
+            path,
+            "select id, title, agent_nickname, agent_role from threads where archived = 0",
+        )
+    })
     .map(|bytes| parse_thread_titles_json(&bytes))
 }
 
@@ -335,6 +588,10 @@ fn parse_thread_titles_json(bytes: &[u8]) -> HashMap<String, CodexThreadTitle> {
         out.insert(
             id.to_string(),
             CodexThreadTitle {
+                name: row
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(ToString::to_string),
                 title: row
                     .get("title")
                     .and_then(|v| v.as_str())
@@ -1452,6 +1709,82 @@ mod tests {
         assert_eq!(roots.get("child-a").map(String::as_str), Some("parent"));
         assert_eq!(roots.get("child-b").map(String::as_str), Some("parent"));
         assert_eq!(roots.get("grandchild").map(String::as_str), Some("parent"));
+    }
+
+    #[test]
+    fn thread_name_outranks_raw_first_prompt_title() {
+        let json = br#"[{"id":"t","name":"music_scores","title":"l","agent_nickname":null,"agent_role":null},{"id":"old","title":"first prompt"}]"#;
+        let titles = parse_thread_titles_json(json);
+        assert_eq!(
+            titles.get("t").and_then(CodexThreadTitle::display_label),
+            Some("music_scores".to_string())
+        );
+        assert_eq!(
+            titles.get("old").and_then(CodexThreadTitle::display_label),
+            Some("first prompt".to_string())
+        );
+    }
+
+    const DAEMON_LSOF: &str = "p5304\nfcwd\ntDIR\nd0x1000010\nn/work/music\nf34\ntunix\nd0x44df\nn->0xe81c\np53894\nfcwd\ntDIR\nn/\nf10\ntunix\nd0xe81c\nn/private/tmp/codex-daemon-502/abc\nf30\ntunix\nd0x3ce9\np7000\nfcwd\ntDIR\nn/work/other\nf5\ntunix\nd0x77\nn->0x88\n";
+
+    fn hosted(daemon: u32, cwd: &str) -> HostedThread {
+        HostedThread {
+            daemon,
+            cwd: PathBuf::from(cwd),
+        }
+    }
+
+    #[test]
+    fn parses_lsof_cwd_and_unix_socket_links() {
+        let fds = parse_process_fds(DAEMON_LSOF);
+        let client = &fds[&5304];
+        assert_eq!(client.cwd.as_deref(), Some(Path::new("/work/music")));
+        assert!(client.peers.contains("0xe81c"));
+        assert!(client.sockets.contains("0x44df"));
+        let daemon = &fds[&53894];
+        assert!(daemon.sockets.contains("0xe81c"));
+        assert!(daemon.sockets.contains("0x3ce9"));
+        assert!(daemon.peers.is_empty());
+    }
+
+    #[test]
+    fn lone_daemon_thread_pairs_with_its_connected_client() {
+        let fds = parse_process_fds(DAEMON_LSOF);
+        let threads = [hosted(53894, "/elsewhere")];
+        assert_eq!(
+            match_daemon_clients(&threads, &[5304, 7000], &fds),
+            vec![(0, 5304)]
+        );
+    }
+
+    #[test]
+    fn daemon_threads_pair_by_client_cwd_and_ambiguity_stays_paneless() {
+        let mut fds = HashMap::new();
+        fds.insert(
+            1,
+            ProcessFds {
+                sockets: HashSet::from(["d".to_string()]),
+                ..ProcessFds::default()
+            },
+        );
+        for (pid, cwd) in [(10, "/a"), (11, "/b"), (12, "/b")] {
+            fds.insert(
+                pid,
+                ProcessFds {
+                    cwd: Some(PathBuf::from(cwd)),
+                    peers: HashSet::from(["d".to_string()]),
+                    ..ProcessFds::default()
+                },
+            );
+        }
+        let threads = [hosted(1, "/a"), hosted(1, "/b"), hosted(1, "/b")];
+        assert_eq!(
+            match_daemon_clients(&threads, &[10, 11, 12], &fds),
+            vec![(0, 10)]
+        );
+        let threads = [hosted(1, "/a"), hosted(1, "/b")];
+        let pairs = match_daemon_clients(&threads, &[10, 11], &fds);
+        assert_eq!(pairs, vec![(0, 10), (1, 11)]);
     }
 
     #[test]
