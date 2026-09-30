@@ -254,7 +254,7 @@ fn attach_daemon_clients(
     pids.extend_from_slice(clients);
     pids.sort_unstable();
     pids.dedup();
-    let fds = match process_fds(&pids) {
+    let mut fds = match process_fds(&pids) {
         Ok(fds) => fds,
         Err(error) => {
             cache.discovery_errors.push(error);
@@ -266,8 +266,35 @@ fn attach_daemon_clients(
         .map(|&i| HostedThread {
             daemon: sessions[i].pid,
             cwd: sessions[i].cwd.clone(),
+            evidence: [
+                sessions[i].last_prompt.as_deref(),
+                sessions[i].latest_assistant_text.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .map(normalize_pane_evidence)
+            .filter(|text| text.chars().count() >= 40)
+            .collect(),
         })
         .collect();
+    let targets: Vec<(u32, String)> = clients
+        .iter()
+        .filter_map(|&pid| {
+            tmux::find_owning_pane(pid, panes, ppid_map, 8).map(|pane| (pid, pane.target))
+        })
+        .collect();
+    let captures = tmux::capture_pane_tails(
+        &targets
+            .iter()
+            .map(|(_, target)| target.clone())
+            .collect::<Vec<_>>(),
+        200,
+    );
+    for (pid, target) in targets {
+        if let (Some(fd), Some(text)) = (fds.get_mut(&pid), captures.get(&target)) {
+            fd.pane_text = normalize_pane_evidence(text);
+        }
+    }
     for (thread, client) in match_daemon_clients(&threads, clients, &fds) {
         let session = &mut sessions[paneless[thread]];
         session.pane = tmux::find_owning_pane(client, panes, ppid_map, 8);
@@ -277,11 +304,17 @@ fn attach_daemon_clients(
 struct HostedThread {
     daemon: u32,
     cwd: PathBuf,
+    evidence: Vec<String>,
+}
+
+fn normalize_pane_evidence(text: &str) -> String {
+    text.chars().filter(|c| c.is_alphanumeric()).collect()
 }
 
 #[derive(Default)]
 struct ProcessFds {
     cwd: Option<PathBuf>,
+    pane_text: String,
     /// Kernel addresses of this process's unix sockets.
     sockets: HashSet<String>,
     /// Kernel addresses of the unix sockets this process's sockets point to.
@@ -372,7 +405,7 @@ fn parse_process_fds(text: &str) -> HashMap<u32, ProcessFds> {
 
 /// Pairs hosted threads (by index) with the client pids connected to their
 /// daemon. A daemon's lone thread and lone client pair outright; otherwise a
-/// thread pairs with the only client launched in its cwd. Unresolvable
+/// thread pairs by unique conversation text or a mutually unique cwd. Unresolvable
 /// threads stay pane-less rather than risk jumping to the wrong pane.
 fn match_daemon_clients(
     threads: &[HostedThread],
@@ -399,7 +432,41 @@ fn match_daemon_clients(
         let mut open_threads: Vec<usize> = (0..threads.len())
             .filter(|&i| threads[i].daemon == daemon)
             .collect();
+        let text_matches: Vec<(usize, u32)> = open_threads
+            .iter()
+            .flat_map(|&i| {
+                open_clients
+                    .iter()
+                    .copied()
+                    .filter(move |client| {
+                        fds.get(client).is_some_and(|fd| {
+                            threads[i].evidence.iter().any(|text| {
+                                text.chars().count() >= 40 && fd.pane_text.contains(text)
+                            })
+                        })
+                    })
+                    .map(move |client| (i, client))
+            })
+            .collect();
+        for &(thread, client) in &text_matches {
+            if text_matches.iter().filter(|(t, _)| *t == thread).count() == 1
+                && text_matches.iter().filter(|(_, c)| *c == client).count() == 1
+            {
+                pairs.push((thread, client));
+                open_threads.retain(|t| *t != thread);
+                open_clients.retain(|c| *c != client);
+            }
+        }
+        let remaining_threads = open_threads.clone();
         open_threads.retain(|&i| {
+            if remaining_threads
+                .iter()
+                .filter(|&&j| threads[j].cwd == threads[i].cwd)
+                .count()
+                != 1
+            {
+                return true;
+            }
             let same_cwd: Vec<u32> = open_clients
                 .iter()
                 .copied()
@@ -1731,6 +1798,7 @@ mod tests {
         HostedThread {
             daemon,
             cwd: PathBuf::from(cwd),
+            evidence: Vec::new(),
         }
     }
 
@@ -1785,6 +1853,43 @@ mod tests {
         let threads = [hosted(1, "/a"), hosted(1, "/b")];
         let pairs = match_daemon_clients(&threads, &[10, 11], &fds);
         assert_eq!(pairs, vec![(0, 10), (1, 11)]);
+    }
+
+    #[test]
+    fn same_directory_clients_pair_by_unique_displayed_conversation() {
+        let mut fds = parse_process_fds(DAEMON_LSOF);
+        let first = "Review the printed accidentals and phrase marks in the generated music scores";
+        let second = "Set the default context window to one million tokens for new Codex sessions";
+        fds.get_mut(&5304).unwrap().pane_text = normalize_pane_evidence(&format!("• **{first}**"));
+        fds.insert(
+            5305,
+            ProcessFds {
+                cwd: Some(PathBuf::from("/work/music")),
+                peers: HashSet::from(["0xe81c".to_string()]),
+                pane_text: normalize_pane_evidence(&second.replace(' ', "\n  ")),
+                ..ProcessFds::default()
+            },
+        );
+        let mut threads = [hosted(53894, "/work/music"), hosted(53894, "/work/music")];
+        threads[0].evidence = vec![normalize_pane_evidence(first)];
+        threads[1].evidence = vec![normalize_pane_evidence(second)];
+        assert_eq!(
+            match_daemon_clients(&threads, &[5305, 5304], &fds),
+            vec![(0, 5304), (1, 5305)]
+        );
+
+        // Shared scrollback must not identify either client.
+        fds.get_mut(&5304).unwrap().pane_text =
+            normalize_pane_evidence(&format!("{first} {second}"));
+        fds.get_mut(&5305).unwrap().pane_text =
+            normalize_pane_evidence(&format!("{first} {second}"));
+        assert!(match_daemon_clients(&threads, &[5304, 5305], &fds).is_empty());
+        // Missing captures must not make a directory collision choose the first thread.
+        for fd in fds.values_mut() {
+            fd.pane_text.clear();
+        }
+        assert!(match_daemon_clients(&threads, &[5304], &fds).is_empty());
+        assert!(match_daemon_clients(&threads, &[5304, 5305], &fds).is_empty());
     }
 
     #[test]
