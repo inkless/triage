@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.6.1](https://github.com/inkless/triage/compare/v0.6.0...v0.6.1) (2026-09-30)
+
+
+### Bug Fixes
+
+* discover Codex app-server sessions ([e65a8b7](https://github.com/inkless/triage/commit/e65a8b78caffc516f8e0b455db967442ec8d3808))
+* distinguish Codex panes sharing a working directory ([3ec4d2a](https://github.com/inkless/triage/commit/3ec4d2a66f34461d9b3d8d60ad5cf59863ce0227))
+
 ## [0.6.0](https://github.com/inkless/triage/compare/v0.5.0...v0.6.0) (2026-09-28)
 
 
