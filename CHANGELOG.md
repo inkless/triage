@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.2](https://github.com/inkless/triage/compare/v0.6.1...v0.6.2) (2026-10-06)
+
+
+### Bug Fixes
+
+* **messaging:** isolate Codex threads on shared app-server ([#24](https://github.com/inkless/triage/issues/24)) ([45854ed](https://github.com/inkless/triage/commit/45854edcc0aa23bed1194821d2a887f0b0ae501e))
+
 ## [0.6.1](https://github.com/inkless/triage/compare/v0.6.0...v0.6.1) (2026-09-30)
 
 
