@@ -347,17 +347,14 @@ fn a_bad_payload_exits_silently_and_is_logged() {
             "--wait",
             "--triage-hook=v1",
         ])
+        .env("CODEX_THREAD_ID", S2)
         .spawn()
         .unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(br#"{"session_id":"../../etc"}"#)
-        .unwrap();
+    child.stdin.take().unwrap().write_all(br#"{}"#).unwrap();
     let out = finish(child, Duration::from_secs(5));
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stderr.is_empty() && out.stdout.is_empty());
+    assert!(!env.state().join("hosts").exists());
     assert!(
         fs::read_to_string(env.state().join("hook.log"))
             .unwrap()

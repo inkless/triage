@@ -111,7 +111,7 @@ fn parse_args(args: &[String]) -> io::Result<HookArgs> {
     })
 }
 
-fn parse_payload(stdin: &str) -> io::Result<Payload> {
+fn parse_payload(stdin: &str, provider: Provider) -> io::Result<Payload> {
     let value: Value = serde_json::from_str(stdin)?;
     let session = value
         .get("session_id")
@@ -119,6 +119,9 @@ fn parse_payload(stdin: &str) -> io::Result<Payload> {
         .map(str::to_string)
         .filter(|s| mailbox::is_uuid(s))
         .or_else(|| {
+            if provider != Provider::Codex {
+                return None;
+            }
             std::env::var("CODEX_THREAD_ID")
                 .ok()
                 .filter(|s| mailbox::is_uuid(s))
@@ -141,7 +144,7 @@ fn parse_payload(stdin: &str) -> io::Result<Payload> {
 }
 
 fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
-    let payload = parse_payload(stdin)?;
+    let payload = parse_payload(stdin, hook.provider)?;
     let host = find_host(hook.provider)
         .ok_or_else(|| io::Error::other("no harness process among this hook's ancestors"))?;
     let agent = register(store, host, hook.provider, &payload.session, hook.event)?;
@@ -171,7 +174,10 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
             if hook.event == Event::UserPromptSubmit {
                 crate::transport::clear_pointer(store, &agent);
             }
-            if host_current_session(store, host).as_deref() != Some(payload.session.as_str()) {
+            if store
+                .read_session_host(host, Provider::Codex, &payload.session)
+                .is_none()
+            {
                 crate::transport::clear_pointer(store, &agent);
                 crate::transport::nudge_helper(store, &agent)?;
                 return Ok(0);
@@ -228,17 +234,21 @@ fn register(
     session: &str,
     event: Event,
 ) -> io::Result<String> {
-    let record = store.read_host(host);
-    let agent = match store.lineage_root(session) {
-        Some(root) => root,
-        None => {
-            let root = match &record {
-                Some(r) if r.current_session != session => store
-                    .lineage_root(&r.current_session)
-                    .unwrap_or_else(|| r.current_session.clone()),
-                _ => session.to_string(),
-            };
-            store.link_lineage(session, &root)?
+    let record = store.read_session_host(host, provider, session);
+    let agent = if provider == Provider::Codex {
+        store.register_codex_thread(session)?
+    } else {
+        match store.lineage_root(session) {
+            Some(root) => root,
+            None => {
+                let root = match &record {
+                    Some(r) if r.current_session != session => store
+                        .lineage_root(&r.current_session)
+                        .unwrap_or_else(|| r.current_session.clone()),
+                    _ => session.to_string(),
+                };
+                store.link_lineage(session, &root)?
+            }
         }
     };
     let current_session = match (&record, event) {
@@ -458,7 +468,9 @@ fn drain(
     via: DeliveredVia,
 ) -> io::Result<i32> {
     let started = Instant::now();
-    if host_current_session(store, host).as_deref() != Some(payload.session.as_str())
+    if store
+        .read_session_host(host, reader, &payload.session)
+        .is_none_or(|r| r.current_session != payload.session)
         || mailbox.ids(State::Pending).is_empty()
     {
         return Ok(0);

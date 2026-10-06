@@ -211,12 +211,7 @@ fn current_host(store: &Store, agent: &str) -> Option<(HostId, HostRecord)> {
     store
         .hosts()
         .into_iter()
-        .filter(|(_, record)| {
-            store
-                .lineage_root(&record.current_session)
-                .unwrap_or_else(|| record.current_session.clone())
-                == agent
-        })
+        .filter(|(_, record)| store.agent_for(record.provider, &record.current_session) == agent)
         .filter(|(host, _)| mailbox::liveness(*host) == Liveness::Alive)
         .max_by_key(|(_, record)| record.updated_at_ms)
 }

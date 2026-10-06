@@ -3,7 +3,7 @@ use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 const S1: &str = "01a0dbf1-0000-7000-8000-000000000001";
 const S2: &str = "01a0dbf1-0000-7000-8000-000000000002";
@@ -110,17 +110,6 @@ impl Env {
     }
 }
 
-fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if done() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    done()
-}
-
 #[test]
 fn session_start_only_records_the_session() {
     let env = Env::new("session-start");
@@ -216,26 +205,43 @@ fn mail_arriving_during_the_grace_period_is_counted_in_the_pointer() {
 }
 
 #[test]
-fn a_prompt_on_a_stale_thread_requeues_the_pointer_to_the_current_one() {
-    let env = Env::new("requeue");
+fn threads_on_one_host_drain_only_their_own_mail() {
+    let env = Env::new("shared-host");
+    fs::create_dir_all(env.state().join("lineage")).unwrap();
+    fs::write(env.state().join(format!("lineage/{S2}")), S1).unwrap();
     env.hook("session-start", S1);
     env.hook("session-start", S2);
+    assert_eq!(
+        fs::read_to_string(env.state().join(format!("lineage/{S2}"))).unwrap(),
+        S2
+    );
     env.write_mail(
         S1,
         "01900000-0000-7000-8000-000000000005",
-        "for the new thread",
+        "first thread only",
     );
-    fs::create_dir_all(env.pointer_marker(S1).parent().unwrap()).unwrap();
-    fs::write(env.pointer_marker(S1), "{}").unwrap();
-
+    env.write_mail(
+        S2,
+        "01900000-0000-7000-8000-000000000008",
+        "second thread only",
+    );
     let out = env.hook("user-prompt-submit", S1);
     assert_eq!(out.status.code(), Some(0));
-    assert!(out.stdout.is_empty(), "a stale thread gets nothing");
-    assert_eq!(env.mail(S1, "pending").len(), 1);
-    assert!(wait_until(Duration::from_secs(10), || env
-        .queue_calls()
-        .iter()
-        .any(|c| c.starts_with(&format!("queue --thread {S2} ")))));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("first thread only"));
+    assert!(!text.contains("second thread only"));
+    assert!(env.mail(S1, "pending").is_empty());
+    assert_eq!(env.mail(S2, "pending").len(), 1);
+    let helper = env.command(&["inbox", "--helper", S2]).output().unwrap();
+    assert!(helper.status.success());
+    assert_eq!(env.queue_calls().len(), 1);
+    assert!(env.queue_calls()[0].starts_with(&format!("queue --thread {S2} ")));
+    let out = env.hook("post-tool-use", S2);
+    assert_eq!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("second thread only"));
+    assert!(!text.contains("first thread only"));
+    assert!(env.mail(S2, "pending").is_empty());
 }
 
 #[test]
@@ -261,4 +267,98 @@ fn hooks_install_writes_codex_entries_once() {
     assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
     let again = run(&["hooks", "install", "--codex"]);
     assert!(String::from_utf8_lossy(&again.stdout).contains("already up to date"));
+}
+
+#[test]
+fn codex_hook_uses_the_environment_thread_only_when_payload_has_no_session() {
+    let env = Env::new("environment-thread");
+    let hook = |session: Option<&str>, thread: &str| {
+        let mut child = env
+            .command(&[
+                "inbox",
+                "--hook",
+                "codex",
+                "post-tool-use",
+                "--triage-hook=v1",
+            ])
+            .env("CODEX_THREAD_ID", thread)
+            .spawn()
+            .unwrap();
+        let payload = session.map_or_else(
+            || serde_json::json!({}),
+            |session| serde_json::json!({"session_id": session}),
+        );
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    env.write_mail(
+        S1,
+        "01900000-0000-7000-8000-000000000009",
+        "environment thread",
+    );
+    let output = hook(None, S1);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("environment thread"));
+    env.write_mail(S2, "01900000-0000-7000-8000-00000000000a", "payload thread");
+    let output = hook(Some(S2), S1);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("payload thread"));
+    assert_eq!(env.mail(S1, "delivered").len(), 1);
+    assert_eq!(env.mail(S2, "delivered").len(), 1);
+}
+
+#[test]
+fn uninstall_removes_scoped_codex_hosts_and_keeps_claude_hosts() {
+    let env = Env::new("uninstall-hosts");
+    assert!(
+        env.command(&["hooks", "install", "--codex"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    env.hook("session-start", S1);
+    env.hook("session-start", S2);
+    let hosts = env.state().join("hosts");
+    let scoped = fs::read_dir(&hosts)
+        .unwrap()
+        .find_map(|e| {
+            let e = e.unwrap();
+            e.file_name()
+                .to_string_lossy()
+                .ends_with(&format!("@{S1}.json"))
+                .then_some(e.path())
+        })
+        .unwrap();
+    let key = scoped
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .split('@')
+        .next()
+        .unwrap()
+        .to_string();
+    fs::write(hosts.join(format!("{key}.json")), fs::read(scoped).unwrap()).unwrap();
+    let claude = hosts.join("99999999-1.json");
+    fs::write(&claude, serde_json::json!({"v": 1, "provider": "claude", "hook_version": "v1", "current_session": SENDER, "updated_at_ms": 1}).to_string()).unwrap();
+    assert!(
+        env.command(&["hooks", "uninstall", "--codex"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let remaining: Vec<_> = fs::read_dir(hosts)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect();
+    assert_eq!(remaining, [claude]);
+    let status = env.command(&["hooks", "status"]).output().unwrap();
+    assert!(status.status.success());
+    assert!(!String::from_utf8_lossy(&status.stdout).contains("sync hooks"));
 }

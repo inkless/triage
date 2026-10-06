@@ -78,16 +78,34 @@ esac
     }
 
     fn run(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_triage"))
+        self.command(args).output().unwrap()
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_triage"));
+        command
             .args(args)
             .env("HOME", &self.dir)
             .env("XDG_STATE_HOME", self.dir.join("state"))
             .env("PATH", &self.dir)
             .env("TMUX_PANE", "%other")
+            .env_remove("CODEX_THREAD_ID")
             .env("CALLER_PID", std::process::id().to_string())
-            .env("TARGET_PID", self.target.id().to_string())
-            .output()
-            .unwrap()
+            .env("TARGET_PID", self.target.id().to_string());
+        command
+    }
+
+    fn shared_host(&self) {
+        fs::write(self.dir.join(".codex/sessions/rollout-sibling.jsonl"), format!("{{\"timestamp\":\"2000-01-01T00:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{CLEARED_SESSION}\",\"source\":\"cli\"}}}}\n")).unwrap();
+        let lsof = self.dir.join("lsof");
+        let script = fs::read_to_string(&lsof).unwrap().replace("echo \"n$HOME/.codex/sessions/rollout-caller.jsonl\"", "echo \"n$HOME/.codex/sessions/rollout-caller.jsonl\"; echo \"n$HOME/.codex/sessions/rollout-sibling.jsonl\"");
+        fs::write(lsof, script).unwrap();
+        let tmux = self.dir.join("tmux");
+        let script = fs::read_to_string(&tmux).unwrap().replace(
+            "  echo \"fixture|1.0|$CALLER_PID|/dev/null|codex|/tmp|1|%41|caller\"\n",
+            "",
+        );
+        fs::write(tmux, script).unwrap();
     }
 
     fn mail(&self, agent: &str, state: &str) -> Vec<serde_json::Value> {
@@ -123,6 +141,7 @@ esac
             .env("XDG_STATE_HOME", self.dir.join("state"))
             .env("PATH", &self.dir)
             .env("TMUX_PANE", "%other")
+            .env_remove("CODEX_THREAD_ID")
             .env("CALLER_PID", std::process::id().to_string())
             .env("TARGET_PID", self.target.id().to_string())
             .env("TRIAGE_TEST_NOW_MS", now_ms.to_string())
@@ -143,6 +162,144 @@ fn ok(output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).into_owned()
+}
+
+#[test]
+fn shared_daemon_cli_identifies_the_thread_without_a_tmux_pane() {
+    let fx = Fixture::new("shared_daemon_identity");
+    fx.shared_host();
+    let run = |args: &[&str], thread: &str| {
+        fx.command(args)
+            .env("CODEX_THREAD_ID", thread)
+            .output()
+            .unwrap()
+    };
+    for thread in [CALLER_SESSION, CLEARED_SESSION] {
+        let row: serde_json::Value =
+            serde_json::from_str(&ok(&run(&["agents", "whoami", "--json"], thread))).unwrap();
+        assert_eq!(row["session_id"], thread);
+        assert_eq!(row["agent_id"], thread);
+        assert!(row["pane_id"].is_null());
+        let rows: Vec<serde_json::Value> =
+            serde_json::from_str(&ok(&run(&["agents", "--json"], thread))).unwrap();
+        assert!(!rows.iter().any(|r| r["session_id"] == thread));
+        assert!(rows.iter().any(|r| r["session_id"]
+            == if thread == CALLER_SESSION {
+                CLEARED_SESSION
+            } else {
+                CALLER_SESSION
+            }));
+    }
+    assert_eq!(
+        fx.run(&["send", "--to", "%42", "--message", "ambiguous"])
+            .status
+            .code(),
+        Some(3)
+    );
+    assert_eq!(
+        run(&["agents", "whoami", "--json"], TARGET_SESSION)
+            .status
+            .code(),
+        Some(3)
+    );
+    assert_eq!(
+        run(
+            &["send", "--to", "%42", "--message", "stale"],
+            TARGET_SESSION
+        )
+        .status
+        .code(),
+        Some(3)
+    );
+    assert!(fx.keys().is_empty());
+    ok(&run(
+        &[
+            "send",
+            "--to",
+            "%42",
+            "--message",
+            "thread identity test",
+            "--mode",
+            "legacy",
+        ],
+        CLEARED_SESSION,
+    ));
+    let sent = fx.mail(TARGET_SESSION, "pasted");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["from"]["session"], CLEARED_SESSION);
+    assert_eq!(sent[0]["from"]["agent"], CLEARED_SESSION);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn shared_daemon_send_and_inbox_do_not_use_a_sibling_registration_or_lineage() {
+    let fx = Fixture::new("shared_daemon_mail");
+    fx.shared_host();
+    let pid = std::process::id();
+    let record = |session: &str| serde_json::json!({"v": 1, "provider": "codex", "hook_version": "v1", "current_session": session, "updated_at_ms": 1});
+    write_json(
+        &fx.dir.join(format!(
+            "state/triage/hosts/{pid}-{}.json",
+            process_start(pid)
+        )),
+        record(CLEARED_SESSION),
+    );
+    for session in [CALLER_SESSION, CLEARED_SESSION] {
+        write_json(
+            &fx.dir.join(format!(
+                "state/triage/hosts/{pid}-{}@{session}.json",
+                process_start(pid)
+            )),
+            record(session),
+        );
+    }
+    let lineage = fx.dir.join("state/triage/lineage");
+    fs::create_dir_all(&lineage).unwrap();
+    fs::write(lineage.join(CALLER_SESSION), CLEARED_SESSION).unwrap();
+    let run = |args: &[&str], thread: &str| {
+        fx.command(args)
+            .env("CODEX_THREAD_ID", thread)
+            .output()
+            .unwrap()
+    };
+    ok(&run(
+        &[
+            "send",
+            "--to",
+            CLEARED_SESSION,
+            "--message",
+            "sibling message",
+            "--mode",
+            "mailbox",
+        ],
+        CALLER_SESSION,
+    ));
+    let mail = fx.mail(CLEARED_SESSION, "pending");
+    assert_eq!(mail.len(), 1);
+    assert_eq!(mail[0]["from"]["agent"], CALLER_SESSION);
+    assert_eq!(mail[0]["from"]["session"], CALLER_SESSION);
+    assert_eq!(mail[0]["to"]["agent"], CLEARED_SESSION);
+    let id = mail[0]["id"].as_str().unwrap();
+    let error = run(
+        &["inbox", "show", id, "--session", CLEARED_SESSION],
+        CALLER_SESSION,
+    );
+    assert_eq!(error.status.code(), Some(3));
+    let own = ok(&run(&["inbox"], CALLER_SESSION));
+    assert!(!own.contains("sibling message"));
+    let sibling = ok(&run(&["inbox"], CLEARED_SESSION));
+    assert!(sibling.contains("sibling message"));
+    assert!(fx.mail(CLEARED_SESSION, "pending").is_empty());
+    assert_eq!(fx.mail(CLEARED_SESSION, "delivered").len(), 1);
+    assert_eq!(
+        run(
+            &["send", "--to", CALLER_SESSION, "--message", "self"],
+            CALLER_SESSION
+        )
+        .status
+        .code(),
+        Some(2)
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -324,6 +481,71 @@ fn mail_for_a_host_dead_over_30s_bounces_to_the_sender_once() {
     assert!(!bounces[0]["body"].as_str().unwrap().contains("secret body"));
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn shared_dead_codex_host_cleans_each_thread_and_preserves_a_live_registration() {
+    let fx = Fixture::new("shared_dead_codex_host");
+    let dead = "99999999-1";
+    let record = |thread: &str| serde_json::json!({"v": 1, "provider": "codex", "hook_version": "v1", "current_session": thread, "updated_at_ms": 1});
+    let threads = [
+        TARGET_SESSION,
+        CLEARED_SESSION,
+        "01a0dbf1-52ad-7e22-9ecd-54582d4a3009",
+    ];
+    for (index, thread) in threads.iter().enumerate() {
+        write_json(
+            &fx.dir
+                .join(format!("state/triage/hosts/{dead}@{thread}.json")),
+            record(thread),
+        );
+        let id = format!("01900000-0000-7000-8000-00000000000{}", index + 1);
+        write_json(
+            &fx.dir
+                .join(format!("state/triage/mail/{thread}/pending/{id}.json")),
+            serde_json::json!({
+                "v": 1, "id": id, "created_at_ms": 1,
+                "from": {"agent": CALLER_SESSION, "session": CALLER_SESSION, "provider": "codex", "label": "caller"},
+                "to": {"agent": thread, "session_at_send": thread},
+                "body": "pending message", "attempt": 0, "bounce_of": null
+            }),
+        );
+    }
+    write_json(
+        &fx.dir.join(format!("state/triage/hosts/{dead}.json")),
+        record(TARGET_SESSION),
+    );
+    let pid = fx.target.id();
+    write_json(
+        &fx.dir.join(format!(
+            "state/triage/hosts/{pid}-{}@{}.json",
+            process_start(pid),
+            threads[2]
+        )),
+        record(threads[2]),
+    );
+    let t0 = 1_800_000_000_000;
+    ok(&fx.run_at(t0, &["agents", "--json"]));
+    for thread in &threads {
+        assert_eq!(fx.mail(thread, "pending").len(), 1);
+    }
+    ok(&fx.run_at(t0 + 31_000, &["agents", "--json"]));
+    ok(&fx.run_at(t0 + 62_000, &["agents", "--json"]));
+    for thread in &threads[..2] {
+        assert!(fx.mail(thread, "pending").is_empty());
+        assert_eq!(fx.mail(thread, "undeliverable").len(), 1);
+    }
+    assert_eq!(fx.mail(CALLER_SESSION, "pending").len(), 2);
+    assert_eq!(fx.mail(threads[2], "pending").len(), 1);
+    let registrations: Vec<_> = fs::read_dir(fx.dir.join("state/triage/hosts"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        registrations,
+        [format!("{pid}-{}@{}.json", process_start(pid), threads[2])]
+    );
+}
+
 #[test]
 fn legacy_send_pastes_and_records_the_message() {
     let fx = Fixture::new("legacy_send_pastes_and_records_the_message");
@@ -345,6 +567,7 @@ fn a_sandboxed_send_says_to_run_outside_the_sandbox() {
         .env("XDG_STATE_HOME", fx.dir.join("state"))
         .env("PATH", &fx.dir)
         .env("TMUX_PANE", "%other")
+        .env_remove("CODEX_THREAD_ID")
         .env("CALLER_PID", std::process::id().to_string())
         .env("TARGET_PID", fx.target.id().to_string())
         .env("SANDBOXED", "1")
@@ -369,6 +592,17 @@ fn sending_to_yourself_is_a_usage_error() {
 #[test]
 fn inbox_commits_only_from_the_agents_current_session() {
     let fx = Fixture::new("inbox_commits_only_from_the_agents_current_session");
+    let session_dir = fx.dir.join(".claude/sessions");
+    fs::create_dir_all(&session_dir).unwrap();
+    write_json(
+        &session_dir.join(format!("{}.json", std::process::id())),
+        serde_json::json!({"pid": std::process::id(), "sessionId": CALLER_SESSION, "cwd": "/tmp", "status": "idle"}),
+    );
+    let ps = fx.dir.join("ps");
+    let script = fs::read_to_string(&ps)
+        .unwrap()
+        .replace("echo \"$CALLER_PID codex\"; ", "");
+    fs::write(ps, script).unwrap();
     let id = "01900000-0000-7000-8000-000000000001";
     write_json(
         &fx.dir
@@ -390,7 +624,7 @@ fn inbox_commits_only_from_the_agents_current_session() {
     write_json(
         &host,
         serde_json::json!({
-            "v": 1, "provider": "codex", "hook_version": "v1",
+            "v": 1, "provider": "claude", "hook_version": "v1",
             "current_session": CLEARED_SESSION, "updated_at_ms": 1
         }),
     );
