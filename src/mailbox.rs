@@ -390,26 +390,92 @@ impl Store {
         is_uuid(root).then(|| root.to_string())
     }
 
+    pub fn register_codex_thread(&self, session: &str) -> io::Result<String> {
+        check_uuid("Codex thread", session)?;
+        if self.lineage_root(session).as_deref() == Some(session) {
+            return Ok(session.to_string());
+        }
+        let dir = self.root.join("lineage");
+        ensure_dir(&dir)?;
+        replace_file(&dir, session, session.as_bytes())?;
+        Ok(session.to_string())
+    }
+
+    pub fn agent_for(&self, provider: Provider, session: &str) -> String {
+        match provider {
+            Provider::Codex => session.to_string(),
+            Provider::Claude => self
+                .lineage_root(session)
+                .unwrap_or_else(|| session.to_string()),
+        }
+    }
+
+    fn host_key(host: HostId, provider: Provider, session: &str) -> String {
+        match provider {
+            Provider::Claude => host.key(),
+            Provider::Codex => format!("{}@{session}", host.key()),
+        }
+    }
+
     pub fn write_host(&self, host: HostId, record: &HostRecord) -> io::Result<()> {
         check_uuid("current session", &record.current_session)?;
         let dir = self.root.join("hosts");
         ensure_dir(&dir)?;
         let bytes = serde_json::to_vec(record)?;
-        replace_file(&dir, &format!("{}.json", host.key()), &bytes)
+        let key = Self::host_key(host, record.provider, &record.current_session);
+        replace_file(&dir, &format!("{key}.json"), &bytes)
     }
 
     pub fn read_host(&self, host: HostId) -> Option<HostRecord> {
         let path = self.root.join("hosts").join(format!("{}.json", host.key()));
+        Self::read_host_path(&path)
+    }
+
+    fn read_host_path(path: &Path) -> Option<HostRecord> {
         let record: HostRecord = serde_json::from_slice(&fs::read(path).ok()?).ok()?;
         is_uuid(&record.current_session).then_some(record)
     }
 
-    pub fn remove_host(&self, host: HostId) -> io::Result<()> {
-        let path = self.root.join("hosts").join(format!("{}.json", host.key()));
-        match fs::remove_file(path) {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
-            _ => Ok(()),
+    pub fn read_session_host(
+        &self,
+        host: HostId,
+        provider: Provider,
+        session: &str,
+    ) -> Option<HostRecord> {
+        if !is_uuid(session) {
+            return None;
         }
+        if provider == Provider::Claude {
+            return self.read_host(host).filter(|r| r.provider == provider);
+        }
+        let key = Self::host_key(host, provider, session);
+        let path = self.root.join("hosts").join(format!("{key}.json"));
+        Self::read_host_path(&path)
+            .or_else(|| self.read_host(host))
+            .filter(|r| r.provider == provider && r.current_session == session)
+    }
+
+    pub fn remove_host_record(&self, host: HostId, record: &HostRecord) -> io::Result<()> {
+        let mut keys = vec![Self::host_key(
+            host,
+            record.provider,
+            &record.current_session,
+        )];
+        if record.provider == Provider::Codex
+            && self.read_host(host).is_some_and(|r| {
+                r.provider == record.provider && r.current_session == record.current_session
+            })
+        {
+            keys.push(host.key());
+        }
+        for key in keys {
+            let path = self.root.join("hosts").join(format!("{key}.json"));
+            match fs::remove_file(path) {
+                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     /// Agents that have a mailbox directory.
@@ -424,11 +490,31 @@ impl Store {
         let mut hosts: Vec<_> = list_names(&self.root.join("hosts"))
             .into_iter()
             .filter_map(|name| {
-                let host = HostId::parse(name.strip_suffix(".json")?)?;
-                Some((host, self.read_host(host)?))
+                let key = name.strip_suffix(".json")?;
+                let (host_key, session) = key
+                    .split_once('@')
+                    .map_or((key, None), |(h, s)| (h, Some(s)));
+                let host = HostId::parse(host_key)?;
+                let record = Self::read_host_path(&self.root.join("hosts").join(&name))?;
+                if let Some(session) = session {
+                    if record.provider != Provider::Codex || record.current_session != session {
+                        return None;
+                    }
+                } else if record.provider == Provider::Codex {
+                    let scoped = Self::host_key(host, record.provider, &record.current_session);
+                    let path = self.root.join("hosts").join(format!("{scoped}.json"));
+                    if Self::read_host_path(&path).is_some_and(|r| {
+                        r.provider == record.provider && r.current_session == record.current_session
+                    }) {
+                        return None;
+                    }
+                }
+                Some((host, record))
             })
             .collect();
-        hosts.sort_by_key(|(host, _)| (host.pid, host.start));
+        hosts.sort_by(|(a, ar), (b, br)| {
+            (a.pid, a.start, &ar.current_session).cmp(&(b.pid, b.start, &br.current_session))
+        });
         hosts
     }
 
@@ -1291,6 +1377,83 @@ mod tests {
         )
         .unwrap();
         assert_eq!(store.read_host(HOST), None);
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn codex_registrations_and_lineage_are_isolated_on_a_shared_host() {
+        let store = temp_store("shared-host");
+        let first = HostRecord {
+            v: 1,
+            provider: Provider::Codex,
+            hook_version: "v1".into(),
+            current_session: ALICE.into(),
+            updated_at_ms: 1,
+        };
+        let second = HostRecord {
+            current_session: BOB.into(),
+            updated_at_ms: 2,
+            ..first.clone()
+        };
+        store.link_lineage(ALICE, BOB).unwrap();
+        store.register_codex_thread(ALICE).unwrap();
+        assert_eq!(store.lineage_root(ALICE).as_deref(), Some(ALICE));
+        store.write_host(HOST, &first).unwrap();
+        store.write_host(HOST, &second).unwrap();
+        assert_eq!(
+            store.read_session_host(HOST, Provider::Codex, ALICE),
+            Some(first.clone())
+        );
+        assert_eq!(
+            store.read_session_host(HOST, Provider::Codex, BOB),
+            Some(second.clone())
+        );
+        assert_eq!(store.hosts().len(), 2);
+        store.remove_host_record(HOST, &first).unwrap();
+        assert!(
+            store
+                .read_session_host(HOST, Provider::Codex, ALICE)
+                .is_none()
+        );
+        assert_eq!(store.hosts(), vec![(HOST, second)]);
+        let _ = fs::remove_dir_all(store.root());
+    }
+
+    #[test]
+    fn legacy_codex_registration_is_reused_only_by_its_own_thread() {
+        let store = temp_store("legacy-codex-host");
+        let record = HostRecord {
+            v: 1,
+            provider: Provider::Codex,
+            hook_version: "v1".into(),
+            current_session: ALICE.into(),
+            updated_at_ms: 1,
+        };
+        let dir = store.root().join("hosts");
+        ensure_dir(&dir).unwrap();
+        fs::write(
+            dir.join(format!("{}.json", HOST.key())),
+            serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            store.read_session_host(HOST, Provider::Codex, ALICE),
+            Some(record.clone())
+        );
+        assert!(
+            store
+                .read_session_host(HOST, Provider::Codex, BOB)
+                .is_none()
+        );
+        assert!(
+            store
+                .read_session_host(HOST, Provider::Claude, ALICE)
+                .is_none()
+        );
+        store.write_host(HOST, &record).unwrap();
+        assert_eq!(store.hosts(), vec![(HOST, record.clone())]);
+        store.remove_host_record(HOST, &record).unwrap();
+        assert!(store.hosts().is_empty());
         let _ = fs::remove_dir_all(store.root());
     }
 

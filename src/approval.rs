@@ -1133,9 +1133,7 @@ fn print_waiters() {
         return;
     }
     for (host, record) in hosts {
-        let agent = store
-            .lineage_root(&record.current_session)
-            .unwrap_or_else(|| record.current_session.clone());
+        let agent = store.agent_for(record.provider, &record.current_session);
         let waiter = match (
             record.provider,
             store.try_lock(crate::mailbox::LockKind::Waiter, &agent),
@@ -1161,7 +1159,7 @@ fn clear_host_records(provider: Provider) -> io::Result<()> {
     let store = crate::mailbox::Store::open_default();
     for (host, record) in store.hosts() {
         if record.provider == provider {
-            store.remove_host(host)?;
+            store.remove_host_record(host, &record)?;
         }
     }
     Ok(())

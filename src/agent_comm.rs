@@ -474,17 +474,14 @@ fn run_agents(args: &[String]) -> Result<(), CliError> {
     let args = parse_agents_args(args)?;
     let mut sessions = load_snapshot()?;
     snapshot::sort_sessions(&mut sessions);
-    let current_pane = (!args.include_self).then(current_tmux_pane_id).flatten();
+    let parents = tmux::build_ppid_map();
+    let caller = resolve_current_caller(&sessions, &parents).ok();
     let store = Store::open_default();
     reconcile_quietly(&store);
 
     let rows = sessions
         .iter()
-        .filter(|s| {
-            current_pane
-                .as_deref()
-                .is_none_or(|pane_id| s.pane.as_ref().is_none_or(|p| p.pane_id != pane_id))
-        })
+        .filter(|s| args.include_self || caller.is_none_or(|caller| !same_session(s, caller)))
         .filter(|s| {
             args.provider
                 .as_deref()
@@ -545,30 +542,15 @@ fn run_whoami(args: &[String]) -> Result<(), CliError> {
         }
     }
 
-    let pane_id = current_tmux_pane_id()
-        .ok_or_else(|| CliError::usage("not running inside a tmux pane (TMUX_PANE is unset)"))?;
-
-    // The caller's own session is the one paired to this pane.
-    let mut sessions = load_snapshot()?;
-    snapshot::sort_sessions(&mut sessions);
+    let sessions = load_snapshot()?;
+    let parents = tmux::build_ppid_map();
+    let caller = resolve_current_caller(&sessions, &parents)?;
     let store = Store::open_default();
-    let row = sessions
-        .iter()
-        .find(|s| s.pane.as_ref().is_some_and(|p| p.pane_id == pane_id))
-        .map(|s| agent_row(&store, s));
+    let row = agent_row(&store, caller);
 
     if json {
-        let value = match &row {
-            Some(row) => serde_json::to_value(row),
-            // Pane is real but triage doesn't track an agent session here
-            // (e.g. a plain shell, or a session it couldn't pair). Still report
-            // the pane so the caller has a usable identity.
-            None => serde_json::to_value(serde_json::json!({
-                "pane_id": pane_id,
-                "tracked": false,
-            })),
-        }
-        .map_err(|e| CliError::runtime(format!("failed to render JSON: {e}")))?;
+        let value = serde_json::to_value(&row)
+            .map_err(|e| CliError::runtime(format!("failed to render JSON: {e}")))?;
         println!(
             "{}",
             serde_json::to_string_pretty(&value)
@@ -577,28 +559,20 @@ fn run_whoami(args: &[String]) -> Result<(), CliError> {
         return Ok(());
     }
 
-    match row {
-        Some(row) => {
-            let target = row.pane_target.as_deref().unwrap_or("?");
-            println!(
-                "pane:     {} ({})",
-                row.pane_id.as_deref().unwrap_or(&pane_id),
-                target
-            );
-            println!("agent:    {} {} {:?}", row.provider, row.state, row.name);
-            println!("cwd:      {}", row.cwd);
-            println!("session:  {}", row.session_id);
-            if let Some(headline) = row.headline {
-                println!(
-                    "headline: {}",
-                    truncate_chars(&headline.replace('\n', " "), 100)
-                );
-            }
-        }
-        None => {
-            println!("pane:     {pane_id}");
-            println!("(no agent session tracked on this pane)");
-        }
+    let target = row.pane_target.as_deref().unwrap_or("?");
+    println!(
+        "pane:     {} ({})",
+        row.pane_id.as_deref().unwrap_or("none"),
+        target
+    );
+    println!("agent:    {} {} {:?}", row.provider, row.state, row.name);
+    println!("cwd:      {}", row.cwd);
+    println!("session:  {}", row.session_id);
+    if let Some(headline) = row.headline {
+        println!(
+            "headline: {}",
+            truncate_chars(&headline.replace('\n', " "), 100)
+        );
     }
     Ok(())
 }
@@ -615,14 +589,14 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
     let mode = args.mode.unwrap_or_else(|| Config::load().send.mode);
     let sessions = load_snapshot()?;
     let parents = tmux::build_ppid_map();
-    let caller = resolve_caller(&sessions, std::process::id(), &parents)?;
+    let caller = resolve_current_caller(&sessions, &parents)?;
     let sender = format!("{} ({})", session_display_label(caller), target_id(caller));
     let body = read_message_body(&args)?;
     let body = validate_body(&body)?;
     let store = Store::open_default();
     reconcile_quietly(&store);
     let target = resolve_send_target(&store, &sessions, selector)?;
-    if target.pid == caller.pid {
+    if same_session(target, caller) {
         return Err(CliError::usage("cannot send a message to yourself"));
     }
     let from = agent_identity(&store, caller);
@@ -704,7 +678,7 @@ fn reconcile_quietly(store: &Store) {
 fn hook_capable(store: &Store, to: &AgentIdentity) -> bool {
     to.host.is_some_and(|host| {
         store
-            .read_host(host)
+            .read_session_host(host, to.provider, &to.session)
             .is_some_and(|record| record.hook_version == crate::peer_hooks::HOOK_VERSION)
             && mailbox::liveness(host) == mailbox::Liveness::Alive
     })
@@ -789,7 +763,7 @@ fn run_inbox(args: &[String]) -> Result<(), CliError> {
     let parents = tmux::build_ppid_map();
     let caller = match &session_arg {
         Some(session) => session_in_caller_chain(&sessions, session, &parents)?,
-        None => resolve_caller(&sessions, std::process::id(), &parents)?,
+        None => resolve_current_caller(&sessions, &parents)?,
     };
     let store = Store::open_default();
     reconcile_quietly(&store);
@@ -947,6 +921,15 @@ fn session_in_caller_chain<'a>(
     session_id: &str,
     parents: &HashMap<u32, u32>,
 ) -> Result<&'a Session, CliError> {
+    if sessions
+        .iter()
+        .any(|s| s.provider == Provider::Codex && s.session_id == session_id)
+        && resolve_current_caller(sessions, parents)?.session_id != session_id
+    {
+        return Err(CliError::denied(
+            "the requested session is not the calling Codex thread",
+        ));
+    }
     let mut chain = std::collections::HashSet::new();
     let mut current = std::process::id();
     while current > 1 && chain.insert(current) {
@@ -983,6 +966,7 @@ struct AgentIdentity {
     agent: String,
     session: String,
     host: Option<HostId>,
+    provider: Provider,
 }
 
 fn agent_identity(store: &Store, s: &Session) -> Option<AgentIdentity> {
@@ -991,19 +975,18 @@ fn agent_identity(store: &Store, s: &Session) -> Option<AgentIdentity> {
         start: info.start,
     });
     let session = host
-        .and_then(|host| store.read_host(host))
+        .and_then(|host| store.read_session_host(host, s.provider, &s.session_id))
         .map(|record| record.current_session)
         .unwrap_or_else(|| s.session_id.clone());
     if !mailbox::is_uuid(&session) {
         return None;
     }
-    let agent = store
-        .lineage_root(&session)
-        .unwrap_or_else(|| session.clone());
+    let agent = store.agent_for(s.provider, &session);
     Some(AgentIdentity {
         agent,
         session,
         host,
+        provider: s.provider,
     })
 }
 
@@ -1509,12 +1492,28 @@ fn resolve_caller<'a>(
     sessions: &'a [Session],
     pid: u32,
     parents: &HashMap<u32, u32>,
+    codex_thread: Option<&str>,
 ) -> Result<&'a Session, CliError> {
     let mut current = pid;
     let mut seen = std::collections::HashSet::new();
     while current > 1 && seen.insert(current) {
         let mut matches = sessions.iter().filter(|session| session.pid == current);
         if let Some(session) = matches.next() {
+            if let Some(thread) = codex_thread
+                && session.provider == Provider::Codex
+            {
+                let mut selected = sessions.iter().filter(|s| {
+                    s.pid == current && s.provider == Provider::Codex && s.session_id == thread
+                });
+                if let Some(selected_session) = selected.next()
+                    && selected.next().is_none()
+                {
+                    return Ok(selected_session);
+                }
+                return Err(CliError::denied(
+                    "CODEX_THREAD_ID does not identify a unique thread on the calling Codex process",
+                ));
+            }
             if matches.next().is_some() {
                 return Err(CliError::denied(
                     "calling process matches multiple agent sessions; refresh session discovery before sending",
@@ -1532,21 +1531,16 @@ fn resolve_caller<'a>(
     ))
 }
 
-fn current_tmux_pane_id() -> Option<String> {
-    std::env::var("TMUX_PANE")
-        .ok()
-        .filter(|p| !p.trim().is_empty())
-        .or_else(|| {
-            let out = Command::new("tmux")
-                .args(["display-message", "-p", "#{pane_id}"])
-                .output()
-                .ok()?;
-            if !out.status.success() {
-                return None;
-            }
-            let pane = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            (!pane.is_empty()).then_some(pane)
-        })
+fn resolve_current_caller<'a>(
+    sessions: &'a [Session],
+    parents: &HashMap<u32, u32>,
+) -> Result<&'a Session, CliError> {
+    let thread = std::env::var("CODEX_THREAD_ID").ok();
+    resolve_caller(sessions, std::process::id(), parents, thread.as_deref())
+}
+
+fn same_session(a: &Session, b: &Session) -> bool {
+    a.provider == b.provider && a.pid == b.pid && a.session_id == b.session_id
 }
 
 #[derive(Serialize)]
@@ -1662,7 +1656,9 @@ mod tests {
         let sessions = vec![other, caller];
         let parents = HashMap::from([(400, 350), (350, 200), (200, 300)]);
         assert_eq!(
-            resolve_caller(&sessions, 400, &parents).unwrap().session_id,
+            resolve_caller(&sessions, 400, &parents, None)
+                .unwrap()
+                .session_id,
             "caller"
         );
     }
@@ -1672,15 +1668,70 @@ mod tests {
         let caller = session(AttentionState::Working);
         let sessions = vec![caller.clone(), caller];
         let parents = HashMap::from([(400, 123)]);
-        assert!(resolve_caller(&sessions, 400, &parents).is_err());
-        assert!(resolve_caller(&sessions[..1], 400, &HashMap::new()).is_err());
+        assert!(resolve_caller(&sessions, 400, &parents, None).is_err());
+        assert!(resolve_caller(&sessions[..1], 400, &HashMap::new(), None).is_err());
         assert!(
             resolve_caller(
                 &sessions[..1],
                 400,
-                &HashMap::from([(400, 401), (401, 400)])
+                &HashMap::from([(400, 401), (401, 400)]),
+                None
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn codex_thread_hint_selects_a_sibling_on_the_nearest_host() {
+        let mut first = session(AttentionState::Working);
+        first.provider = Provider::Codex;
+        first.session_id = "first".into();
+        let mut second = first.clone();
+        second.session_id = "second".into();
+        let sessions = vec![first, second];
+        let parents = HashMap::from([(400, 123)]);
+        for thread in ["first", "second"] {
+            assert_eq!(
+                resolve_caller(&sessions, 400, &parents, Some(thread))
+                    .unwrap()
+                    .session_id,
+                thread
+            );
+        }
+        assert!(resolve_caller(&sessions, 400, &parents, None).is_err());
+        assert!(resolve_caller(&sessions, 400, &parents, Some("stale")).is_err());
+        assert!(resolve_caller(&sessions[..1], 400, &parents, Some("second")).is_err());
+    }
+
+    #[test]
+    fn codex_thread_hint_cannot_select_a_different_process() {
+        let mut caller = session(AttentionState::Working);
+        caller.provider = Provider::Codex;
+        caller.session_id = "caller".into();
+        let mut other = caller.clone();
+        other.pid = 200;
+        other.session_id = "other".into();
+        let sessions = vec![caller, other];
+        assert!(
+            resolve_caller(
+                &sessions,
+                400,
+                &HashMap::from([(400, 123), (123, 200)]),
+                Some("other")
+            )
+            .is_err()
+        );
+        assert!(resolve_caller(&sessions, 400, &HashMap::new(), Some("caller")).is_err());
+    }
+
+    #[test]
+    fn codex_thread_hint_does_not_override_a_nearer_claude_caller() {
+        let caller = session(AttentionState::Working);
+        assert_eq!(
+            resolve_caller(&[caller], 400, &HashMap::from([(400, 123)]), Some("other"))
+                .unwrap()
+                .provider,
+            Provider::Claude
         );
     }
 

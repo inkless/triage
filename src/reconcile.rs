@@ -237,23 +237,25 @@ pub fn reconcile_all(store: &Store) -> io::Result<()> {
     bounce_for_dead_hosts(store)
 }
 
-fn dead_marker(store: &Store, host: HostId) -> PathBuf {
+fn dead_marker(store: &Store, host: HostId, record: &crate::mailbox::HostRecord) -> PathBuf {
+    let suffix = match record.provider {
+        crate::models::Provider::Claude => String::new(),
+        crate::models::Provider::Codex => format!("@{}", record.current_session),
+    };
     store
         .root()
         .join("hosts")
-        .join(format!("{}-{}.dead", host.pid, host.start))
+        .join(format!("{}-{}{suffix}.dead", host.pid, host.start))
 }
 
 fn bounce_for_dead_hosts(store: &Store) -> io::Result<()> {
     let now = mailbox::now_ms();
     let hosts = store.hosts();
-    let agent_of = |current: &str| {
-        store
-            .lineage_root(current)
-            .unwrap_or_else(|| current.to_string())
+    let agent_of = |record: &crate::mailbox::HostRecord| {
+        store.agent_for(record.provider, &record.current_session)
     };
     for (host, record) in &hosts {
-        let marker = dead_marker(store, *host);
+        let marker = dead_marker(store, *host, record);
         match mailbox::liveness(*host) {
             Liveness::Alive => {
                 let _ = fs::remove_file(&marker);
@@ -272,16 +274,16 @@ fn bounce_for_dead_hosts(store: &Store) -> io::Result<()> {
         if now.saturating_sub(dead_since) < DEAD_HOST_BOUNCE_MS {
             continue;
         }
-        let agent = agent_of(&record.current_session);
+        let agent = agent_of(record);
         let live_elsewhere = hosts.iter().any(|(other, r)| {
-            other != host
-                && agent_of(&r.current_session) == agent
+            (other != host || r.current_session != record.current_session)
+                && agent_of(r) == agent
                 && mailbox::liveness(*other) != Liveness::Dead
         });
         if !live_elsewhere {
             bounce_pending(store, &store.mailbox(&agent)?, &agent, record.provider)?;
         }
-        store.remove_host(*host)?;
+        store.remove_host_record(*host, record)?;
         let _ = fs::remove_file(&marker);
     }
     Ok(())

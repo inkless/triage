@@ -52,11 +52,7 @@ pub fn collect(store: &Store) -> Vec<Entry> {
     let linked: std::collections::HashSet<String> = store
         .hosts()
         .into_iter()
-        .map(|(_, r)| {
-            store
-                .lineage_root(&r.current_session)
-                .unwrap_or(r.current_session)
-        })
+        .map(|(_, r)| store.agent_for(r.provider, &r.current_session))
         .collect();
     let mut entries = Vec::new();
     for agent in store.agents() {

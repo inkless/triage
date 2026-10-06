@@ -74,6 +74,7 @@ esac
             .env("HOME", &dir)
             .env("PATH", &dir)
             .env("TMUX_PANE", "%other")
+            .env_remove("CODEX_THREAD_ID")
             .env("TRIAGE_AGENT", "wrong-sender")
             .env("FIXTURE_PID", std::process::id().to_string())
             .env("FIXTURE_ROLLOUT", &rollout)
