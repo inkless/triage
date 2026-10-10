@@ -1,0 +1,7 @@
+────────────────────────────────────────
+☐ Layout
+│ Use that long-term layout? Event parsing goes to src/utils/pr-event/,
+│ the rules to src/pr-policy/builtins/, and hasApproval to src/pr-policy/approvers.ts.
+❯ 1. Yes
+  2. No
+Esc to cancel · Tab to amend

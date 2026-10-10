@@ -198,7 +198,7 @@ fn scan_blocked_panes(sessions: &mut [Session]) {
         .filter_map(|s| s.pane.as_ref().map(|pane| pane.target.clone()))
         .filter(|target| seen_targets.insert(target.clone()))
         .collect::<Vec<_>>();
-    let claude_captures = tmux::capture_pane_tails(&claude_targets, 15);
+    let claude_captures = tmux::capture_panes_visible(&claude_targets);
 
     apply_claude_pane_captures(sessions, &claude_captures);
 
@@ -219,7 +219,8 @@ fn apply_claude_pane_captures(sessions: &mut [Session], captures: &HashMap<Strin
     for s in sessions.iter_mut().filter(|s| should_scan_claude_pane(s)) {
         if let Some(pane) = &s.pane
             && let Some(content) = captures.get(&pane.target)
-            && tmux::has_pending_permission_prompt(content)
+            && (tmux::has_pending_permission_prompt(content)
+                || tmux::has_claude_user_choice_prompt(content))
         {
             s.pane_blocked = true;
         }
@@ -474,5 +475,57 @@ mod tests {
         apply_claude_pane_captures(std::slice::from_mut(&mut session), &captures);
 
         assert!(session.pane_blocked);
+    }
+
+    #[test]
+    fn user_question_without_yes_options_still_needs_attention() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        if std::env::var_os("TRIAGE_TALL_QUESTION_FIXTURE").is_some() {
+            let mut session = claude_session("/repo/ux", None, None);
+            session.status = "idle".to_string();
+            session.pane = Some(pane(1, "%1", "/repo/ux", "claude", "agent"));
+            scan_blocked_panes(std::slice::from_mut(&mut session));
+            assert!(session.pane_blocked);
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("triage-tall-question-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let question = format!(
+            "☐ Layout\n{}❯ 1. Keep current layout\n  2. Move the files\nEsc to cancel\n",
+            "Detailed question context\n".repeat(30)
+        );
+        fs::write(root.join("question"), question).unwrap();
+        let tmux = root.join("tmux");
+        fs::write(
+            &tmux,
+            r#"#!/bin/sh
+printf '__TRIAGE_CAPTURE_0__\n'
+case "$*" in
+*'-S -15'*) /usr/bin/tail -n 15 "$TRIAGE_TALL_QUESTION_FIXTURE/question" ;;
+*) /bin/cat "$TRIAGE_TALL_QUESTION_FIXTURE/question" ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(tmux, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "snapshot::tests::user_question_without_yes_options_still_needs_attention",
+                "--nocapture",
+            ])
+            .env("PATH", &root)
+            .env("TRIAGE_TALL_QUESTION_FIXTURE", &root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

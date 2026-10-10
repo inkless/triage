@@ -1,0 +1,9 @@
+────────────────────────────────────────
+Tool use
+jira — Create issue Tool: (MCP)
+summary: Create a development issue
+Permission rule mcp__jira__createJiraIssue requires confirmation for this tool.
+❯ 1. Yes
+  2. Yes, and don't ask again
+  3. No
+Esc to cancel · Tab to amend

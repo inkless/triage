@@ -13,6 +13,7 @@ use crate::models::Provider;
 /// cleanup trap (cancelled tool call, SIGKILL, crash). We auto-delete on read
 /// so orphaned files don't keep showing a fake pending approval.
 const PENDING_TTL: Duration = Duration::from_secs(30);
+const CLAIMED_PENDING_TTL: Duration = Duration::from_secs(70);
 
 /// Single tool-use approval request the hook is waiting on.
 #[derive(Debug, Clone)]
@@ -81,10 +82,6 @@ impl PendingApproval {
 pub fn triage_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
     PathBuf::from(home).join(".claude/triage")
-}
-
-pub fn pending_dir() -> PathBuf {
-    triage_dir().join("pending")
 }
 
 pub fn decisions_dir() -> PathBuf {
@@ -201,16 +198,15 @@ fn current_pane_id() -> Option<String> {
 /// file means triage just won't surface it (the hook will time out and Claude
 /// will fall back to its own prompt).
 ///
-/// Side effect: deletes pending files older than `PENDING_TTL`. The hook
-/// itself falls back after a few seconds, so anything that survives longer is
-/// from a process that died without running its cleanup trap (cancelled tool
-/// call, SIGKILL, crash).
 pub fn read_pending() -> Vec<PendingApproval> {
-    let dir = pending_dir();
+    read_pending_at(&triage_dir(), SystemTime::now())
+}
+
+fn read_pending_at(root: &Path, now: SystemTime) -> Vec<PendingApproval> {
+    let dir = root.join("pending");
     let Ok(entries) = fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let now = SystemTime::now();
     let mut out = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -224,12 +220,14 @@ pub fn read_pending() -> Vec<PendingApproval> {
             .metadata()
             .and_then(|m| m.created().or_else(|_| m.modified()))
             .unwrap_or(now);
-        if now
-            .duration_since(created_at)
-            .is_ok_and(|age| age > PENDING_TTL)
-        {
+        let ttl = if root.join("claims").join(format!("{uuid}.json")).exists() {
+            CLAIMED_PENDING_TTL
+        } else {
+            PENDING_TTL
+        };
+        if now.duration_since(created_at).is_ok_and(|age| age > ttl) {
             let _ = fs::remove_file(&path);
-            let _ = fs::remove_file(decisions_dir().join(format!("{uuid}.json")));
+            let _ = fs::remove_file(root.join("decisions").join(format!("{uuid}.json")));
             continue;
         }
         let Ok(bytes) = fs::read(&path) else { continue };
@@ -1266,6 +1264,38 @@ fn expand_tilde(p: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claimed_permissions_survive_the_hook_wait_but_have_bounded_expiry() {
+        let root = std::env::temp_dir().join(format!("triage-pending-ttl-{}", std::process::id()));
+        fs::create_dir_all(root.join("pending")).unwrap();
+        fs::create_dir_all(root.join("claims")).unwrap();
+        let path = root.join("pending/claimed.json");
+        fs::write(
+            &path,
+            r#"{"session_id":"session","tool_name":"Bash","tool_input":{"command":"cargo test"}}"#,
+        )
+        .unwrap();
+        let created = path.metadata().unwrap().created().unwrap();
+        fs::write(root.join("claims/claimed.json"), "{}").unwrap();
+        assert_eq!(
+            read_pending_at(&root, created + Duration::from_secs(40)).len(),
+            1
+        );
+        assert!(path.exists());
+        assert!(read_pending_at(&root, created + Duration::from_secs(71)).is_empty());
+        assert!(!path.exists());
+        fs::write(root.join("pending/unclaimed.json"), "{}").unwrap();
+        let created = root
+            .join("pending/unclaimed.json")
+            .metadata()
+            .unwrap()
+            .created()
+            .unwrap();
+        assert!(read_pending_at(&root, created + Duration::from_secs(31)).is_empty());
+        assert!(!root.join("pending/unclaimed.json").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
     use serde_json::json;
 
     const TRIAGE: &str = "/opt/homebrew/bin/triage";

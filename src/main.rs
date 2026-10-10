@@ -1113,54 +1113,100 @@ fn is_auto_auditable_blocked(s: &models::Session) -> bool {
     ) && s.state == models::AttentionState::Blocked
 }
 
-fn audit_payload_for_session(s: &models::Session) -> Option<(String, String)> {
+#[derive(Debug)]
+struct AutoAuditPayload {
+    tool_name: String,
+    tool_input: String,
+    pending: Option<approval::PendingApproval>,
+    claude_prompt: Option<tmux::ClaudePermissionPrompt>,
+}
+
+fn audit_payload_for_session(
+    s: &models::Session,
+    mode: models::ApprovalMode,
+) -> Option<AutoAuditPayload> {
     match s.provider {
-        models::Provider::Claude => audit_payload_for_claude(s),
-        models::Provider::Codex => audit_payload_for_codex(s),
+        models::Provider::Claude => audit_payload_for_claude(s, mode),
+        models::Provider::Codex => {
+            audit_payload_for_codex(s).map(|(tool_name, tool_input)| AutoAuditPayload {
+                tool_name,
+                tool_input,
+                pending: None,
+                claude_prompt: None,
+            })
+        }
     }
 }
 
 fn is_auto_auditable_claude_tool(tool_name: &str) -> bool {
-    // User-choice prompts are semantic decisions, not permission requests.
-    // Auto-selecting even the currently highlighted option can change scope.
-    tool_name != "AskUserQuestion"
+    !matches!(
+        tool_name
+            .rsplit(['.', ':'])
+            .next()
+            .unwrap_or(tool_name)
+            .to_ascii_lowercase()
+            .as_str(),
+        "askuserquestion" | "userquestion" | "request_user_input" | "request_user_input_async"
+    )
 }
 
-fn audit_payload_for_claude(s: &models::Session) -> Option<(String, String)> {
-    // Prefer hook-captured (richer, structured, FULL untruncated input).
-    // When the hook didn't fire (timed out for a stale Blocked, or the
-    // session is in `permission_mode=auto` so the hook bailed), do a fresh
-    // pane capture and parse the full pending command, not the UI brief.
-    if let Some(a) = s.pending_approvals.first() {
-        if !is_auto_auditable_claude_tool(&a.tool_name) {
-            return None;
-        }
-        return Some((a.tool_name.clone(), a.tool_input_full.clone()));
-    }
-    if let Some(pane) = &s.pane
-        && let Some(content) = tmux::capture_pane(&pane.target)
-        && let Some(full_input) = tmux::parse_pending_full(&content)
-    {
-        let tool_name = s
-            .last_tool_use
-            .as_ref()
-            .map(|(n, _)| n.clone())
-            .or_else(|| {
-                s.waiting_for
-                    .as_deref()
-                    .and_then(|w| w.strip_prefix("approve "))
-                    .map(String::from)
-            })
-            .unwrap_or_else(|| "?".to_string());
-        if !is_auto_auditable_claude_tool(&tool_name) {
-            return None;
-        }
-        return Some((tool_name, full_input));
-    }
-    s.last_tool_use
+fn audit_payload_for_claude(
+    s: &models::Session,
+    mode: models::ApprovalMode,
+) -> Option<AutoAuditPayload> {
+    let content = s
+        .pane
         .as_ref()
-        .filter(|(name, _)| is_auto_auditable_claude_tool(name))
-        .map(|(name, brief)| (name.clone(), brief.clone()))
+        .and_then(|pane| tmux::capture_pane_visible_ansi(&pane.target));
+    claude_audit_payload(s, content.as_deref(), mode)
+}
+
+fn claude_audit_payload(
+    s: &models::Session,
+    content: Option<&str>,
+    mode: models::ApprovalMode,
+) -> Option<AutoAuditPayload> {
+    if content.is_some_and(tmux::has_claude_user_choice_prompt) {
+        return None;
+    }
+    let claude_prompt = content.and_then(tmux::claude_permission_prompt);
+    if mode == models::ApprovalMode::Hook
+        && let Some(pending) = s
+            .pending_approvals
+            .iter()
+            .find(|pending| pending.session_id == s.session_id && pending.cwd == s.cwd)
+    {
+        if !is_auto_auditable_claude_tool(&pending.tool_name) {
+            return None;
+        }
+        return Some(AutoAuditPayload {
+            tool_name: pending.tool_name.clone(),
+            tool_input: pending.tool_input_full.clone(),
+            pending: Some(pending.clone()),
+            claude_prompt,
+        });
+    }
+    let prompt = claude_prompt?;
+    let tool_name = s
+        .last_tool_use
+        .as_ref()
+        .map(|(name, _)| name.clone())
+        .or_else(|| {
+            s.waiting_for
+                .as_deref()
+                .and_then(|w| w.strip_prefix("approve "))
+                .map(String::from)
+        })
+        .unwrap_or_else(|| "?".to_string());
+    if !is_auto_auditable_claude_tool(&tool_name) {
+        return None;
+    }
+    Some(AutoAuditPayload {
+        tool_name,
+        tool_input: prompt.body.clone(),
+        pending: None,
+        claude_prompt: Some(prompt),
+    })
 }
 
 fn audit_payload_for_codex(s: &models::Session) -> Option<(String, String)> {
@@ -1278,9 +1324,15 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         if app.audit_decided.contains(&key) {
             continue;
         }
-        let Some((tool_name, tool_input)) = audit_payload_for_session(s) else {
+        let Some(payload) = audit_payload_for_session(s, app.approval_mode) else {
             continue;
         };
+        if s.provider == models::Provider::Claude
+            && (app.approval_mode != models::ApprovalMode::Hook || payload.pending.is_none())
+            && payload.claude_prompt.is_none()
+        {
+            continue;
+        }
         let intent = s
             .last_prompt
             .clone()
@@ -1296,7 +1348,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         // synchronously (so the decision file lands BEFORE remove_claim
         // signals the hook). The hook path needs the uuid; tmux fallback
         // needs the pane target; we capture both and let the worker pick.
-        let uuid = s.pending_approvals.first().map(|a| a.uuid.clone());
+        let uuid = payload.pending.as_ref().map(|a| a.uuid.clone());
         let pane_target = s.pane.as_ref().map(|p| p.target.clone());
         let provider = s.provider;
         let approval_mode = app.approval_mode;
@@ -1313,8 +1365,8 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
                 &cwd,
                 recent_recap.as_deref(),
                 &intent,
-                &tool_name,
-                &tool_input,
+                &payload.tool_name,
+                &payload.tool_input,
             );
             // Route APPROVE/DENY here so the decision file lands BEFORE
             // remove_claim. WAIT writes nothing — the hook sees claim removal
@@ -1322,26 +1374,13 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
             // no hook path, so route it through the same fresh prompt check
             // as manual `a`/`d`.
             let route_result = match (provider, v.decision.as_str()) {
-                (models::Provider::Claude, "APPROVE") => {
-                    route_decision(
-                        approval_mode,
-                        uuid.as_deref(),
-                        pane_target.as_deref(),
-                        true,
-                        &v.reason,
-                    );
-                    Ok(())
-                }
-                (models::Provider::Claude, "DENY") => {
-                    route_decision(
-                        approval_mode,
-                        uuid.as_deref(),
-                        pane_target.as_deref(),
-                        false,
-                        &v.reason,
-                    );
-                    Ok(())
-                }
+                (models::Provider::Claude, "APPROVE" | "DENY") => route_auto_claude_decision(
+                    approval_mode,
+                    &payload,
+                    pane_target.as_deref(),
+                    v.decision == "APPROVE",
+                    &v.reason,
+                ),
                 (models::Provider::Codex, "APPROVE") => {
                     if let Some(target) = pane_target.as_deref() {
                         route_codex_decision(target, true)
@@ -1371,33 +1410,80 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
     }
 }
 
-/// Route the auditor's APPROVE/DENY through the same machinery as manual
-/// `a`/`d`. Runs in the auditor's worker thread (not the main thread) so the
-/// decision file lands BEFORE `remove_claim` signals the hook — otherwise the
-/// hook would react to claim removal and bail to Claude's native flow before
-/// our decision had a chance to be picked up. Takes captured-by-value fields
-/// instead of `&Session` because the session list is local to the main
-/// thread's refresh and may be gone by the time the auditor returns.
-fn route_decision(
+fn route_auto_claude_decision(
     mode: models::ApprovalMode,
-    uuid: Option<&str>,
-    pane_target: Option<&str>,
+    payload: &AutoAuditPayload,
+    target: Option<&str>,
     approve: bool,
     reason: &str,
-) {
-    if mode == models::ApprovalMode::Hook
-        && let Some(uuid) = uuid
-    {
-        if approve {
-            approval::approve(uuid);
-        } else {
-            approval::deny(uuid, reason);
-        }
-        return;
+) -> Result<(), String> {
+    let content = target.and_then(tmux::capture_pane_visible_ansi);
+    if target.is_some() && content.is_none() {
+        return Err("permission capture failed".to_string());
     }
-    let Some(target) = pane_target else { return };
-    let keys: &[&str] = if approve { &["Enter"] } else { &["Escape"] };
-    let _ = tmux::send_keys(target, keys);
+    if content
+        .as_deref()
+        .is_some_and(tmux::has_claude_user_choice_prompt)
+    {
+        return Err("user-choice prompt is visible".to_string());
+    }
+    if mode == models::ApprovalMode::Hook
+        && let Some(expected) = &payload.pending
+    {
+        let pending = approval::read_pending();
+        if !pending
+            .iter()
+            .any(|current| same_pending_permission(expected, current))
+        {
+            return Err("hook permission changed or ended".to_string());
+        }
+        if approve {
+            approval::approve(&expected.uuid);
+        } else {
+            approval::deny(&expected.uuid, reason);
+        }
+        return Ok(());
+    }
+    let expected = payload
+        .claude_prompt
+        .as_ref()
+        .ok_or("no audited pane permission")?;
+    let current = content
+        .as_deref()
+        .and_then(tmux::claude_permission_prompt)
+        .ok_or("permission prompt no longer visible")?;
+    validate_claude_auto_route(expected, &current, approve)?;
+    tmux::send_keys(
+        target.ok_or("session has no pane")?,
+        &[if approve { "Enter" } else { "Escape" }],
+    )
+    .map_err(|e| e.to_string())
+}
+
+fn same_pending_permission(
+    expected: &approval::PendingApproval,
+    current: &approval::PendingApproval,
+) -> bool {
+    expected.uuid == current.uuid
+        && expected.session_id == current.session_id
+        && expected.cwd == current.cwd
+        && expected.tool_name == current.tool_name
+        && expected.tool_input_full == current.tool_input_full
+        && is_auto_auditable_claude_tool(&current.tool_name)
+}
+
+fn validate_claude_auto_route(
+    expected: &tmux::ClaudePermissionPrompt,
+    current: &tmux::ClaudePermissionPrompt,
+    approve: bool,
+) -> Result<(), String> {
+    if expected.body != current.body {
+        return Err("permission action changed during audit".to_string());
+    }
+    if approve && !current.approval_selected {
+        return Err("an approval option is not selected".to_string());
+    }
+    Ok(())
 }
 
 fn setup_terminal() -> io::Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -1680,6 +1766,296 @@ mod tests {
         assert!(audit_verdict_needs_attention("WAIT"));
     }
 
+    fn auto_test_session() -> Session {
+        Session::new(
+            Provider::Claude,
+            123,
+            "test-session".into(),
+            PathBuf::from("/repo"),
+            None,
+            "waiting".into(),
+            1,
+            2,
+            None,
+        )
+    }
+
+    #[test]
+    fn pane_questions_are_excluded_with_unknown_stale_and_hook_metadata() {
+        for name in [
+            "UserQuestion",
+            "ASKUSERQUESTION",
+            "functions.request_user_input",
+            "tools:AskUserQuestion",
+            "request_user_input_async",
+        ] {
+            assert!(!is_auto_auditable_claude_tool(name), "{name}");
+        }
+        let mut session = auto_test_session();
+        let shell = include_str!("../tests/fixtures/claude-prompts/shell.txt");
+        let questions = [
+            include_str!("../tests/fixtures/claude-prompts/layout-question.txt"),
+            include_str!("../tests/fixtures/claude-prompts/comment-question.txt"),
+            include_str!("../tests/fixtures/claude-prompts/multi-question.txt"),
+        ];
+        for name in [
+            "?",
+            "Bash",
+            "AskUserQuestion",
+            "UserQuestion",
+            "functions.request_user_input",
+        ] {
+            session.last_tool_use = Some((name.into(), "old command".into()));
+            for question in questions {
+                assert!(
+                    super::claude_audit_payload(
+                        &session,
+                        Some(question),
+                        crate::models::ApprovalMode::Hook
+                    )
+                    .is_none()
+                );
+            }
+            assert!(
+                super::claude_audit_payload(&session, None, crate::models::ApprovalMode::Hook)
+                    .is_none()
+            );
+        }
+        session.last_tool_use = Some(("Bash".into(), "old command".into()));
+        let allowed =
+            super::claude_audit_payload(&session, Some(shell), crate::models::ApprovalMode::Tmux)
+                .unwrap();
+        assert!(allowed.tool_input.contains("cargo test"));
+        assert!(!allowed.tool_input.contains("old command"));
+        session.last_tool_use = None;
+        assert_eq!(
+            super::claude_audit_payload(&session, Some(shell), crate::models::ApprovalMode::Tmux)
+                .unwrap()
+                .tool_name,
+            "?"
+        );
+        session.pending_approvals.push(PendingApproval {
+            uuid: "permission".into(),
+            session_id: "test-session".into(),
+            cwd: PathBuf::from("/repo"),
+            tool_name: "Bash".into(),
+            tool_input_brief: "cargo test".into(),
+            tool_input_full: r#"{"command":"cargo test"}"#.into(),
+            created_at: SystemTime::now(),
+            pending_path: PathBuf::new(),
+        });
+        for question in questions {
+            assert!(
+                super::claude_audit_payload(
+                    &session,
+                    Some(question),
+                    crate::models::ApprovalMode::Hook
+                )
+                .is_none()
+            );
+        }
+        let visible = shell.replace("cargo test", "git push --force");
+        let pane_payload = super::claude_audit_payload(
+            &session,
+            Some(&visible),
+            crate::models::ApprovalMode::Tmux,
+        )
+        .unwrap();
+        assert!(pane_payload.pending.is_none());
+        assert!(pane_payload.tool_input.contains("git push --force"));
+        assert!(!pane_payload.tool_input.contains("cargo test"));
+        session.pending_approvals[0].session_id = "another-session".into();
+        let hook_mode = super::claude_audit_payload(
+            &session,
+            Some(&visible),
+            crate::models::ApprovalMode::Hook,
+        )
+        .unwrap();
+        assert!(hook_mode.pending.is_none());
+        assert!(hook_mode.tool_input.contains("git push --force"));
+        session.pending_approvals[0].session_id = session.session_id.clone();
+        for name in [
+            "UserQuestion",
+            "functions.request_user_input",
+            "tools:ASKUSERQUESTION",
+        ] {
+            session.last_tool_use = Some((name.into(), "command".into()));
+            assert!(
+                super::claude_audit_payload(
+                    &session,
+                    Some(shell),
+                    crate::models::ApprovalMode::Tmux
+                )
+                .is_none()
+            );
+            session.pending_approvals[0].tool_name = name.into();
+            assert!(
+                super::claude_audit_payload(&session, None, crate::models::ApprovalMode::Hook)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_claude_routing_sends_no_input_to_changed_or_question_prompts() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        use std::process::Command as ProcessCommand;
+        if let Ok(root) = std::env::var("TRIAGE_AUTO_ROUTE_TEST_ROOT") {
+            let scenario = std::env::var("TRIAGE_AUTO_ROUTE_SCENARIO").unwrap();
+            let shell = include_str!("../tests/fixtures/claude-prompts/shell.txt");
+            let mut payload = super::claude_audit_payload(
+                &auto_test_session(),
+                Some(shell),
+                crate::models::ApprovalMode::Tmux,
+            )
+            .unwrap();
+            let mode = if scenario.starts_with("hook-") {
+                crate::models::ApprovalMode::Hook
+            } else {
+                crate::models::ApprovalMode::Tmux
+            };
+            if mode == crate::models::ApprovalMode::Hook {
+                payload.pending = Some(PendingApproval {
+                    uuid: "permission".into(),
+                    session_id: "test-session".into(),
+                    cwd: PathBuf::from("/repo"),
+                    tool_name: "Bash".into(),
+                    tool_input_brief: "cargo test".into(),
+                    tool_input_full: r#"{"command":"cargo test"}"#.into(),
+                    created_at: SystemTime::now(),
+                    pending_path: PathBuf::new(),
+                });
+            }
+            let approve = !scenario.ends_with("deny");
+            let result = super::route_auto_claude_decision(
+                mode,
+                &payload,
+                Some("fixture:1.0"),
+                approve,
+                "test reason",
+            );
+            fs::write(
+                PathBuf::from(root).join("result"),
+                if result.is_ok() { "applied" } else { "refused" },
+            )
+            .unwrap();
+            return;
+        }
+        let shell = include_str!("../tests/fixtures/claude-prompts/shell.txt");
+        let question = include_str!("../tests/fixtures/claude-prompts/layout-question.txt");
+        let no = shell
+            .replace("❯ 1. Yes", "  1. Yes")
+            .replace("  3. No", "❯ 3. No");
+        let changed = shell.replace("cargo test", "git push");
+        let quoted = shell
+            .lines()
+            .map(|line| format!("│ {line}\n"))
+            .collect::<String>();
+        for (scenario, content, expected) in [
+            ("approve", shell, "Enter"),
+            ("deny", shell, "Escape"),
+            ("question", question, ""),
+            ("question-deny", question, ""),
+            ("changed", changed.as_str(), ""),
+            ("no-selected", no.as_str(), ""),
+            ("dismissed", "❯ empty composer\n", ""),
+            ("unreadable", shell, ""),
+            ("quoted", quoted.as_str(), ""),
+            ("hook-approve", shell, "hook"),
+            ("hook-deny", shell, "hook"),
+            ("hook-session", shell, ""),
+            ("hook-cwd", shell, ""),
+            ("hook-tool", shell, ""),
+            ("hook-uuid", shell, ""),
+            ("hook-question", question, ""),
+            ("hook-question-deny", question, ""),
+            ("hook-changed", shell, ""),
+            ("hook-ended", shell, ""),
+            ("hook-unreadable", shell, ""),
+        ] {
+            let dir = std::env::temp_dir().join(format!(
+                "triage-auto-route-{}-{scenario}",
+                std::process::id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("current.txt"), content).unwrap();
+            let tmux = dir.join("tmux");
+            fs::write(
+                &tmux,
+                r#"#!/bin/sh
+case "$1" in
+capture-pane)
+ case "$TRIAGE_AUTO_ROUTE_SCENARIO" in *unreadable) exit 1;; esac
+ /bin/cat "$TRIAGE_AUTO_ROUTE_TEST_ROOT/current.txt" ;;
+send-keys) printf '%s\n' "$*" >> "$TRIAGE_AUTO_ROUTE_TEST_ROOT/keys" ;;
+esac
+"#,
+            )
+            .unwrap();
+            fs::set_permissions(&tmux, fs::Permissions::from_mode(0o755)).unwrap();
+            if scenario.starts_with("hook-") && scenario != "hook-ended" {
+                let pending = dir.join(".claude/triage/pending");
+                fs::create_dir_all(&pending).unwrap();
+                fs::write(pending.join(if scenario == "hook-uuid" { "other.json" } else { "permission.json" }), serde_json::json!({"session_id": if scenario == "hook-session" { "another-session" } else { "test-session" }, "cwd": if scenario == "hook-cwd" { "/other" } else { "/repo" }, "tool_name": if scenario == "hook-tool" { "Edit" } else { "Bash" }, "tool_input":{"command": if scenario == "hook-changed" { "git push" } else { "cargo test" }}}).to_string()).unwrap();
+            }
+            let output = ProcessCommand::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "tests::automatic_claude_routing_sends_no_input_to_changed_or_question_prompts",
+                    "--nocapture",
+                ])
+                .env("TRIAGE_AUTO_ROUTE_TEST_ROOT", &dir)
+                .env("TRIAGE_AUTO_ROUTE_SCENARIO", scenario)
+                .env("HOME", &dir)
+                .env("PATH", &dir)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{scenario}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let keys = fs::read_to_string(dir.join("keys")).unwrap_or_default();
+            let decision = dir.join(".claude/triage/decisions/permission.json");
+            assert_eq!(
+                fs::read_to_string(dir.join("result")).unwrap(),
+                if expected.is_empty() {
+                    "refused"
+                } else {
+                    "applied"
+                },
+                "{scenario}"
+            );
+            if expected == "hook" {
+                assert!(keys.is_empty());
+                let record: serde_json::Value =
+                    serde_json::from_slice(&fs::read(decision).unwrap()).unwrap();
+                assert_eq!(
+                    record["decision"],
+                    if scenario.ends_with("deny") {
+                        "block"
+                    } else {
+                        "approve"
+                    }
+                );
+                if scenario.ends_with("deny") {
+                    assert_eq!(record["reason"], "test reason");
+                }
+            } else if expected.is_empty() {
+                assert!(keys.is_empty(), "{scenario}: {keys}");
+                assert!(!decision.exists(), "{scenario}");
+            } else {
+                assert!(
+                    keys.ends_with(&format!("{expected}\n")),
+                    "{scenario}: {keys}"
+                );
+                assert!(!decision.exists());
+            }
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
     #[test]
     fn user_choice_prompts_are_never_auto_audited() {
         assert!(!is_auto_auditable_claude_tool("AskUserQuestion"));
@@ -1708,11 +2084,12 @@ mod tests {
             pending_path: PathBuf::from("/tmp/choice.json"),
         });
 
-        assert_eq!(audit_payload_for_claude(&session), None);
+        assert!(audit_payload_for_claude(&session, crate::models::ApprovalMode::Hook).is_none());
 
         session.pending_approvals[0].tool_name = "Bash".to_string();
         assert_eq!(
-            audit_payload_for_claude(&session),
+            audit_payload_for_claude(&session, crate::models::ApprovalMode::Hook)
+                .map(|p| (p.tool_name, p.tool_input)),
             Some(("Bash".to_string(), r#"{"questions":[]}"#.to_string()))
         );
     }
