@@ -604,11 +604,19 @@ pub fn capture_pane_tail(target: &str, lines: u32) -> Option<String> {
 /// pane would push the refresh path beyond its latency budget, so issue a
 /// command sequence with marker lines and split the combined output.
 pub fn capture_pane_tails(targets: &[String], lines: u32) -> HashMap<String, String> {
+    capture_panes(targets, Some(lines))
+}
+
+pub fn capture_panes_visible(targets: &[String]) -> HashMap<String, String> {
+    capture_panes(targets, None)
+}
+
+fn capture_panes(targets: &[String], lines: Option<u32>) -> HashMap<String, String> {
     if targets.is_empty() {
         return HashMap::new();
     }
 
-    let start = format!("-{lines}");
+    let start = lines.map(|lines| format!("-{lines}"));
     let mut command = Command::new("tmux");
     for (index, target) in targets.iter().enumerate() {
         if index > 0 {
@@ -622,7 +630,11 @@ pub fn capture_pane_tails(targets: &[String], lines: u32) -> HashMap<String, Str
             &batch_capture_marker(index),
         ]);
         command.arg(";");
-        command.args(["capture-pane", "-p", "-S", &start, "-t", target]);
+        command.args(["capture-pane", "-p"]);
+        if let Some(start) = &start {
+            command.args(["-S", start]);
+        }
+        command.args(["-t", target]);
     }
 
     let Ok(output) = command.output() else {
@@ -700,6 +712,67 @@ pub fn capture_pane_visible_ansi(target: &str) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudePermissionPrompt {
+    pub body: String,
+    pub approval_selected: bool,
+}
+
+pub fn has_claude_user_choice_prompt(pane: &str) -> bool {
+    strip_ansi(pane).lines().any(|line| {
+        let line = line.trim();
+        line.starts_with('☐')
+            || line.starts_with('☒')
+            || (line.starts_with('←') && line.contains("✔ Submit") && line.ends_with('→'))
+    })
+}
+
+pub fn claude_permission_prompt(pane: &str) -> Option<ClaudePermissionPrompt> {
+    let plain = strip_ansi(pane);
+    if has_claude_user_choice_prompt(&plain) {
+        return None;
+    }
+    let lines: Vec<_> = plain.lines().map(str::trim).collect();
+    let footer = lines
+        .iter()
+        .rposition(|line| line.starts_with("Esc to cancel"))?;
+    if lines[footer + 1..]
+        .iter()
+        .any(|line| !line.is_empty() && !is_outer_separator(line))
+    {
+        return None;
+    }
+    let selected = lines[..footer]
+        .iter()
+        .rposition(|line| line.starts_with("❯ "))?;
+    let options_start = lines[..=selected].iter().rposition(|line| {
+        let line = line.strip_prefix("❯ ").unwrap_or(line);
+        line == "1. Yes" || line.starts_with("1. Yes,")
+    })?;
+    let header = lines[..options_start].iter().rposition(|line| {
+        matches!(
+            *line,
+            "Run shell command"
+                | "Bash command"
+                | "Edit file"
+                | "Write file"
+                | "Tool use"
+                | "Web search"
+                | "Read file"
+                | "Fetch URL"
+        )
+    })?;
+    let body = parse_pending_full(&lines[header..=footer].join("\n"))?;
+    Some(ClaudePermissionPrompt {
+        body,
+        approval_selected: lines[selected].strip_prefix("❯ ").is_some_and(|line| {
+            line.strip_prefix("1. ")
+                .or_else(|| line.strip_prefix("2. "))
+                .is_some_and(|choice| choice == "Yes" || choice.starts_with("Yes,"))
+        }),
+    })
 }
 
 /// True iff the captured pane shows a Claude permission prompt UI in its
@@ -1231,6 +1304,64 @@ Esc to cancel · Tab to amend
 "#;
 
         assert!(has_pending_permission_prompt(pane));
+    }
+
+    #[test]
+    fn user_question_chrome_excludes_yes_no_menus_from_permissions() {
+        for pane in [
+            include_str!("../tests/fixtures/claude-prompts/layout-question.txt"),
+            include_str!("../tests/fixtures/claude-prompts/comment-question.txt"),
+            include_str!("../tests/fixtures/claude-prompts/multi-question.txt"),
+        ] {
+            assert!(has_claude_user_choice_prompt(pane));
+            assert!(claude_permission_prompt(pane).is_none());
+            assert!(claude_permission_prompt(&format!("\x1b[1m{pane}\x1b[0m")).is_none());
+        }
+    }
+
+    #[test]
+    fn permission_parser_requires_a_live_action_and_records_the_selection() {
+        for pane in [
+            include_str!("../tests/fixtures/claude-prompts/shell.txt"),
+            include_str!("../tests/fixtures/claude-prompts/edit.txt"),
+            include_str!("../tests/fixtures/claude-prompts/mcp.txt"),
+        ] {
+            let permission = claude_permission_prompt(pane).unwrap();
+            assert!(permission.approval_selected);
+            assert!(!permission.body.is_empty());
+            let no = pane
+                .replace("❯ 1. Yes", "  1. Yes")
+                .replace("  3. No", "❯ 3. No");
+            assert!(!claude_permission_prompt(&no).unwrap().approval_selected);
+            let always = pane
+                .replace("❯ 1. Yes", "  1. Yes")
+                .replace("  2. Yes,", "❯ 2. Yes,");
+            assert!(claude_permission_prompt(&always).unwrap().approval_selected);
+            assert!(claude_permission_prompt(&format!("{pane}\n❯ user draft")).is_none());
+            assert!(
+                claude_permission_prompt(&pane.replace("Esc to cancel", "unknown footer"))
+                    .is_none()
+            );
+        }
+        assert!(
+            claude_permission_prompt("Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel")
+                .is_none()
+        );
+        let pane = include_str!("../tests/fixtures/claude-prompts/shell.txt");
+        assert!(
+            claude_permission_prompt(
+                &pane
+                    .lines()
+                    .map(|line| format!("│ {line}\n"))
+                    .collect::<String>()
+            )
+            .is_none()
+        );
+        let quoted = pane.replace(
+            "│ cargo test",
+            "│ echo '☐ Layout'\n│ echo '← ☐ Options ✔ Submit →'",
+        );
+        assert!(claude_permission_prompt(&quoted).is_some());
     }
 
     #[test]

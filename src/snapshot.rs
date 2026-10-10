@@ -198,7 +198,7 @@ fn scan_blocked_panes(sessions: &mut [Session]) {
         .filter_map(|s| s.pane.as_ref().map(|pane| pane.target.clone()))
         .filter(|target| seen_targets.insert(target.clone()))
         .collect::<Vec<_>>();
-    let claude_captures = tmux::capture_pane_tails(&claude_targets, 15);
+    let claude_captures = tmux::capture_panes_visible(&claude_targets);
 
     apply_claude_pane_captures(sessions, &claude_captures);
 
@@ -219,7 +219,8 @@ fn apply_claude_pane_captures(sessions: &mut [Session], captures: &HashMap<Strin
     for s in sessions.iter_mut().filter(|s| should_scan_claude_pane(s)) {
         if let Some(pane) = &s.pane
             && let Some(content) = captures.get(&pane.target)
-            && tmux::has_pending_permission_prompt(content)
+            && (tmux::has_pending_permission_prompt(content)
+                || tmux::has_claude_user_choice_prompt(content))
         {
             s.pane_blocked = true;
         }
@@ -473,6 +474,22 @@ mod tests {
 
         apply_claude_pane_captures(std::slice::from_mut(&mut session), &captures);
 
+        assert!(session.pane_blocked);
+    }
+
+    #[test]
+    fn user_question_without_yes_options_still_needs_attention() {
+        let mut session = claude_session("/repo/ux", None, None);
+        session.status = "idle".to_string();
+        session.pane = Some(pane(1, "%1", "/repo/ux", "claude", "agent"));
+        let captures = HashMap::from([(
+            "main:1.0".to_string(),
+            format!(
+                "☐ Layout\n{}❯ 1. Keep current layout\n  2. Move the files\nEsc to cancel\n",
+                "Detailed question context\n".repeat(30)
+            ),
+        )]);
+        apply_claude_pane_captures(std::slice::from_mut(&mut session), &captures);
         assert!(session.pane_blocked);
     }
 }

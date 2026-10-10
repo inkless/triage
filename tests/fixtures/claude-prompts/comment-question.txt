@@ -1,0 +1,7 @@
+────────────────────────────────────────
+☐ Comment evt
+│ Support PR comment events so that writing bypass policy check
+│ in a comment takes effect immediately?
+❯ 1. Yes
+  2. No
+Esc to cancel · Tab to amend
