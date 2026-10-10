@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.3](https://github.com/inkless/triage/compare/v0.6.2...v0.6.3) (2026-10-10)
+
+
+### Bug Fixes
+
+* **auto:** leave user questions for human input ([#26](https://github.com/inkless/triage/issues/26)) ([0213384](https://github.com/inkless/triage/commit/0213384011c72d2782d6fbb969b6c57880d13ca4))
+
 ## [0.6.2](https://github.com/inkless/triage/compare/v0.6.1...v0.6.2) (2026-10-06)
 
 
