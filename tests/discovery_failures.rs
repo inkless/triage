@@ -7,7 +7,7 @@ fn run_failure(tool: &str) {
     fs::create_dir_all(dir.join(".codex")).unwrap();
     for (name, body) in [
         ("tmux", "exit 0".to_string()),
-        ("ps", format!("echo '{} codex'", std::process::id())),
+        ("ps", format!("echo '{} ?? codex'", std::process::id())),
         ("lsof", "exit 0".to_string()),
         ("sqlite3", "exit 0".to_string()),
     ] {

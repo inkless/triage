@@ -320,6 +320,8 @@ Toggle with `space`. Three zones:
 
 Codex sessions show up beside Claude rows with the `cx` provider label. Filter matches `cx`, `codex`, row name, and cwd.
 
+Completed Codex threads disappear from the dashboard once their terminal is closed, even if the shared app-server keeps them loaded. Idle sessions with an open terminal remain visible.
+
 Triage discovers live Codex processes from `ps`, finds the active rollout jsonl held open by the process, and joins that process back to tmux. Titles come from Codex's native thread metadata when available. `R` creates a triage-local alias when the native title is too long; aliases are keyed by Codex's root thread id, so a renamed spawned-review session continues to label the parent row.
 
 Blocked Codex detection uses two signals together: the latest unfinished tool call must request escalation, and the visible tmux pane must show Codex's approval UI. Manual `a`/`d` and auto mode answer that visible prompt through tmux. Codex does not currently have a PreToolUse hook path like Claude, so triage validates the prompt is still present before sending keys; approve requires the `Yes` option to be selected.

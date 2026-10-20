@@ -1001,6 +1001,8 @@ fn refresh(app: &mut AppState) {
         app.status_msg = None;
     }
 
+    snapshot::retain_dashboard_sessions(&mut sessions);
+
     // Auto-unmute any session whose user-text timestamp has advanced past the
     // mute-at time. The user typing in a muted pane is the strongest possible
     // signal that they want it surfaced again. Mute entries for sessions that

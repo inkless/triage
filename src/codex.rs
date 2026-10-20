@@ -109,8 +109,8 @@ pub fn discover_live_sessions(
     let mut out = Vec::new();
     let thread_titles = cache.thread_titles();
     let thread_roots = cache.thread_roots();
-    let pids = match codex_pids() {
-        Ok(pids) => pids,
+    let processes = match codex_processes() {
+        Ok(processes) => processes,
         Err(error) => {
             cache.discovery_errors.push(error);
             return out;
@@ -120,7 +120,8 @@ pub fn discover_live_sessions(
     // while the `codex` TUI in tmux is only a client with no rollout open.
     let mut paneless = Vec::new();
     let mut clients = Vec::new();
-    for pid in pids {
+    for process in processes {
+        let pid = process.pid;
         let paths = match rollout_paths_for_pid(pid) {
             Ok(paths) => paths,
             Err(error) => {
@@ -128,7 +129,7 @@ pub fn discover_live_sessions(
                 continue;
             }
         };
-        let pane = tmux::find_owning_pane(pid, panes, ppid_map, 8);
+        let pane = process.owning_pane(panes, ppid_map);
         let selected = if pane.is_some() {
             select_rollout(paths, cache).into_iter().collect()
         } else {
@@ -696,25 +697,53 @@ fn normalize_codex_label(raw: &str) -> Option<String> {
     Some(crate::approval::truncate(&label, 80))
 }
 
-fn codex_pids() -> Result<Vec<u32>, String> {
+struct CodexProcess {
+    pid: u32,
+    tty: Option<String>,
+}
+
+impl CodexProcess {
+    fn owning_pane(
+        &self,
+        panes: &HashMap<u32, Pane>,
+        ppid_map: &HashMap<u32, u32>,
+    ) -> Option<Pane> {
+        // A managed daemon can remain a descendant of its launching TUI after
+        // detaching. Only a process still on that terminal owns the pane.
+        let tty = self.tty.as_deref()?;
+        tmux::find_owning_pane(self.pid, panes, ppid_map, 8)
+            .filter(|pane| pane.tty.strip_prefix("/dev/").unwrap_or(&pane.tty) == tty)
+    }
+}
+
+fn codex_processes() -> Result<Vec<CodexProcess>, String> {
     let stdout = checked_output(
-        Command::new("ps").args(["-A", "-o", "pid=,comm="]),
+        Command::new("ps").args(["-A", "-o", "pid=,tty=,comm="]),
         "ps Codex discovery failed",
     )?;
-    let mut pids = Vec::new();
-    for line in String::from_utf8_lossy(&stdout).lines() {
-        let line = line.trim();
-        let Some((pid_raw, command)) = split_first_ws(line) else {
+    Ok(parse_codex_processes(&String::from_utf8_lossy(&stdout)))
+}
+
+fn parse_codex_processes(text: &str) -> Vec<CodexProcess> {
+    let mut processes = Vec::new();
+    for line in text.lines() {
+        let Some((pid_raw, rest)) = split_first_ws(line.trim()) else {
+            continue;
+        };
+        let Some((tty, command)) = split_first_ws(rest) else {
             continue;
         };
         let Ok(pid) = pid_raw.parse::<u32>() else {
             continue;
         };
         if command_basename(command) == Some("codex") {
-            pids.push(pid);
+            processes.push(CodexProcess {
+                pid,
+                tty: (!tty.chars().all(|c| c == '?')).then(|| tty.to_string()),
+            });
         }
     }
-    Ok(pids)
+    processes
 }
 
 fn rollout_paths_for_pid(pid: u32) -> Result<Vec<PathBuf>, String> {
@@ -1800,6 +1829,39 @@ mod tests {
             cwd: PathBuf::from(cwd),
             evidence: Vec::new(),
         }
+    }
+
+    #[test]
+    fn detached_daemon_does_not_own_its_launching_clients_pane() {
+        let processes = parse_codex_processes(
+            "8633 ?? /opt/codex/bin/codex\n9284 ?? /opt/codex/bin/codex\n9170 ttys031 codex\n24666 ttys038 codex\n99 ? /opt/codex/bin/codex\n100 ttys031 codex-code-mode-host\nmalformed\n",
+        );
+        assert_eq!(
+            processes.iter().map(|p| p.pid).collect::<Vec<_>>(),
+            vec![8633, 9284, 9170, 24666, 99]
+        );
+        let pane = Pane {
+            target: "triage:1.0".to_string(),
+            tmux_session: "triage".to_string(),
+            window_name: "triage-dev".to_string(),
+            pane_id: "%30".to_string(),
+            pid: 9028,
+            tty: "/dev/ttys031".to_string(),
+            current_command: "codex".to_string(),
+            cwd: PathBuf::from("/work/triage"),
+            active: true,
+        };
+        let panes = HashMap::from([(pane.pid, pane)]);
+        let parents = HashMap::from([(8633, 9284), (9284, 9170), (9170, 9028), (24666, 9028)]);
+        assert!(tmux::find_owning_pane(8633, &panes, &parents, 8).is_some());
+        assert!(processes[0].owning_pane(&panes, &parents).is_none());
+        assert!(processes[1].owning_pane(&panes, &parents).is_none());
+        assert_eq!(
+            processes[2].owning_pane(&panes, &parents).unwrap().pane_id,
+            "%30"
+        );
+        assert!(processes[3].owning_pane(&panes, &parents).is_none());
+        assert!(processes[4].tty.is_none());
     }
 
     #[test]

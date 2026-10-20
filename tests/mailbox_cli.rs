@@ -54,6 +54,7 @@ esac
                 r#"
 [ -n "$SANDBOXED" ] && { echo "ps: Operation not permitted" >&2; exit 1; }
 case "$*" in
+*tty*) echo "$CALLER_PID null codex"; echo "$TARGET_PID null codex" ;;
 *comm*) echo "$CALLER_PID codex"; echo "$TARGET_PID codex" ;;
 *) echo "$CALLER_PID 1"; echo "$TARGET_PID 1"; echo "$PPID $CALLER_PID" ;;
 esac
@@ -601,6 +602,7 @@ fn inbox_commits_only_from_the_agents_current_session() {
     let ps = fx.dir.join("ps");
     let script = fs::read_to_string(&ps)
         .unwrap()
+        .replace("echo \"$CALLER_PID null codex\"; ", "")
         .replace("echo \"$CALLER_PID codex\"; ", "");
     fs::write(ps, script).unwrap();
     let id = "01900000-0000-7000-8000-000000000001";
