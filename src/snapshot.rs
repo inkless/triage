@@ -57,9 +57,10 @@ pub fn discover_sessions_with_panes(
 }
 
 pub fn retain_dashboard_sessions(sessions: &mut Vec<Session>) {
-    // Shared Codex daemons keep completed threads loaded after their TUI exits.
-    // Keep them available to mailbox lookup, but omit them from the dashboard.
-    sessions.retain(|s| s.provider != Provider::Codex || s.pane.is_some() || s.status != "idle");
+    // Orphaned Claude processes and shared Codex daemons can outlive their TUI.
+    // Keep idle threads available to mailbox lookup, but omit them here unless
+    // they still have a pane or active background work.
+    sessions.retain(|s| s.pane.is_some() || s.status != "idle" || s.active_background_jobs > 0);
 }
 
 fn prefer_tmux_window_names(sessions: &mut [Session]) {
@@ -281,27 +282,46 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_hides_completed_codex_threads_without_a_terminal() {
-        let mut closed = claude_session("/repo", Some("closed Codex"), None);
-        closed.provider = Provider::Codex;
-        let mut attached = closed.clone();
-        attached.name = Some("open Codex".into());
-        attached.pane = Some(pane(1, "%1", "/repo", "codex", "review"));
-        let mut working = closed.clone();
-        working.name = Some("background Codex".into());
-        working.status = "busy".into();
-        let claude = claude_session("/repo", Some("Claude"), None);
-        let mut sessions = vec![closed, attached, working, claude];
+    fn dashboard_hides_idle_threads_without_a_terminal_for_both_providers() {
+        for provider in [Provider::Claude, Provider::Codex] {
+            let mut closed = claude_session("/repo", Some("closed"), None);
+            closed.provider = provider;
+            let mut attached = closed.clone();
+            attached.name = Some("open".into());
+            attached.pane = Some(pane(1, "%1", "/repo", "agent", "review"));
+            let mut working = closed.clone();
+            working.name = Some("working".into());
+            working.status = "busy".into();
+            let mut waiting = closed.clone();
+            waiting.name = Some("waiting".into());
+            waiting.status = "waiting".into();
+            let mut sessions = vec![closed, attached, working, waiting];
+
+            retain_dashboard_sessions(&mut sessions);
+
+            assert_eq!(
+                sessions
+                    .iter()
+                    .filter_map(|s| s.name.as_deref())
+                    .collect::<Vec<_>>(),
+                vec!["open", "working", "waiting"],
+                "{provider:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dashboard_keeps_idle_claude_parent_with_active_background_work() {
+        let mut parent = claude_session("/repo", Some("parked parent"), None);
+        parent.active_background_jobs = 1;
+        let mut sessions = vec![parent];
 
         retain_dashboard_sessions(&mut sessions);
+        assert_eq!(sessions.len(), 1);
 
-        assert_eq!(
-            sessions
-                .iter()
-                .filter_map(|s| s.name.as_deref())
-                .collect::<Vec<_>>(),
-            vec!["open Codex", "background Codex", "Claude"]
-        );
+        sessions[0].active_background_jobs = 0;
+        retain_dashboard_sessions(&mut sessions);
+        assert!(sessions.is_empty());
     }
 
     fn paned_session(cwd: &str, pid: u32, pane_id: &str, updated_at_ms: u64) -> Session {

@@ -15,6 +15,8 @@ Codex CLI:
 Shared:
 - `tmux list-panes -a` — joined via process-ancestor walk from the agent PID
 
+The dashboard hides idle sessions without a tmux pane, including orphaned Claude processes and completed threads retained by Codex's shared app-server. Idle sessions with an open pane or active background work remain visible.
+
 Different shape from [`agentop`](https://crates.io/crates/agentop) (process-centric, token/cost focused). `triage` is content-centric: the headline column is the recap, the detail pane shows what the agent is doing and why, and auto mode (off by default) routes safe tool approvals through an LLM auditor.
 
 ## Demo
@@ -319,8 +321,6 @@ Toggle with `space`. Three zones:
 ## Codex support
 
 Codex sessions show up beside Claude rows with the `cx` provider label. Filter matches `cx`, `codex`, row name, and cwd.
-
-Completed Codex threads disappear from the dashboard once their terminal is closed, even if the shared app-server keeps them loaded. Idle sessions with an open terminal remain visible.
 
 Triage discovers live Codex processes from `ps`, finds the active rollout jsonl held open by the process, and joins that process back to tmux. Titles come from Codex's native thread metadata when available. `R` creates a triage-local alias when the native title is too long; aliases are keyed by Codex's root thread id, so a renamed spawned-review session continues to label the parent row.
 
