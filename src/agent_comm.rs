@@ -168,7 +168,7 @@ pub fn cli_approve(args: &[String]) -> i32 {
     }
 }
 
-const APPROVE_USAGE: &str = "usage: triage approve --to TARGET [--deny] [--dry-run]\n       TARGET: pane id, pane target, name or provider:session-id";
+const APPROVE_USAGE: &str = "usage: triage approve --to TARGET [--deny] [--dry-run]\n       TARGET: pane id, pane target, name, agent id or its last 8 characters";
 
 struct ApproveArgs {
     selector: String,
@@ -218,7 +218,9 @@ fn run_approve(args: &[String]) -> Result<String, CliError> {
     let parents = tmux::build_ppid_map();
     let caller = resolve_current_caller(&sessions, &parents)?;
     let sender = format!("{} ({})", session_display_label(caller), target_id(caller));
-    let target = resolve_target(&sessions, &args.selector)?;
+    let store = Store::open_default();
+    reconcile_quietly(&store);
+    let target = resolve_send_target(&store, &sessions, &args.selector)?;
     if same_session(target, caller) {
         return Err(CliError::usage("cannot decide your own permission prompt"));
     }
@@ -275,6 +277,12 @@ fn inspect_permission_prompt(target: &Session, deny: bool) -> Result<String, Str
     let Some(pane) = &target.pane else {
         return Err("target has no tmux pane".to_string());
     };
+    // Pane text alone can't prove a live Codex approval (scrollback or quoted
+    // source can mimic it); the rollout must also show an escalated call
+    // waiting on one.
+    if target.provider == Provider::Codex && !target.approval_prompt_pending {
+        return Err("Codex session has no pending approval".to_string());
+    }
     let Some(content) = tmux::capture_pane_visible_ansi(&pane.pane_id) else {
         return Err("cannot inspect target pane".to_string());
     };
@@ -290,8 +298,10 @@ fn evaluate_approve_gate(
         Provider::Claude => {
             let prompt = tmux::claude_permission_prompt(pane_text)
                 .ok_or("no permission prompt visible (user-choice prompts need a human)")?;
-            if !deny && !prompt.approval_selected {
-                return Err("the highlighted option is not a Yes");
+            let one_time_yes =
+                prompt.approval_selected && tmux::selected_option_is_one_time_yes(pane_text);
+            if !deny && !one_time_yes {
+                return Err("the highlighted option is not a one-time Yes");
             }
             Ok(prompt.body)
         }
@@ -302,8 +312,9 @@ fn evaluate_approve_gate(
             }
             if !deny {
                 match tmux::codex_selected_permission_choice(&plain) {
-                    Some(tmux::CodexPromptChoice::Yes) => {}
-                    Some(_) => return Err("the highlighted option is not a Yes"),
+                    Some(tmux::CodexPromptChoice::Yes)
+                        if tmux::selected_option_is_one_time_yes(&plain) => {}
+                    Some(_) => return Err("the highlighted option is not a one-time Yes"),
                     None => return Err("prompt has no selected choice"),
                 }
             }
@@ -2104,9 +2115,42 @@ mod tests {
 
         assert_eq!(
             evaluate_approve_gate(Provider::Claude, &pane, false),
-            Err("the highlighted option is not a Yes")
+            Err("the highlighted option is not a one-time Yes")
         );
         assert!(evaluate_approve_gate(Provider::Claude, &pane, true).is_ok());
+    }
+
+    #[test]
+    fn approve_gate_refuses_persistent_yes_but_allows_deny() {
+        let claude = CLAUDE_SHELL_PROMPT
+            .replace("❯ 1. Yes", "  1. Yes")
+            .replace("  2. Yes,", "❯ 2. Yes,");
+        assert_eq!(
+            evaluate_approve_gate(Provider::Claude, &claude, false),
+            Err("the highlighted option is not a one-time Yes")
+        );
+        assert!(evaluate_approve_gate(Provider::Claude, &claude, true).is_ok());
+
+        let codex = CODEX_PROMPT
+            .replace("› 1. Yes", "  1. Yes")
+            .replace("  2. Yes, and", "› 2. Yes, and");
+        assert_eq!(
+            evaluate_approve_gate(Provider::Codex, &codex, false),
+            Err("the highlighted option is not a one-time Yes")
+        );
+        assert!(evaluate_approve_gate(Provider::Codex, &codex, true).is_ok());
+    }
+
+    #[test]
+    fn codex_target_without_a_pending_approval_is_refused_before_the_pane_is_read() {
+        let mut codex = session(AttentionState::Working);
+        codex.provider = Provider::Codex;
+        codex.approval_prompt_pending = false;
+
+        assert_eq!(
+            inspect_permission_prompt(&codex, false),
+            Err("Codex session has no pending approval".to_string())
+        );
     }
 
     #[test]
@@ -2148,7 +2192,7 @@ mod tests {
             .replace("  3. No", "› 3. No");
         assert_eq!(
             evaluate_approve_gate(Provider::Codex, &no_selected, false),
-            Err("the highlighted option is not a Yes")
+            Err("the highlighted option is not a one-time Yes")
         );
         assert!(evaluate_approve_gate(Provider::Codex, &no_selected, true).is_ok());
     }

@@ -17,6 +17,22 @@ fn approve_only_sends_keys_when_the_pane_shows_a_yes_selected_prompt() {
         )
         .unwrap();
     }
+    let pending = concat!(
+        "{\"timestamp\":\"2000-01-01T00:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"name\":\"exec_command\",\"call_id\":\"call-1\",",
+        "\"arguments\":\"{\\\"cmd\\\":\\\"cargo test\\\",\\\"sandbox_permissions\\\":\\\"require_escalated\\\"}\"}}\n"
+    );
+    let meta = fs::read_to_string(&rollout).unwrap();
+    let set_pending = |on: bool| {
+        fs::write(
+            &rollout,
+            if on {
+                format!("{meta}{pending}")
+            } else {
+                meta.clone()
+            },
+        )
+        .unwrap();
+    };
     for (name, body) in [
         (
             "tmux",
@@ -26,6 +42,7 @@ list-panes) echo "fixture|1.0|$FIXTURE_PID|/dev/null|codex|/tmp|1|%42|fixture" ;
 capture-pane)
   case "$SCENARIO" in
     capture-failure) exit 1 ;;
+    always) printf 'Would you like to run the following command?\n  $ cargo test\n  1. Yes, proceed (y)\n› 2. Yes, and don'"'"'t ask again for commands that start with `cargo test` (p)\n  3. No, and tell Codex what to do differently (esc)\n' ;;
     yes) printf 'Would you like to run the following command?\n  $ cargo test\n› 1. Yes, proceed (y)\n  2. No, and tell Codex what to do differently (esc)\n' ;;
     no) printf 'Would you like to run the following command?\n  $ cargo test\n  1. Yes, proceed (y)\n› 2. No, and tell Codex what to do differently (esc)\n' ;;
     *) printf '› \n' ;;
@@ -76,9 +93,11 @@ esac
     let keys = dir.join("keys");
     let stderr = |o: &Output| String::from_utf8_lossy(&o.stderr).into_owned();
 
+    set_pending(true);
     for (scenario, expected) in [
         ("idle", "no permission prompt visible"),
-        ("no", "not a Yes"),
+        ("always", "not a one-time Yes"),
+        ("no", "not a one-time Yes"),
         ("capture-failure", "cannot inspect"),
     ] {
         let output = run(scenario, &["approve", "--to", "%42"]);
@@ -95,6 +114,19 @@ esac
         );
         assert!(!keys.exists(), "{scenario} sent keys");
     }
+
+    // Control: the same prompt text on screen with no pending approval in the
+    // rollout (stale scrollback / quoted source) must not receive a key.
+    set_pending(false);
+    let stale = run("yes", &["approve", "--to", "%42"]);
+    assert_eq!(stale.status.code(), Some(3), "{}", stderr(&stale));
+    assert!(
+        stderr(&stale).contains("no pending approval"),
+        "{}",
+        stderr(&stale)
+    );
+    assert!(!keys.exists(), "pane-only prompt sent keys");
+    set_pending(true);
 
     let dry = run("yes", &["approve", "--to", "%42", "--dry-run"]);
     assert!(dry.status.success(), "{}", stderr(&dry));

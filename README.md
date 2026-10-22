@@ -178,9 +178,12 @@ triage approve --to '%42' --deny      # press Escape
 ```
 
 The command captures the target pane immediately before sending a key and refuses
-unless it shows a live Claude or Codex permission prompt. Approving also requires
-a Yes option to be highlighted. `AskUserQuestion` and other user-choice prompts are
-never approved; they need a human. Agents cannot decide their own prompt. Read the
+unless it shows a live Claude or Codex permission prompt; for Codex the rollout must
+also show an approval waiting. Approving requires the plain one-time "Yes" (option 1)
+to be highlighted — a cursor on "Yes, and don't ask again" or "No" means a person is
+mid-decision, so the command refuses (`--deny` still works). `--to` takes what
+`triage send` takes (for example the agent's name from `triage agents`).
+`AskUserQuestion` and other user-choice prompts are never approved; they need a human. Agents cannot decide their own prompt. Read the
 prompt first (`tmux capture-pane -p -t %42`): approval is single-step, the printed
 line and the message audit record the prompt body that was approved, and a different
 prompt appearing between your read and the call is approved too.
