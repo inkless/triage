@@ -159,6 +159,12 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    /// Approve (or --deny) a live agent's visible permission prompt
+    #[command(disable_help_flag = true)]
+    Approve {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
     /// Launch a configured Claude/Codex agent tmux window
     #[command(disable_help_flag = true)]
     Launch {
@@ -194,6 +200,7 @@ fn main() -> io::Result<()> {
             Command::Inbox { args } => std::process::exit(agent_comm::cli_inbox(&args)),
             Command::Messages { args } => std::process::exit(messages::cli(&args)),
             Command::Interrupt { args } => std::process::exit(agent_comm::cli_interrupt(&args)),
+            Command::Approve { args } => std::process::exit(agent_comm::cli_approve(&args)),
             Command::Launch { args } => std::process::exit(spawn_agent::cli_launch(&args)),
         }
     }
@@ -1667,6 +1674,10 @@ mod tests {
         match parse(&["send", "--to", "%1", "hello"]).unwrap().command {
             Some(Command::Send { args }) => assert_eq!(args, ["--to", "%1", "hello"]),
             other => panic!("expected send passthrough, got {other:?}"),
+        }
+        match parse(&["approve", "--to", "%1", "--deny"]).unwrap().command {
+            Some(Command::Approve { args }) => assert_eq!(args, ["--to", "%1", "--deny"]),
+            other => panic!("expected approve passthrough, got {other:?}"),
         }
     }
 

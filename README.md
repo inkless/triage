@@ -47,6 +47,7 @@ triage              # launch the TUI
 triage --probe      # print the joined session table once (no TUI)
 triage agents --json # list peer agents and guarded send status
 triage send --to '%42' --message "can you check this?" # message a live agent
+triage approve --to '%42' # approve a blocked agent's visible permission prompt
 triage inbox        # peer mail queued for the calling agent
 triage messages     # review peer mail across agents
 triage hooks install # Claude + Codex peer-mail hooks (restart agents afterwards)
@@ -166,6 +167,23 @@ Escape and records the action in the message audit. There is no atomic lock
 with the receiving agent, so progress can resume after the final check.
 Interruption does not guarantee queued input is processed; inspect the agent
 again before using normal `send` for an urgent follow-up. `send` never interrupts.
+
+To unblock a peer that is stopped on a permission prompt (for example, a manager
+agent approving a worker):
+
+```bash
+triage approve --to '%42' --dry-run   # run every check, send nothing
+triage approve --to '%42'             # press Enter on the highlighted Yes
+triage approve --to '%42' --deny      # press Escape
+```
+
+The command captures the target pane immediately before sending a key and refuses
+unless it shows a live Claude or Codex permission prompt. Approving also requires
+a Yes option to be highlighted. `AskUserQuestion` and other user-choice prompts are
+never approved; they need a human. Agents cannot decide their own prompt. Read the
+prompt first (`tmux capture-pane -p -t %42`): approval is single-step, the printed
+line and the message audit record the prompt body that was approved, and a different
+prompt appearing between your read and the call is approved too.
 
 `launch` is the reusable tmux/process primitive behind the TUI's `N` shortcut
 and future mb-work fleet launch integration:

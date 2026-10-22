@@ -155,6 +155,163 @@ fn parse_interrupt_args(args: &[String]) -> Result<(Option<String>, bool), CliEr
     Ok((selector, dry_run))
 }
 
+pub fn cli_approve(args: &[String]) -> i32 {
+    match run_approve(args) {
+        Ok(message) => {
+            println!("{message}");
+            0
+        }
+        Err(error) => {
+            eprintln!("{}", with_sandbox_hint(&error.message));
+            error.code
+        }
+    }
+}
+
+const APPROVE_USAGE: &str = "usage: triage approve --to TARGET [--deny] [--dry-run]\n       TARGET: pane id, pane target, name or provider:session-id";
+
+struct ApproveArgs {
+    selector: String,
+    deny: bool,
+    dry_run: bool,
+}
+
+fn parse_approve_args(args: &[String]) -> Result<Option<ApproveArgs>, CliError> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        return Ok(None);
+    }
+    let mut selector = None;
+    let mut deny = false;
+    let mut dry_run = false;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--to" if selector.is_none() => {
+                selector = Some(
+                    args.next()
+                        .filter(|value| !value.starts_with('-'))
+                        .ok_or_else(|| CliError::usage(APPROVE_USAGE))?
+                        .clone(),
+                );
+            }
+            "--deny" => deny = true,
+            "--dry-run" => dry_run = true,
+            _ => return Err(CliError::usage(APPROVE_USAGE)),
+        }
+    }
+    let selector = selector.ok_or_else(|| CliError::usage(APPROVE_USAGE))?;
+    Ok(Some(ApproveArgs {
+        selector,
+        deny,
+        dry_run,
+    }))
+}
+
+fn run_approve(args: &[String]) -> Result<String, CliError> {
+    let Some(args) = parse_approve_args(args)? else {
+        return Ok(APPROVE_USAGE.to_string());
+    };
+    let sessions = load_snapshot()?;
+    let parents = tmux::build_ppid_map();
+    let caller = resolve_current_caller(&sessions, &parents)?;
+    let sender = format!("{} ({})", session_display_label(caller), target_id(caller));
+    let target = resolve_target(&sessions, &args.selector)?;
+    if same_session(target, caller) {
+        return Err(CliError::usage("cannot decide your own permission prompt"));
+    }
+
+    let verb = if args.deny { "deny" } else { "approve" };
+    let prompt = match inspect_permission_prompt(target, args.deny) {
+        Ok(prompt) => prompt,
+        Err(reason) => {
+            let verdict = format!("{verb}-refused");
+            let entry = AuditEntry::new(
+                &sender,
+                &args.selector,
+                target,
+                &verdict,
+                Some(&reason),
+                None,
+            );
+            if let Err(error) = append_message_audit(&entry) {
+                eprintln!("warning: failed to append approve audit: {error}");
+            }
+            return Err(CliError::denied(reason));
+        }
+    };
+    let pane_id = target_id(target);
+    let label = target_label(target);
+    let headline = truncate_chars(&prompt.replace('\n', " "), 120);
+    if args.dry_run {
+        return Ok(format!(
+            "dry-run: would {verb} {pane_id} ({label}): {headline}"
+        ));
+    }
+    let key = if args.deny { "Escape" } else { "Enter" };
+    tmux::send_keys(&pane_id, &[key])
+        .map_err(|error| CliError::delivery(format!("{verb} failed: {error}")))?;
+    let verdict = if args.deny { "denied" } else { "approved" };
+    let entry = AuditEntry::new(
+        &sender,
+        &args.selector,
+        target,
+        verdict,
+        None,
+        Some(&prompt),
+    );
+    if let Err(error) = append_message_audit(&entry) {
+        eprintln!("warning: failed to append approve audit: {error}");
+    }
+    Ok(format!("{verdict} {pane_id} ({label}): {headline}"))
+}
+
+/// Capture the target's live screen and prove it shows a permission prompt
+/// whose highlighted option makes Enter (approve) or Escape (deny) correct.
+/// Returns the prompt body for the audit trail.
+fn inspect_permission_prompt(target: &Session, deny: bool) -> Result<String, String> {
+    let Some(pane) = &target.pane else {
+        return Err("target has no tmux pane".to_string());
+    };
+    let Some(content) = tmux::capture_pane_visible_ansi(&pane.pane_id) else {
+        return Err("cannot inspect target pane".to_string());
+    };
+    evaluate_approve_gate(target.provider, &content, deny).map_err(str::to_string)
+}
+
+fn evaluate_approve_gate(
+    provider: Provider,
+    pane_text: &str,
+    deny: bool,
+) -> Result<String, &'static str> {
+    match provider {
+        Provider::Claude => {
+            let prompt = tmux::claude_permission_prompt(pane_text)
+                .ok_or("no permission prompt visible (user-choice prompts need a human)")?;
+            if !deny && !prompt.approval_selected {
+                return Err("the highlighted option is not a Yes");
+            }
+            Ok(prompt.body)
+        }
+        Provider::Codex => {
+            let plain = tmux::strip_ansi(pane_text);
+            if !tmux::has_codex_permission_prompt(&plain) {
+                return Err("no permission prompt visible");
+            }
+            if !deny {
+                match tmux::codex_selected_permission_choice(&plain) {
+                    Some(tmux::CodexPromptChoice::Yes) => {}
+                    Some(_) => return Err("the highlighted option is not a Yes"),
+                    None => return Err("prompt has no selected choice"),
+                }
+            }
+            Ok(tmux::parse_codex_pending_full(&plain).unwrap_or_default())
+        }
+    }
+}
+
 fn interrupt_eligibility(session: &Session, now: SystemTime) -> Result<(), &'static str> {
     if classifier::no_progress_age(session, now).is_none() {
         return Err(
@@ -1928,5 +2085,92 @@ mod tests {
 
         assert_eq!(err.code, 2);
         assert_eq!(err.message, "reply must be a single line");
+    }
+
+    const CLAUDE_SHELL_PROMPT: &str = include_str!("../tests/fixtures/claude-prompts/shell.txt");
+
+    #[test]
+    fn approve_gate_accepts_claude_prompt_with_yes_selected() {
+        let body = evaluate_approve_gate(Provider::Claude, CLAUDE_SHELL_PROMPT, false).unwrap();
+
+        assert!(body.contains("cargo test"));
+    }
+
+    #[test]
+    fn approve_gate_refuses_claude_prompt_with_no_selected_but_allows_deny() {
+        let pane = CLAUDE_SHELL_PROMPT
+            .replace("❯ 1. Yes", "  1. Yes")
+            .replace("  3. No", "❯ 3. No");
+
+        assert_eq!(
+            evaluate_approve_gate(Provider::Claude, &pane, false),
+            Err("the highlighted option is not a Yes")
+        );
+        assert!(evaluate_approve_gate(Provider::Claude, &pane, true).is_ok());
+    }
+
+    #[test]
+    fn approve_gate_refuses_claude_user_choice_prompts() {
+        for pane in [
+            include_str!("../tests/fixtures/claude-prompts/layout-question.txt"),
+            include_str!("../tests/fixtures/claude-prompts/multi-question.txt"),
+        ] {
+            assert!(evaluate_approve_gate(Provider::Claude, pane, false).is_err());
+            assert!(evaluate_approve_gate(Provider::Claude, pane, true).is_err());
+        }
+    }
+
+    #[test]
+    fn approve_gate_refuses_when_no_prompt_is_visible() {
+        let pane = "$ cargo test\n   Compiling triage\n❯ \n";
+
+        assert!(evaluate_approve_gate(Provider::Claude, pane, false).is_err());
+        assert!(evaluate_approve_gate(Provider::Codex, pane, false).is_err());
+    }
+
+    #[test]
+    fn approve_gate_refuses_prompt_text_quoted_in_scrollback() {
+        // The prompt UI is no longer the last thing on screen.
+        let pane = format!("{CLAUDE_SHELL_PROMPT}\nthe agent kept working\n");
+
+        assert!(evaluate_approve_gate(Provider::Claude, &pane, false).is_err());
+    }
+
+    const CODEX_PROMPT: &str = "  Would you like to run the following command?\n\n  $ cargo test\n\n› 1. Yes, proceed (y)\n  2. Yes, and don't ask again for commands that start with `cargo test` (p)\n  3. No, and tell Codex what to do differently (esc)\n\n  Press enter to confirm or esc to cancel\n";
+
+    #[test]
+    fn approve_gate_accepts_codex_prompt_only_with_yes_selected() {
+        let body = evaluate_approve_gate(Provider::Codex, CODEX_PROMPT, false).unwrap();
+        assert!(body.contains("cargo test"));
+
+        let no_selected = CODEX_PROMPT
+            .replace("› 1. Yes", "  1. Yes")
+            .replace("  3. No", "› 3. No");
+        assert_eq!(
+            evaluate_approve_gate(Provider::Codex, &no_selected, false),
+            Err("the highlighted option is not a Yes")
+        );
+        assert!(evaluate_approve_gate(Provider::Codex, &no_selected, true).is_ok());
+    }
+
+    #[test]
+    fn approve_args_parse_flags_and_reject_garbage() {
+        let args = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        let parsed = parse_approve_args(&args(&["--to", "UPR-329", "--deny", "--dry-run"]))
+            .unwrap()
+            .unwrap();
+        assert_eq!(parsed.selector, "UPR-329");
+        assert!(parsed.deny && parsed.dry_run);
+
+        assert!(parse_approve_args(&args(&["--help"])).unwrap().is_none());
+        for bad in [
+            &["--deny"][..],
+            &["--to"],
+            &["--to", "--deny"],
+            &["--to", "%1", "extra"],
+        ] {
+            assert_eq!(parse_approve_args(&args(bad)).err().unwrap().code, 2);
+        }
     }
 }
