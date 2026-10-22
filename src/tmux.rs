@@ -775,6 +775,35 @@ pub fn claude_permission_prompt(pane: &str) -> Option<ClaudePermissionPrompt> {
     })
 }
 
+/// True iff the highlighted choice is the plain one-time "Yes": a numbered
+/// choice must be option 1, and "Yes, and ..." variants (always allow, allow
+/// for the session) are never one-time. Used where Enter must grant exactly
+/// this action and nothing persistent.
+pub fn selected_option_is_one_time_yes(pane: &str) -> bool {
+    let plain = strip_ansi(pane);
+    let Some(line) = plain.lines().rev().find_map(|line| {
+        let trimmed = line
+            .trim()
+            .trim_matches(|c: char| c.is_whitespace() || matches!(c, '│' | '┃' | '║' | '┆' | '┊'));
+        trimmed
+            .strip_prefix('›')
+            .or_else(|| trimmed.strip_prefix('❯'))
+            .map(str::trim)
+    }) else {
+        return false;
+    };
+    let text = match line.split_once(". ") {
+        Some((number, rest)) if number.chars().all(|c| c.is_ascii_digit()) => {
+            if number != "1" {
+                return false;
+            }
+            rest.trim()
+        }
+        _ => line,
+    };
+    text.starts_with("Yes") && !text.starts_with("Yes, and ")
+}
+
 /// True iff the captured pane shows a Claude permission prompt UI in its
 /// most recent block. We require two distinct UI lines to BOTH appear as
 /// trimmed whole-line matches:
@@ -1575,6 +1604,32 @@ Esc to cancel · Tab to amend · ctrl+e to explain
     #[test]
     fn no_composer_marker_is_not_draft() {
         assert!(!has_draft_input("just some output\nno prompt here"));
+    }
+
+    #[test]
+    fn one_time_yes_requires_option_one_and_no_persistent_variant() {
+        let shell = include_str!("../tests/fixtures/claude-prompts/shell.txt");
+        assert!(selected_option_is_one_time_yes(shell));
+        assert!(selected_option_is_one_time_yes(&format!(
+            "\x1b[36m{shell}\x1b[0m"
+        )));
+
+        let always = shell
+            .replace("❯ 1. Yes", "  1. Yes")
+            .replace("  2. Yes,", "❯ 2. Yes,");
+        assert!(!selected_option_is_one_time_yes(&always));
+        let no = shell
+            .replace("❯ 1. Yes", "  1. Yes")
+            .replace("  3. No", "❯ 3. No");
+        assert!(!selected_option_is_one_time_yes(&no));
+
+        assert!(selected_option_is_one_time_yes(
+            "│ › Yes, proceed │\n│ No, and tell Codex │"
+        ));
+        assert!(!selected_option_is_one_time_yes(
+            "│ › Yes, and don't ask again for `cargo` │"
+        ));
+        assert!(!selected_option_is_one_time_yes("$ cargo test\n"));
     }
 
     #[test]
