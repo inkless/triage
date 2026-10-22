@@ -296,8 +296,7 @@ fn evaluate_approve_gate(
 ) -> Result<String, &'static str> {
     match provider {
         Provider::Claude => {
-            let prompt = tmux::claude_permission_prompt(pane_text)
-                .ok_or("no permission prompt visible (user-choice prompts need a human)")?;
+            let prompt = tmux::claude_permission_prompt_checked(pane_text)?;
             let one_time_yes =
                 prompt.approval_selected && tmux::selected_option_is_one_time_yes(pane_text);
             if !deny && !one_time_yes {
@@ -2162,6 +2161,29 @@ mod tests {
             assert!(evaluate_approve_gate(Provider::Claude, pane, false).is_err());
             assert!(evaluate_approve_gate(Provider::Claude, pane, true).is_err());
         }
+    }
+
+    #[test]
+    fn approve_gate_names_the_check_that_failed() {
+        let trailing = format!("{CLAUDE_SHELL_PROMPT}[Opus 5.5] statusline\n");
+        assert_eq!(
+            evaluate_approve_gate(Provider::Claude, &trailing, false),
+            Err("extra lines below the 'Esc to cancel' footer")
+        );
+        let choice = format!("☐ pick one\n{CLAUDE_SHELL_PROMPT}");
+        assert_eq!(
+            evaluate_approve_gate(Provider::Claude, &choice, false),
+            Err("a user-choice screen (☐/☒/✔ Submit line) is visible")
+        );
+        let header = CLAUDE_SHELL_PROMPT.replace("Run shell command", "Something else");
+        assert_eq!(
+            evaluate_approve_gate(Provider::Claude, &header, false),
+            Err("no known tool header (e.g. 'Bash command') above the options")
+        );
+        assert_eq!(
+            evaluate_approve_gate(Provider::Claude, "$ ls\n", false),
+            Err("no 'Esc to cancel' footer on screen")
+        );
     }
 
     #[test]

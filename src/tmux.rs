@@ -730,42 +730,59 @@ pub fn has_claude_user_choice_prompt(pane: &str) -> bool {
 }
 
 pub fn claude_permission_prompt(pane: &str) -> Option<ClaudePermissionPrompt> {
+    claude_permission_prompt_checked(pane).ok()
+}
+
+/// Same parse as `claude_permission_prompt`, but names the check that failed
+/// so a refused `triage approve` can say why the screen was not recognized.
+pub fn claude_permission_prompt_checked(
+    pane: &str,
+) -> Result<ClaudePermissionPrompt, &'static str> {
     let plain = strip_ansi(pane);
     if has_claude_user_choice_prompt(&plain) {
-        return None;
+        return Err("a user-choice screen (☐/☒/✔ Submit line) is visible");
     }
     let lines: Vec<_> = plain.lines().map(str::trim).collect();
     let footer = lines
         .iter()
-        .rposition(|line| line.starts_with("Esc to cancel"))?;
+        .rposition(|line| line.starts_with("Esc to cancel"))
+        .ok_or("no 'Esc to cancel' footer on screen")?;
     if lines[footer + 1..]
         .iter()
         .any(|line| !line.is_empty() && !is_outer_separator(line))
     {
-        return None;
+        return Err("extra lines below the 'Esc to cancel' footer");
     }
     let selected = lines[..footer]
         .iter()
-        .rposition(|line| line.starts_with("❯ "))?;
-    let options_start = lines[..=selected].iter().rposition(|line| {
-        let line = line.strip_prefix("❯ ").unwrap_or(line);
-        line == "1. Yes" || line.starts_with("1. Yes,")
-    })?;
-    let header = lines[..options_start].iter().rposition(|line| {
-        matches!(
-            *line,
-            "Run shell command"
-                | "Bash command"
-                | "Edit file"
-                | "Write file"
-                | "Tool use"
-                | "Web search"
-                | "Read file"
-                | "Fetch URL"
-        )
-    })?;
-    let body = parse_pending_full(&lines[header..=footer].join("\n"))?;
-    Some(ClaudePermissionPrompt {
+        .rposition(|line| line.starts_with("❯ "))
+        .ok_or("no highlighted option above the footer")?;
+    let options_start = lines[..=selected]
+        .iter()
+        .rposition(|line| {
+            let line = line.strip_prefix("❯ ").unwrap_or(line);
+            line == "1. Yes" || line.starts_with("1. Yes,")
+        })
+        .ok_or("no '1. Yes' option at or above the highlight")?;
+    let header = lines[..options_start]
+        .iter()
+        .rposition(|line| {
+            matches!(
+                *line,
+                "Run shell command"
+                    | "Bash command"
+                    | "Edit file"
+                    | "Write file"
+                    | "Tool use"
+                    | "Web search"
+                    | "Read file"
+                    | "Fetch URL"
+            )
+        })
+        .ok_or("no known tool header (e.g. 'Bash command') above the options")?;
+    let body = parse_pending_full(&lines[header..=footer].join("\n"))
+        .ok_or("could not read the prompt body")?;
+    Ok(ClaudePermissionPrompt {
         body,
         approval_selected: lines[selected].strip_prefix("❯ ").is_some_and(|line| {
             line.strip_prefix("1. ")
