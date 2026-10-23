@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.7.0](https://github.com/inkless/triage/compare/v0.6.2...v0.7.0) (2026-10-23)
+
+
+### Features
+
+* **approve:** add triage approve for peer permission prompts ([#28](https://github.com/inkless/triage/issues/28)) ([897e05e](https://github.com/inkless/triage/commit/897e05e7d4d2f4fcf87094b1b771fee8f2f0eb34))
+
+
+### Bug Fixes
+
+* **approve:** recognize prompts whose tool header scrolled off screen ([c163bf5](https://github.com/inkless/triage/commit/c163bf5de0f9e7ec9532c924413f27ba450109b4))
+* **approve:** say which prompt check failed ([4668861](https://github.com/inkless/triage/commit/466886161060ffad5220103b58a34a6d2c1497be))
+* **auto:** leave user questions for human input ([#26](https://github.com/inkless/triage/issues/26)) ([0213384](https://github.com/inkless/triage/commit/0213384011c72d2782d6fbb969b6c57880d13ca4))
+* **codex:** detect detached daemons and hide completed threads ([2b11b37](https://github.com/inkless/triage/commit/2b11b379c8dee22b70ee4930047e6555d29e6ae9))
+* **discovery:** hide orphaned idle Claude sessions ([edbf5c9](https://github.com/inkless/triage/commit/edbf5c91c168a2d5dc3cd30b7770fef007751861))
+
 ## [0.6.2](https://github.com/inkless/triage/compare/v0.6.1...v0.6.2) (2026-10-06)
 
 
