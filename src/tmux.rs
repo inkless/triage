@@ -764,23 +764,31 @@ pub fn claude_permission_prompt_checked(
             line == "1. Yes" || line.starts_with("1. Yes,")
         })
         .ok_or("no '1. Yes' option at or above the highlight")?;
-    let header = lines[..options_start]
+    // A tall command (long heredoc) can push the tool header off the top of
+    // the visible screen, so the "Do you want ..." question directly above the
+    // options is an equally good anchor.
+    let header = lines[..options_start].iter().rposition(|line| {
+        matches!(
+            *line,
+            "Run shell command"
+                | "Bash command"
+                | "Edit file"
+                | "Write file"
+                | "Tool use"
+                | "Web search"
+                | "Read file"
+                | "Fetch URL"
+        )
+    });
+    let question_above = lines[..options_start]
         .iter()
-        .rposition(|line| {
-            matches!(
-                *line,
-                "Run shell command"
-                    | "Bash command"
-                    | "Edit file"
-                    | "Write file"
-                    | "Tool use"
-                    | "Web search"
-                    | "Read file"
-                    | "Fetch URL"
-            )
-        })
-        .ok_or("no known tool header (e.g. 'Bash command') above the options")?;
-    let body = parse_pending_full(&lines[header..=footer].join("\n"))
+        .rev()
+        .find(|line| !line.is_empty())
+        .is_some_and(|line| line.starts_with("Do you want"));
+    if header.is_none() && !question_above {
+        return Err("no tool header or 'Do you want ...' question above the options");
+    }
+    let body = parse_pending_full(&lines[header.unwrap_or(0)..=footer].join("\n"))
         .ok_or("could not read the prompt body")?;
     Ok(ClaudePermissionPrompt {
         body,

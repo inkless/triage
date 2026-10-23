@@ -2175,14 +2175,43 @@ mod tests {
             evaluate_approve_gate(Provider::Claude, &choice, false),
             Err("a user-choice screen (☐/☒/✔ Submit line) is visible")
         );
-        let header = CLAUDE_SHELL_PROMPT.replace("Run shell command", "Something else");
+        let header = CLAUDE_SHELL_PROMPT
+            .replace("Run shell command", "Something else")
+            .replace("Do you want to proceed?", "Continue?");
         assert_eq!(
             evaluate_approve_gate(Provider::Claude, &header, false),
-            Err("no known tool header (e.g. 'Bash command') above the options")
+            Err("no tool header or 'Do you want ...' question above the options")
         );
         assert_eq!(
             evaluate_approve_gate(Provider::Claude, "$ ls\n", false),
             Err("no 'Esc to cancel' footer on screen")
+        );
+    }
+
+    // A tall heredoc pushed the "Bash command" header off the top of the screen.
+    const CLAUDE_TALL_PROMPT: &str = "\
+ │ 4. Repeat with `=off`: nothing changes from today.
+ │ EOF
+ │ git push -q -u origin feature 2>&1 | tail -2; gh pr create --draft --title \"x\"
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+ Parser skipped input between top-level statements
+ Permission rule Bash(gh pr create:*) requires confirmation for this command.
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. No
+ Esc to cancel · Tab to amend
+";
+
+    #[test]
+    fn approve_gate_accepts_prompt_whose_tool_header_scrolled_off_screen() {
+        let body = evaluate_approve_gate(Provider::Claude, CLAUDE_TALL_PROMPT, false).unwrap();
+        assert!(body.contains("gh pr create"));
+
+        // Without the question line there is no anchor: refuse.
+        let no_question = CLAUDE_TALL_PROMPT.replace(" Do you want to proceed?\n", "");
+        assert_eq!(
+            evaluate_approve_gate(Provider::Claude, &no_question, false),
+            Err("no tool header or 'Do you want ...' question above the options")
         );
     }
 
