@@ -356,9 +356,10 @@ fn append_audit_log(
         "duration_ms": v.duration_ms,
         "raw": truncate(raw, 1000),
     });
+    // One write call: `writeln!` issues several, and concurrent audit workers
+    // then interleave their lines.
     let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
-    writeln!(f, "{entry}")?;
-    Ok(())
+    f.write_all(format!("{entry}\n").as_bytes())
 }
 
 fn truncate(s: &str, n: usize) -> String {
