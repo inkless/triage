@@ -1130,6 +1130,21 @@ struct AutoAuditPayload {
     claude_prompt: Option<tmux::ClaudePermissionPrompt>,
 }
 
+/// Identity of the prompt on screen: the hook's pending uuid when there is
+/// one, otherwise the tool name plus its full input.
+fn prompt_fingerprint(payload: &AutoAuditPayload) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match &payload.pending {
+        Some(pending) => pending.uuid.hash(&mut hasher),
+        None => {
+            payload.tool_name.hash(&mut hasher);
+            payload.tool_input.hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
 fn audit_payload_for_session(
     s: &models::Session,
     mode: models::ApprovalMode,
@@ -1262,7 +1277,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
             started_at_ms: s.started_at_ms,
         })
         .collect();
-    app.audit_decided.retain(|k| blocked_keys.contains(k));
+    app.audit_decided.retain(|k, _| blocked_keys.contains(k));
 
     // Drain returning verdicts. Routing happened in the worker thread (so the
     // decision file lands before the claim is removed and the hook reacts).
@@ -1299,7 +1314,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
             cwd: s.cwd.clone(),
             started_at_ms: s.started_at_ms,
         };
-        app.audit_decided.insert(key);
+        app.audit_decided.insert(key, v.prompt_fp);
         app.status_msg = Some(format!(
             "auditor {}: pid {} ({})",
             v.decision, v.pid, v.tool_name
@@ -1330,12 +1345,13 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
             cwd: s.cwd.clone(),
             started_at_ms: s.started_at_ms,
         };
-        if app.audit_decided.contains(&key) {
-            continue;
-        }
         let Some(payload) = audit_payload_for_session(s, app.approval_mode) else {
             continue;
         };
+        let prompt_fp = prompt_fingerprint(&payload);
+        if app.audit_decided.get(&key) == Some(&prompt_fp) {
+            continue;
+        }
         if s.provider == models::Provider::Claude
             && (app.approval_mode != models::ApprovalMode::Hook || payload.pending.is_none())
             && payload.claude_prompt.is_none()
@@ -1377,6 +1393,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
                 &payload.tool_name,
                 &payload.tool_input,
             );
+            v.prompt_fp = prompt_fp;
             // Route APPROVE/DENY here so the decision file lands BEFORE
             // remove_claim. WAIT writes nothing — the hook sees claim removal
             // with no decision and bails to Claude's native flow. Codex has
@@ -1625,8 +1642,8 @@ fn jump_to_selected(app: &mut AppState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, audit_payload_for_claude, audit_verdict_needs_attention,
-        is_auto_auditable_claude_tool, should_alert_actionable_transition,
+        AutoAuditPayload, Cli, Command, audit_payload_for_claude, audit_verdict_needs_attention,
+        is_auto_auditable_claude_tool, prompt_fingerprint, should_alert_actionable_transition,
     };
     use crate::approval::PendingApproval;
     use crate::models::{AttentionState, Provider, Session};
@@ -2067,6 +2084,28 @@ esac
             }
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn consecutive_prompts_of_one_tool_get_distinct_fingerprints() {
+        let payload = |input: &str| AutoAuditPayload {
+            tool_name: "mcp__jira__createJiraIssue".to_string(),
+            tool_input: input.to_string(),
+            pending: None,
+            claude_prompt: None,
+        };
+
+        // Back-to-back Jira creates arrive inside one refresh tick, so the
+        // session never visibly leaves Blocked; only the fingerprint tells
+        // the second prompt from the one already audited.
+        assert_eq!(
+            prompt_fingerprint(&payload("summary: first")),
+            prompt_fingerprint(&payload("summary: first"))
+        );
+        assert_ne!(
+            prompt_fingerprint(&payload("summary: first")),
+            prompt_fingerprint(&payload("summary: second"))
+        );
     }
 
     #[test]

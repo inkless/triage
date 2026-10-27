@@ -96,10 +96,12 @@ pub struct AppState {
     /// ticks while a verdict is in flight; the timestamp drives the
     /// "auditor running… (Xs)" indicator in the detail view.
     pub audit_in_flight: HashMap<u32, SystemTime>,
-    /// (cwd, started_at_ms) → last decision the auditor returned for this
-    /// stable session identity. Re-deciding on every tick would burn tokens;
-    /// we only re-fire when the session leaves and re-enters `waiting`.
-    pub audit_decided: HashSet<MuteKey>,
+    /// (cwd, started_at_ms) → fingerprint of the last prompt the auditor
+    /// decided for this stable session identity. Re-deciding the same prompt
+    /// on every tick would burn tokens; we re-fire when the session leaves
+    /// `waiting` or shows a different prompt (back-to-back prompts can chain
+    /// inside one refresh tick, so leaving `waiting` is not always observed).
+    pub audit_decided: HashMap<MuteKey, u64>,
     /// Per-session verdict annotation, surfaced in detail view + status line.
     pub audit_notes: HashMap<u32, (SystemTime, String)>,
     /// Worker threads send completed verdicts here; `refresh()` drains.
@@ -222,7 +224,7 @@ impl AppState {
             autonomous: loaded.autonomous,
             phone_push_enabled: loaded.phone_push_enabled,
             audit_in_flight: HashMap::new(),
-            audit_decided: HashSet::new(),
+            audit_decided: HashMap::new(),
             audit_notes: HashMap::new(),
             audit_tx,
             audit_rx,

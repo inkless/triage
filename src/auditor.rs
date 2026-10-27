@@ -100,6 +100,9 @@ pub struct Verdict {
     /// Wall-clock duration of the audit subprocess as reported by claude
     /// (`duration_ms`). Useful for spotting Sonnet rate-limit slowdowns.
     pub duration_ms: Option<u64>,
+    /// Identity of the prompt this verdict answers (`prompt_fingerprint`).
+    /// Set by the autonomous loop; 0 for one-shot audits.
+    pub prompt_fp: u64,
 }
 
 /// Resolve the system prompt at call time so users can iterate on it without
@@ -167,6 +170,7 @@ pub fn run_audit(
                 tool_name: tool_name.to_string(),
                 cost_usd: None,
                 duration_ms: None,
+                prompt_fp: 0,
             };
             let _ = append_audit_log(&v, cwd, intent, tool_input, "");
             return v;
@@ -202,6 +206,7 @@ pub fn run_audit(
         tool_name: tool_name.to_string(),
         cost_usd,
         duration_ms,
+        prompt_fp: 0,
     };
     let _ = append_audit_log(&v, cwd, intent, tool_input, &raw_envelope);
     v
