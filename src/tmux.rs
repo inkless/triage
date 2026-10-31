@@ -1253,8 +1253,13 @@ pub fn parse_pending_full(pane: &str) -> Option<String> {
     Some(collected.join("\n"))
 }
 
+/// A full-width rule, optionally carrying a session-name label
+/// (`──── agent-UPR-493 ─`) when the Claude session was started with `-n`.
 fn is_outer_separator(s: &str) -> bool {
-    !s.is_empty() && s.chars().count() >= 20 && s.chars().all(|c| c == '─')
+    s.starts_with('─')
+        && s.ends_with('─')
+        && s.chars().filter(|&c| c == '─').count() >= 20
+        && !s.trim_matches('─').contains('─')
 }
 
 fn is_inner_separator(s: &str) -> bool {
@@ -1416,6 +1421,18 @@ Esc to cancel · Tab to amend
             "│ echo '☐ Layout'\n│ echo '← ☐ Options ✔ Submit →'",
         );
         assert!(claude_permission_prompt(&quoted).is_some());
+    }
+
+    #[test]
+    fn permission_parser_accepts_a_session_name_in_the_bottom_border() {
+        // Regression: a session started with `-n agent-UPR-493` draws its name
+        // into the rule below the footer, which read as extra screen content
+        // and left auto mode skipping the prompt.
+        let pane = include_str!("../tests/fixtures/claude-prompts/shell.txt");
+        let rule = "─".repeat(40);
+        let labeled = format!("{pane}\n{rule} agent-UPR-493 ─\n");
+        assert!(claude_permission_prompt(&labeled).is_some());
+        assert!(claude_permission_prompt(&format!("{pane}\n{rule} agent ─ x ─\n")).is_none());
     }
 
     #[test]
