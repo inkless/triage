@@ -1,0 +1,10 @@
+────────────────────────────────────────
+Ready to code?
+│ Here is Claude's plan:
+│ ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+│ Extract a standalone StatsigSession module.
+Would you like to proceed?
+❯ 1. Yes, auto-accept edits
+  2. Yes, manually approve edits
+  3. No, keep planning
+Esc to cancel · Tab to amend

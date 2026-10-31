@@ -1170,8 +1170,91 @@ fn is_auto_auditable_claude_tool(tool_name: &str) -> bool {
             .unwrap_or(tool_name)
             .to_ascii_lowercase()
             .as_str(),
-        "askuserquestion" | "userquestion" | "request_user_input" | "request_user_input_async"
+        "askuserquestion"
+            | "userquestion"
+            | "exitplanmode"
+            | "request_user_input"
+            | "request_user_input_async"
     )
+}
+
+/// Why a Blocked Claude session shows a permission prompt that auto mode could
+/// not read, plus the screen it failed on. `None` when the prompt is readable,
+/// is a question or plan for the human, or there is no prompt at all.
+fn unreadable_claude_prompt(content: &str) -> Option<&'static str> {
+    if !tmux::has_pending_permission_prompt(&tmux::strip_ansi(content))
+        || tmux::has_claude_user_choice_prompt(content)
+    {
+        return None;
+    }
+    tmux::claude_permission_prompt_checked(content).err()
+}
+
+const UNPARSED_CAPTURES_KEPT: usize = 20;
+
+/// Save the screen auto mode could not read, so the next parser regression
+/// becomes a fixture instead of a guess. Prunes to the newest captures.
+fn save_unparsed_capture(pid: u32, content: &str) -> Option<std::path::PathBuf> {
+    let dir = std::path::PathBuf::from(std::env::var_os("HOME")?).join(".config/triage/unparsed");
+    std::fs::create_dir_all(&dir).ok()?;
+    let ts = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("{ts}-{pid}.txt"));
+    std::fs::write(&path, content).ok()?;
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .collect();
+    files.sort();
+    let excess = files.len().saturating_sub(UNPARSED_CAPTURES_KEPT);
+    for old in &files[..excess] {
+        let _ = std::fs::remove_file(old);
+    }
+    Some(path)
+}
+
+/// Auto mode skips a prompt it cannot read, which otherwise looks like it
+/// simply is not running. Say so in the audit note, keep the screen, and
+/// alert if the session was already Blocked (a fresh transition alerts on its
+/// own).
+fn note_unreadable_prompt(app: &mut ui::AppState, s: &models::Session) {
+    use std::hash::{Hash, Hasher};
+    if s.provider != models::Provider::Claude {
+        return;
+    }
+    let Some(content) = s
+        .pane
+        .as_ref()
+        .and_then(|pane| tmux::capture_pane_visible_ansi(&pane.target))
+    else {
+        return;
+    };
+    let Some(reason) = unreadable_claude_prompt(&content) else {
+        return;
+    };
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    reason.hash(&mut hasher);
+    content.hash(&mut hasher);
+    let fp = hasher.finish();
+    if app.auto_skip_noted.insert(s.pid, fp) == Some(fp) {
+        return;
+    }
+    let saved = save_unparsed_capture(s.pid, &content)
+        .map(|p| format!(" (screen saved to {})", p.display()))
+        .unwrap_or_default();
+    app.audit_notes.insert(
+        s.pid,
+        (
+            SystemTime::now(),
+            format!("WAIT — auto mode could not read this prompt: {reason}{saved}"),
+        ),
+    );
+    if app.last_states.get(&s.pid) == Some(&models::AttentionState::Blocked) {
+        notify_os::alert(s, &app.config, app.phone_push_enabled);
+    }
 }
 
 fn audit_payload_for_claude(
@@ -1278,6 +1361,13 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         })
         .collect();
     app.audit_decided.retain(|k, _| blocked_keys.contains(k));
+    let blocked_pids: HashSet<u32> = sessions
+        .iter()
+        .filter(|s| is_auto_auditable_blocked(s))
+        .map(|s| s.pid)
+        .collect();
+    app.auto_skip_noted
+        .retain(|pid, _| blocked_pids.contains(pid));
 
     // Drain returning verdicts. Routing happened in the worker thread (so the
     // decision file lands before the claim is removed and the hook reacts).
@@ -1346,6 +1436,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
             started_at_ms: s.started_at_ms,
         };
         let Some(payload) = audit_payload_for_session(s, app.approval_mode) else {
+            note_unreadable_prompt(app, s);
             continue;
         };
         let prompt_fp = prompt_fingerprint(&payload);
@@ -1817,6 +1908,7 @@ mod tests {
             "ASKUSERQUESTION",
             "functions.request_user_input",
             "tools:AskUserQuestion",
+            "ExitPlanMode",
             "request_user_input_async",
         ] {
             assert!(!is_auto_auditable_claude_tool(name), "{name}");
@@ -1827,10 +1919,13 @@ mod tests {
             include_str!("../tests/fixtures/claude-prompts/layout-question.txt"),
             include_str!("../tests/fixtures/claude-prompts/comment-question.txt"),
             include_str!("../tests/fixtures/claude-prompts/multi-question.txt"),
+            include_str!("../tests/fixtures/claude-prompts/plan-approval.txt"),
+            include_str!("../tests/fixtures/claude-prompts/free-text-question.txt"),
         ];
         for name in [
             "?",
             "Bash",
+            "ExitPlanMode",
             "AskUserQuestion",
             "UserQuestion",
             "functions.request_user_input",
@@ -2143,6 +2238,24 @@ esac
             audit_payload_for_claude(&session, crate::models::ApprovalMode::Hook)
                 .map(|p| (p.tool_name, p.tool_input)),
             Some(("Bash".to_string(), r#"{"questions":[]}"#.to_string()))
+        );
+    }
+
+    #[test]
+    fn unreadable_prompts_are_reported_but_questions_and_readable_prompts_are_not() {
+        let shell = include_str!("../tests/fixtures/claude-prompts/shell.txt");
+        assert_eq!(super::unreadable_claude_prompt(shell), None);
+        assert_eq!(super::unreadable_claude_prompt("just a transcript"), None);
+        for question in [
+            include_str!("../tests/fixtures/claude-prompts/layout-question.txt"),
+            include_str!("../tests/fixtures/claude-prompts/plan-approval.txt"),
+            include_str!("../tests/fixtures/claude-prompts/free-text-question.txt"),
+        ] {
+            assert_eq!(super::unreadable_claude_prompt(question), None);
+        }
+        assert_eq!(
+            super::unreadable_claude_prompt(&format!("{shell}\nsomething new below\n")),
+            Some("extra lines below the 'Esc to cancel' footer")
         );
     }
 }

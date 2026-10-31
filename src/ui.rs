@@ -104,6 +104,10 @@ pub struct AppState {
     pub audit_decided: HashMap<MuteKey, u64>,
     /// Per-session verdict annotation, surfaced in detail view + status line.
     pub audit_notes: HashMap<u32, (SystemTime, String)>,
+    /// Blocked sessions whose prompt auto mode could not parse, keyed by pid
+    /// with a hash of the failure + screen, so each unreadable screen is
+    /// reported (and saved for a fixture) once.
+    pub auto_skip_noted: HashMap<u32, u64>,
     /// Worker threads send completed verdicts here; `refresh()` drains.
     pub audit_tx: mpsc::Sender<Verdict>,
     pub audit_rx: mpsc::Receiver<Verdict>,
@@ -226,6 +230,7 @@ impl AppState {
             audit_in_flight: HashMap::new(),
             audit_decided: HashMap::new(),
             audit_notes: HashMap::new(),
+            auto_skip_noted: HashMap::new(),
             audit_tx,
             audit_rx,
             default_model: crate::approval::read_default_model(),

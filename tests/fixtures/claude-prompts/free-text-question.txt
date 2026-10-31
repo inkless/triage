@@ -1,0 +1,9 @@
+────────────────────────────────────────
+Bash command
+│ rm -rf build/
+Do you want to proceed?
+❯ 1. Yes
+  2. No
+  3. Type something.
+  4. Chat about this
+Esc to cancel · Tab to amend

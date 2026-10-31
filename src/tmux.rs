@@ -722,10 +722,18 @@ pub struct ClaudePermissionPrompt {
 
 pub fn has_claude_user_choice_prompt(pane: &str) -> bool {
     strip_ansi(pane).lines().any(|line| {
-        let line = line.trim();
+        let line = line.trim_start_matches(|c: char| c.is_whitespace() || c == '❯');
+        let option = line.trim_start_matches(|c: char| c.is_ascii_digit() || c == '.' || c == ' ');
         line.starts_with('☐')
             || line.starts_with('☒')
             || (line.starts_with('←') && line.contains("✔ Submit") && line.ends_with('→'))
+            // Plan approval and free-text escape hatches: a human has to read
+            // the plan or write the answer, whatever the tool name says.
+            || line.starts_with("Ready to code?")
+            || line.starts_with("Here is Claude's plan")
+            || option.starts_with("No, keep planning")
+            || option.starts_with("Chat about this")
+            || option.starts_with("Type something")
     })
 }
 
@@ -1371,6 +1379,8 @@ Esc to cancel · Tab to amend
             include_str!("../tests/fixtures/claude-prompts/layout-question.txt"),
             include_str!("../tests/fixtures/claude-prompts/comment-question.txt"),
             include_str!("../tests/fixtures/claude-prompts/multi-question.txt"),
+            include_str!("../tests/fixtures/claude-prompts/plan-approval.txt"),
+            include_str!("../tests/fixtures/claude-prompts/free-text-question.txt"),
         ] {
             assert!(has_claude_user_choice_prompt(pane));
             assert!(claude_permission_prompt(pane).is_none());
