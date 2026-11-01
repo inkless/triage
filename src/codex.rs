@@ -267,6 +267,7 @@ fn attach_daemon_clients(
         .map(|&i| HostedThread {
             daemon: sessions[i].pid,
             cwd: sessions[i].cwd.clone(),
+            name: sessions[i].name.clone(),
             evidence: [
                 sessions[i].last_prompt.as_deref(),
                 sessions[i].latest_assistant_text.as_deref(),
@@ -278,21 +279,24 @@ fn attach_daemon_clients(
             .collect(),
         })
         .collect();
-    let targets: Vec<(u32, String)> = clients
+    let targets: Vec<(u32, Pane)> = clients
         .iter()
-        .filter_map(|&pid| {
-            tmux::find_owning_pane(pid, panes, ppid_map, 8).map(|pane| (pid, pane.target))
-        })
+        .filter_map(|&pid| tmux::find_owning_pane(pid, panes, ppid_map, 8).map(|pane| (pid, pane)))
         .collect();
     let captures = tmux::capture_pane_tails(
         &targets
             .iter()
-            .map(|(_, target)| target.clone())
+            .map(|(_, pane)| pane.target.clone())
             .collect::<Vec<_>>(),
         200,
     );
-    for (pid, target) in targets {
-        if let (Some(fd), Some(text)) = (fds.get_mut(&pid), captures.get(&target)) {
+    let titles = tmux::pane_titles();
+    for (pid, pane) in targets {
+        let Some(fd) = fds.get_mut(&pid) else {
+            continue;
+        };
+        fd.pane_title = titles.get(&pane.pane_id).cloned().unwrap_or_default();
+        if let Some(text) = captures.get(&pane.target) {
             fd.pane_text = normalize_pane_evidence(text);
         }
     }
@@ -305,6 +309,8 @@ fn attach_daemon_clients(
 struct HostedThread {
     daemon: u32,
     cwd: PathBuf,
+    /// Codex's thread name, which its TUI shows in the pane title.
+    name: Option<String>,
     evidence: Vec<String>,
 }
 
@@ -316,6 +322,7 @@ fn normalize_pane_evidence(text: &str) -> String {
 struct ProcessFds {
     cwd: Option<PathBuf>,
     pane_text: String,
+    pane_title: String,
     /// Kernel addresses of this process's unix sockets.
     sockets: HashSet<String>,
     /// Kernel addresses of the unix sockets this process's sockets point to.
@@ -433,31 +440,21 @@ fn match_daemon_clients(
         let mut open_threads: Vec<usize> = (0..threads.len())
             .filter(|&i| threads[i].daemon == daemon)
             .collect();
-        let text_matches: Vec<(usize, u32)> = open_threads
-            .iter()
-            .flat_map(|&i| {
-                open_clients
-                    .iter()
-                    .copied()
-                    .filter(move |client| {
-                        fds.get(client).is_some_and(|fd| {
-                            threads[i].evidence.iter().any(|text| {
-                                text.chars().count() >= 40 && fd.pane_text.contains(text)
-                            })
-                        })
-                    })
-                    .map(move |client| (i, client))
+        // Strongest signal first: the pane title names the thread. Then the
+        // conversation on screen. Each claims only unambiguous pairs.
+        let by_title = candidates(&open_threads, &open_clients, |thread, client| {
+            let title = fds[&client].pane_title.as_str();
+            threads[thread].name.as_deref().is_some_and(|name| {
+                title == name || title.rsplit_once(" | ").is_some_and(|(n, _)| n == name)
             })
-            .collect();
-        for &(thread, client) in &text_matches {
-            if text_matches.iter().filter(|(t, _)| *t == thread).count() == 1
-                && text_matches.iter().filter(|(_, c)| *c == client).count() == 1
-            {
-                pairs.push((thread, client));
-                open_threads.retain(|t| *t != thread);
-                open_clients.retain(|c| *c != client);
-            }
-        }
+        });
+        claim_unique(&by_title, &mut open_threads, &mut open_clients, &mut pairs);
+        let by_text = candidates(&open_threads, &open_clients, |thread, client| {
+            threads[thread].evidence.iter().any(|text| {
+                text.chars().count() >= 40 && fds[&client].pane_text.contains(text.as_str())
+            })
+        });
+        claim_unique(&by_text, &mut open_threads, &mut open_clients, &mut pairs);
         let remaining_threads = open_threads.clone();
         open_threads.retain(|&i| {
             if remaining_threads
@@ -490,6 +487,37 @@ fn match_daemon_clients(
         }
     }
     pairs
+}
+
+fn candidates(
+    threads: &[usize],
+    clients: &[u32],
+    matches: impl Fn(usize, u32) -> bool,
+) -> Vec<(usize, u32)> {
+    threads
+        .iter()
+        .flat_map(|&thread| clients.iter().map(move |&client| (thread, client)))
+        .filter(|&(thread, client)| matches(thread, client))
+        .collect()
+}
+
+/// Pairs a thread with a client only when each appears in exactly one
+/// candidate; anything shared stays open rather than risk the wrong pane.
+fn claim_unique(
+    candidates: &[(usize, u32)],
+    open_threads: &mut Vec<usize>,
+    open_clients: &mut Vec<u32>,
+    pairs: &mut Vec<(usize, u32)>,
+) {
+    for &(thread, client) in candidates {
+        if candidates.iter().filter(|(t, _)| *t == thread).count() == 1
+            && candidates.iter().filter(|(_, c)| *c == client).count() == 1
+        {
+            pairs.push((thread, client));
+            open_threads.retain(|t| *t != thread);
+            open_clients.retain(|c| *c != client);
+        }
+    }
 }
 
 fn codex_state_path() -> Option<PathBuf> {
@@ -1827,6 +1855,7 @@ mod tests {
         HostedThread {
             daemon,
             cwd: PathBuf::from(cwd),
+            name: None,
             evidence: Vec::new(),
         }
     }
@@ -1951,6 +1980,36 @@ mod tests {
             fd.pane_text.clear();
         }
         assert!(match_daemon_clients(&threads, &[5304], &fds).is_empty());
+        assert!(match_daemon_clients(&threads, &[5304, 5305], &fds).is_empty());
+    }
+
+    #[test]
+    fn same_directory_clients_pair_by_pane_title() {
+        let mut fds = parse_process_fds(DAEMON_LSOF);
+        fds.get_mut(&5304).unwrap().pane_title = "Research paths | music".to_string();
+        fds.insert(
+            5305,
+            ProcessFds {
+                cwd: Some(PathBuf::from("/work/music")),
+                peers: HashSet::from(["0xe81c".to_string()]),
+                pane_title: "Assess web UI | music".to_string(),
+                ..ProcessFds::default()
+            },
+        );
+        let mut threads = [hosted(53894, "/work/music"), hosted(53894, "/work/music")];
+        threads[0].name = Some("Assess web UI".to_string());
+        threads[1].name = Some("Research paths".to_string());
+        assert_eq!(
+            match_daemon_clients(&threads, &[5304, 5305], &fds),
+            vec![(0, 5305), (1, 5304)]
+        );
+
+        // Two panes carrying the same title cannot identify either.
+        fds.get_mut(&5304).unwrap().pane_title = "Assess web UI | music".to_string();
+        assert!(match_daemon_clients(&threads, &[5304, 5305], &fds).is_empty());
+        // A pane title that is only a prefix of the name is not a match.
+        fds.get_mut(&5304).unwrap().pane_title = "Assess | music".to_string();
+        fds.get_mut(&5305).unwrap().pane_title = String::new();
         assert!(match_daemon_clients(&threads, &[5304, 5305], &fds).is_empty());
     }
 

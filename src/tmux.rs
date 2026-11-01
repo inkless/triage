@@ -598,6 +598,22 @@ pub fn capture_pane_tail(target: &str, lines: u32) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Pane id -> pane title for every tmux pane. Codex titles its pane
+/// `<thread name> | <directory>`, which names the thread the pane is showing.
+pub fn pane_titles() -> HashMap<String, String> {
+    let Ok(out) = Command::new("tmux")
+        .args(["list-panes", "-a", "-F", "#{pane_id}|#{pane_title}"])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|line| line.split_once('|'))
+        .map(|(id, title)| (id.to_string(), title.to_string()))
+        .collect()
+}
+
 /// Capture several pane tails through one tmux client process. Permission
 /// detection must inspect idle Claude panes because provider status can stay
 /// `idle` while a native prompt is visible. Forking one `tmux` process per
