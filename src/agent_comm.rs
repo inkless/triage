@@ -1760,22 +1760,23 @@ fn is_pane_harness(pid: u32, provider: Provider) -> bool {
     {
         return true;
     }
-    let Ok(info) = mailbox::proc_info(pid) else {
-        return false;
-    };
+    mailbox::proc_info(pid).is_ok_and(|info| is_harness_comm(&info.comm, provider))
+}
+
+/// pi must be named `pi`, as discovery requires: a bare `node` could be any
+/// Node process.
+fn is_harness_comm(comm: &str, provider: Provider) -> bool {
     match provider {
-        Provider::Opencode => info.comm == "opencode" || info.comm == "opencode-pty",
-        // pi retitles itself `pi`; where the title does not reach the
-        // kernel's process name it is still `node`.
-        Provider::Pi => info.comm == "pi" || info.comm == "node",
+        Provider::Opencode => comm == "opencode" || comm == "opencode-pty",
+        Provider::Pi => comm == "pi",
         Provider::Claude | Provider::Codex => false,
     }
 }
 
 /// opencode and pi run no triage hooks and publish no per-process session
 /// record, so their callers are identified by tmux pane, NOT by session: the
-/// caller must descend from a harness process inside exactly one tracked
-/// pane. This names the pane (`opencode:%30`), never which of the harness's
+/// caller must be, or descend from, a harness process inside exactly one
+/// tracked pane. This names the pane (`opencode:%30`), never which of the harness's
 /// sessions is speaking — weaker than the Claude/Codex guarantee, and not to
 /// be read as session-grade identity.
 fn check_pane_only_caller(
@@ -1785,7 +1786,11 @@ fn check_pane_only_caller(
     provider: Provider,
     probe: &PaneProbe,
 ) -> Result<(), CliError> {
-    if !walked.iter().any(|&pid| (probe.is_harness)(pid, provider)) {
+    if !walked
+        .iter()
+        .chain([&pane_root])
+        .any(|&pid| (probe.is_harness)(pid, provider))
+    {
         return Err(CliError::denied(format!(
             "calling process is in a {} pane but not under its {} process",
             provider.name(),
@@ -2182,6 +2187,24 @@ mod tests {
                 Ok(sender)
             );
         }
+    }
+
+    #[test]
+    fn pi_run_as_the_pane_root_process_can_send() {
+        // `tmux new-window pi`: the shell execs pi, so pi is the pane root.
+        let parents = HashMap::from([(400, 350), (350, 200), (200, 1)]);
+        let sessions = [pane_only_session(Provider::Pi, 200)];
+        assert_eq!(
+            resolve_pane_only(&sessions, &parents, 200, &[200]).as_deref(),
+            Ok("pi:%30")
+        );
+    }
+
+    #[test]
+    fn pi_harness_is_named_pi_not_node() {
+        assert!(is_harness_comm("pi", Provider::Pi));
+        assert!(!is_harness_comm("node", Provider::Pi));
+        assert!(is_harness_comm("opencode-pty", Provider::Opencode));
     }
 
     #[test]

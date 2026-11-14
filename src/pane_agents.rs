@@ -85,7 +85,8 @@ fn children_of(ppid_map: &HashMap<u32, u32>) -> HashMap<u32, Vec<u32>> {
 /// The pane's foreground command names the harness when it was started from
 /// an interactive shell. Launched as `tmux new-window opencode`, the shell
 /// runs it without job control and tmux reports the shell instead, so also
-/// look at the pane's children and grandchildren.
+/// look at the pane's children and grandchildren. A shell that execs the
+/// harness makes it the pane's own process.
 /// Returns the harness and, when found, its process id.
 fn pane_provider(
     pane: &Pane,
@@ -96,7 +97,8 @@ fn pane_provider(
     let grandkids = kids
         .clone()
         .flat_map(|kid| children.get(kid).into_iter().flatten());
-    let harness = kids
+    let harness = std::iter::once(&pane.pid)
+        .chain(kids)
         .chain(grandkids)
         .find_map(|&pid| Some((provider_for_command(&comm(pid)?)?, pid)));
     match (provider_for_command(&pane.current_command), harness) {
@@ -535,6 +537,16 @@ mod tests {
         assert_eq!(
             pi_session_dir_name(Path::new("/home/inkless/workspace/bazhen")),
             "--home-inkless-workspace-bazhen--"
+        );
+    }
+
+    #[test]
+    fn finds_a_harness_that_is_the_pane_process() {
+        let comm = |pid: u32| (pid == 13).then(|| "pi".to_string());
+        let exec = pane(13, "%5", "/w", "pi");
+        assert_eq!(
+            pane_provider(&exec, &HashMap::new(), &comm),
+            Some((Provider::Pi, Some(13)))
         );
     }
 
