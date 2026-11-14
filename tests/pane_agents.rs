@@ -148,6 +148,29 @@ fn lists_opencode_and_pi_panes_with_session_names_and_state() {
 }
 
 #[test]
+fn an_opencode_database_without_usage_columns_still_names_the_pane() {
+    let fx = Fixture::new(
+        "oldschema",
+        r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'"#,
+    );
+    let sqlite3 = fx.dir.join("sqlite3");
+    fs::write(
+        &sqlite3,
+        r#"#!/bin/sh
+case "$*" in
+*tokens_cache_read*) echo "no such column: tokens_cache_read" >&2; exit 1 ;;
+*session_v2*) printf '[{"id":"ses_oc","directory":"/work/oc","title":"Fix the parser","time_created":1,"time_updated":2000000000000,"time_busy":10,"time_idle":20}]' ;;
+esac
+"#,
+    )
+    .unwrap();
+    let rows = fx.agents();
+    let oc = row(&rows, "%30");
+    assert_eq!(oc["session_id"], "ses_oc");
+    assert_eq!(oc["headline"], "Fix the parser");
+}
+
+#[test]
 fn panes_sharing_a_cwd_are_listed_but_not_named_after_a_guess() {
     let fx = Fixture::new(
         "twins",
