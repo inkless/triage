@@ -28,7 +28,7 @@ impl Fixture {
                 "\n",
                 r#"{"type":"session_info","id":"i1","timestamp":"2026-10-14T18:49:14Z","name":"pi-worker"}"#,
                 "\n",
-                r#"{"type":"message","id":"m1","timestamp":"2026-10-14T18:49:15Z","message":{"role":"user"}}"#,
+                r#"{"type":"message","id":"m1","timestamp":"2026-10-14T18:49:15Z","message":{"role":"user","content":[{"type":"text","text":"please fix pi"}]}}"#,
                 "\n",
             ),
         )
@@ -52,7 +52,7 @@ esac
 case "$*" in
 *"where id = 'ses_oc'"*) printf '[{"directory":"/work/oc"}]' ;;
 *"where id ="*) printf '[{"directory":"/work/other"}]' ;;
-*session_v2*) printf '[{"id":"ses_oc","directory":"/work/oc","title":"Fix the parser","time_created":1,"time_updated":2000000000000,"time_busy":10,"time_idle":20}]' ;;
+*session_v2*) printf '[{"id":"ses_oc","directory":"/work/oc","title":"Fix the parser","time_created":1,"time_updated":2000000000000,"time_busy":10,"time_idle":20,"last_user_text":"please fix the parser"}]' ;;
 esac
 "#,
             ),
@@ -128,7 +128,7 @@ fn lists_opencode_and_pi_panes_with_session_names_and_state() {
     let oc = row(&rows, "%30");
     assert_eq!(oc["provider"], "oc");
     assert_eq!(oc["name"], "Fix the parser");
-    assert_eq!(oc["headline"], "Fix the parser");
+    assert_eq!(oc["headline"], "please fix the parser");
     assert_eq!(oc["cwd"], "/work/oc");
     assert_eq!(oc["session_id"], "ses_oc");
     assert_eq!(oc["agent_id"], serde_json::Value::Null);
@@ -137,6 +137,7 @@ fn lists_opencode_and_pi_panes_with_session_names_and_state() {
     let pi = row(&rows, "%31");
     assert_eq!(pi["provider"], "pi");
     assert_eq!(pi["name"], "pi-worker");
+    assert_eq!(pi["headline"], "please fix pi");
     assert_eq!(pi["cwd"], "/work/pi");
     assert_eq!(pi["session_id"], "01a1-pi");
     assert_eq!(pi["state"], "Working");
