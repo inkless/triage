@@ -1834,6 +1834,7 @@ struct PaneProbe<'a> {
     opencode_env: Option<(String, String)>,
     opencode_session_dir: &'a dyn Fn(&str) -> Option<PathBuf>,
     opencode_server_pid: Option<u32>,
+    opencode_sessions_since: &'a dyn Fn(&Path, u64) -> Option<Vec<String>>,
     /// `PI_SESSION_ID`, unless pi marked the session ephemeral by leaving
     /// `PI_SESSION_FILE` unset.
     pi_session: Option<String>,
@@ -1867,6 +1868,7 @@ fn resolve_caller(
         },
         is_harness: &is_pane_harness,
         opencode_session_dir: &crate::pane_agents::opencode_session_dir,
+        opencode_sessions_since: &crate::pane_agents::opencode_sessions_since,
         pi_session: std::env::var("PI_SESSION_ID")
             .ok()
             .filter(|id| !id.is_empty())
@@ -1949,7 +1951,9 @@ fn check_pane_only_caller(
 /// opencode records in its `service.json`; and opencode's database places the
 /// session in the pane's directory. The pane claim itself is not proven: a
 /// tool shell of that server can name any opencode pane in its session's
-/// directory.
+/// directory, and any session there. So the caller speaks as the session only
+/// when it is the one top-level session in that directory written to since
+/// the pane's opencode started; otherwise it is identified by its pane.
 fn resolve_opencode_caller(
     sessions: &[Session],
     walked: &[u32],
@@ -1996,8 +2000,16 @@ fn resolve_opencode_caller(
             "OPENCODE_SESSION_ID {session_id} is not a session in {pane_id}'s directory"
         )));
     }
+    let only_recent = session
+        .harness_started_ms
+        .and_then(|since| (probe.opencode_sessions_since)(&session.cwd, since))
+        .is_some_and(|ids| ids == [session_id.as_str()]);
     let mut caller = session.clone();
-    caller.session_id = session_id.clone();
+    caller.session_id = if only_recent {
+        session_id.clone()
+    } else {
+        pane_id.clone()
+    };
     Ok(Some(caller))
 }
 
@@ -2356,6 +2368,7 @@ mod tests {
         s.provider = provider;
         s.pid = pane_root;
         s.session_id = "ses_x".into();
+        s.harness_started_ms = Some(1_000);
         if let Some(pane) = s.pane.as_mut() {
             pane.pid = pane_root;
             pane.pane_id = "%30".into();
@@ -2375,6 +2388,7 @@ mod tests {
             opencode_env: None,
             opencode_session_dir: &|_| None,
             opencode_server_pid: None,
+            opencode_sessions_since: &|_, _| None,
             pi_session: None,
             pi_session_in_cwd: &|_, _| false,
             pi_host_session: &|_| None,
@@ -2468,6 +2482,7 @@ mod tests {
             opencode_env: None,
             opencode_session_dir: &|_| None,
             opencode_server_pid: None,
+            opencode_sessions_since: &|_, _| None,
             pi_session: env.map(str::to_string),
             pi_session_in_cwd: &|cwd, id| {
                 cwd == Path::new("/tmp/project") && matches!(id, "pi-known" | "pi-other")
@@ -2558,6 +2573,8 @@ mod tests {
         server: Option<u32>,
         pane_roots: &'a [u32],
         session_dir: &'a str,
+        /// Top-level sessions in the directory since the pane's opencode started.
+        recent: &'a [&'a str],
     }
 
     impl Default for OpencodeCall<'_> {
@@ -2569,6 +2586,7 @@ mod tests {
                 server: Some(250),
                 pane_roots: &[],
                 session_dir: "/tmp/project",
+                recent: &["ses_x"],
             }
         }
     }
@@ -2582,6 +2600,10 @@ mod tests {
             opencode_env: Some((call.session.to_string(), call.pane.to_string())),
             opencode_session_dir: &|_| Some(dir.clone()),
             opencode_server_pid: call.server,
+            opencode_sessions_since: &|cwd, since| {
+                (cwd == Path::new("/tmp/project") && since == 1_000)
+                    .then(|| call.recent.iter().map(|id| id.to_string()).collect())
+            },
             pi_session: None,
             pi_session_in_cwd: &|_, _| false,
             pi_host_session: &|_| None,
@@ -2602,11 +2624,34 @@ mod tests {
         // A second session in the pane's directory is still this pane.
         let other = OpencodeCall {
             session: "ses_y",
+            recent: &["ses_y"],
             ..Default::default()
         };
         assert_eq!(
             resolve_opencode_env(&sessions, other).as_deref(),
             Ok("opencode:%30 ses_y")
+        );
+    }
+
+    #[test]
+    fn opencode_caller_speaks_as_its_session_only_when_no_other_could_be_it() {
+        let sessions = [pane_only_session(Provider::Opencode, 200)];
+        for recent in [&["ses_x", "ses_y"][..], &["ses_y"][..], &[][..]] {
+            let call = OpencodeCall {
+                recent,
+                ..Default::default()
+            };
+            assert_eq!(
+                resolve_opencode_env(&sessions, call).as_deref(),
+                Ok("opencode:%30 -"),
+                "{recent:?}"
+            );
+        }
+        let mut unknown_start = pane_only_session(Provider::Opencode, 200);
+        unknown_start.harness_started_ms = None;
+        assert_eq!(
+            resolve_opencode_env(&[unknown_start], OpencodeCall::default()).as_deref(),
+            Ok("opencode:%30 -")
         );
     }
 

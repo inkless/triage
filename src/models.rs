@@ -175,6 +175,8 @@ pub struct Session {
     /// These enrich the headline/detail and hook-mode `a`/`d` flow, but they
     /// are only actionable when Claude itself reports `status == "waiting"`.
     pub pending_approvals: Vec<PendingApproval>,
+    /// When the harness process in an opencode or pi pane started, if known.
+    pub harness_started_ms: Option<u64>,
 }
 
 impl Session {
@@ -235,6 +237,7 @@ impl Session {
             watched: false,
             pinned: false,
             pending_approvals: Vec::new(),
+            harness_started_ms: None,
         }
     }
 }

@@ -227,15 +227,18 @@ fn sessions_for_panes(
     panes
         .iter()
         .map(|pane| {
-            if panes_per_cwd[pane.cwd.as_path()] != 1 {
-                return pane_session(provider, pane, None);
-            }
             let since = started.get(&pane.pane_id).copied();
-            match (latest_in(metas, &pane.cwd, since), since) {
-                (Some(meta), _) => pane_session(provider, pane, Some(meta)),
-                (None, Some(_)) => pane_session(provider, pane, Some(&fresh_meta(pane))),
-                (None, None) => pane_session(provider, pane, None),
-            }
+            let mut session = if panes_per_cwd[pane.cwd.as_path()] != 1 {
+                pane_session(provider, pane, None)
+            } else {
+                match (latest_in(metas, &pane.cwd, since), since) {
+                    (Some(meta), _) => pane_session(provider, pane, Some(meta)),
+                    (None, Some(_)) => pane_session(provider, pane, Some(&fresh_meta(pane))),
+                    (None, None) => pane_session(provider, pane, None),
+                }
+            };
+            session.harness_started_ms = since;
+            session
         })
         .collect()
 }
@@ -360,6 +363,34 @@ pub fn opencode_session_dir(id: &str) -> Option<PathBuf> {
         .filter(|out| out.status.success())?;
     let rows: Vec<Value> = serde_json::from_slice(&out.stdout).ok()?;
     rows.first()?.get("directory")?.as_str().map(PathBuf::from)
+}
+
+/// Top-level opencode sessions in `dir` written to since `since_ms`; `None`
+/// when the database can't be read.
+pub fn opencode_sessions_since(dir: &Path, since_ms: u64) -> Option<Vec<String>> {
+    let db = opencode_db_path();
+    let since = since_ms.saturating_sub(START_SLACK_MS);
+    let query = format!(
+        "select id, directory, time_updated from session_v2 \
+         where parent_id is null and time_updated >= {since}"
+    );
+    let out = Command::new("sqlite3")
+        .args(["-readonly", "-json", &db.to_string_lossy(), &query])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if text.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let rows: Vec<OpencodeRow> = serde_json::from_str(&text).ok()?;
+    Some(
+        rows.into_iter()
+            .filter(|row| Path::new(&row.directory) == dir)
+            .filter(|row| row.time_updated.is_some_and(|t| t >= since))
+            .map(|row| row.id)
+            .collect(),
+    )
 }
 
 #[derive(Deserialize)]

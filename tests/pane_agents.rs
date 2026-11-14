@@ -54,7 +54,8 @@ esac
                 "sqlite3",
                 r#"
 case "$*" in
-*"where id = 'ses_oc'"*) printf '[{"directory":"/work/oc"}]' ;;
+*"where id = 'ses_oc'"*|*"where id = 'ses_twin'"*) printf '[{"directory":"/work/oc"}]' ;;
+*"time_updated >="*) printf '[{"id":"ses_oc","directory":"/work/oc","time_updated":2000000000000}%s]' "$EXTRA_OC_ROWS" ;;
 *"where id ="*) printf '[{"directory":"/work/other"}]' ;;
 *session_v2*) printf '[{"id":"ses_oc","directory":"/work/oc","title":"Fix the parser","time_created":1,"time_updated":2000000000000,"time_busy":10,"time_idle":20}]' ;;
 esac
@@ -95,6 +96,7 @@ esac
             .env_remove("TMUX_PANE")
             .env("CAPTURE", "")
             .env_remove("HARNESS_ARGS")
+            .env_remove("EXTRA_OC_ROWS")
             .env_remove("CODEX_THREAD_ID");
         command
     }
@@ -323,9 +325,8 @@ fn an_opencode_tool_shell_sends_as_its_pane() {
     .unwrap();
     let send = |session: &str| {
         fx.command(&["send", "--to", "%31", "--message", "hi pi"])
-            .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+            .envs(OPENCODE_IN_PANE_30)
             .env("OPENCODE_SESSION_ID", session)
-            .env("TMUX_PANE", "%30")
             .output()
             .unwrap()
     };
@@ -470,6 +471,15 @@ fn a_pi_tool_shell_sends_as_the_session_its_env_names() {
     assert_eq!(audit(&fx).len(), 1);
 }
 
+/// An opencode TUI (777002) runs in pane %30 (root 501), started five
+/// seconds ago; 777001, in every caller's chain, is its server.
+const OPENCODE_IN_PANE_30: [(&str, &str); 4] = [
+    ("TRIAGE_TEST_PANE_HARNESS", "777001,777002"),
+    ("EXTRA_PS", "777002 501"),
+    ("HARNESS_ARGS", "opencode"),
+    ("TMUX_PANE", "%30"),
+];
+
 /// The caller's process chain reaches no pane: an opencode tool shell.
 const OC_CALLER_AND_PI_TARGET: &str = r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'
   echo 'pi|1.0|502|/dev/null|pi|/work/pi|1|%31|pi'"#;
@@ -508,9 +518,8 @@ impl Fixture {
     fn as_opencode(&self, args: &[&str]) -> Output {
         self.record_opencode_server();
         self.command(args)
-            .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+            .envs(OPENCODE_IN_PANE_30)
             .env("OPENCODE_SESSION_ID", "ses_oc")
-            .env("TMUX_PANE", "%30")
             .output()
             .unwrap()
     }
@@ -714,7 +723,7 @@ fn mail_to_a_pi_session_with_the_extension_waits_for_its_waiter() {
     let fx = Fixture::new("pihost", OC_CALLER_AND_PI_TARGET);
     let pi = std::process::id().to_string();
     let hosted = "019a8f3c-0000-7000-8000-0000000000e1";
-    let harnesses = format!("777001,{pi}");
+    let harnesses = format!("777001,777002,{pi}");
     let as_pi_hook = |event: &str| {
         let mut child = fx
             .command(&["inbox", "--hook", "pi", event, "--triage-hook=v1"])
@@ -734,10 +743,10 @@ fn mail_to_a_pi_session_with_the_extension_waits_for_its_waiter() {
     };
     let with_pi = |args: &[&str]| {
         fx.command(args)
+            .envs(OPENCODE_IN_PANE_30)
             .env("TRIAGE_TEST_PANE_HARNESS", &harnesses)
-            .env("EXTRA_PS", format!("{pi} 502"))
+            .env("EXTRA_PS", format!("777002 501\n{pi} 502"))
             .env("OPENCODE_SESSION_ID", "ses_oc")
-            .env("TMUX_PANE", "%30")
             .output()
             .unwrap()
     };
@@ -771,4 +780,30 @@ fn mail_to_a_pi_session_with_the_extension_waits_for_its_waiter() {
     assert!(delivered.status.success());
     assert!(String::from_utf8_lossy(&delivered.stdout).contains("\nhi\n"));
     assert_eq!(mail(&fx, hosted, "delivered").len(), 1);
+}
+
+#[test]
+fn an_opencode_caller_is_pane_grade_when_another_session_shares_its_directory() {
+    let fx = Fixture::new("octwin", OC_CALLER_AND_PI_TARGET);
+    fx.record_opencode_server();
+    let send = |session: &str| {
+        fx.command(&["send", "--to", "%31", "--message", "hi pi"])
+            .envs(OPENCODE_IN_PANE_30)
+            .env("OPENCODE_SESSION_ID", session)
+            .env(
+                "EXTRA_OC_ROWS",
+                r#",{"id":"ses_twin","directory":"/work/oc","time_updated":2000000000000}"#,
+            )
+            .output()
+            .unwrap()
+    };
+    for session in ["ses_oc", "ses_twin"] {
+        let output = send(session);
+        assert!(output.status.success(), "{}", stderr(&output));
+    }
+    for entry in audit(&fx) {
+        assert_eq!(entry["from"], "opencode:%30");
+        assert_eq!(entry["from_session"], serde_json::Value::Null);
+    }
+    assert_eq!(audit(&fx).len(), 2);
 }

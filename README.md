@@ -101,23 +101,28 @@ without caring about the transport.
 
 opencode and pi agents can send too. They are named by provider and pane
 (`opencode:%30`, `pi:%31`) in the delivered text and the audit log, and are
-identified by session when their tool shell says which one it is. A pi caller
-must be, or run under, a process named `pi` inside exactly one tmux pane; when
-its shell carries `PI_SESSION_ID`, that id must name a pi session file for the
-pane's directory (otherwise the send is refused), and the caller speaks as
-that session. opencode runs tool shells under its shared `opencode serve`
-process, outside the pane, so an opencode caller is taken from the
-`OPENCODE_SESSION_ID` and `TMUX_PANE` its shell inherits, and is accepted only
-when that pane is a tracked opencode pane, the caller sits in no tmux pane, it
-runs under an `opencode` process and under the server pid recorded in
-`~/.local/state/opencode/service.json`, and opencode's database places that
-`ses_…` session in the pane's directory. That proves the caller is a tool
-shell of the running opencode server working in the pane's directory, not
-which opencode pane it belongs to: with two opencode panes in one directory
-either could claim the other. The audit log records the caller's session as
-`from_session`; a caller known only by its pane has none, and cannot use
-`triage inbox`. Pasted sends to these agents pass a gate that blocks on a
-visible permission prompt but does not inspect their input box.
+identified by session only when nothing else could be that session. A pi
+caller must be, or run under, a process named `pi` inside exactly one tmux
+pane. When its shell carries `PI_SESSION_ID`, that id must name a pi session
+file for the pane's directory and must not be a session another live pi
+process holds (otherwise the send is refused). The caller then speaks as that
+session if it is the one triage's pi extension registered for the caller's own
+pi process (any other id is refused), or, with no registration, if this is the
+only pi pane in the directory. opencode runs tool shells under its shared
+`opencode serve` process, outside the pane, so an opencode caller is taken
+from the `OPENCODE_SESSION_ID` and `TMUX_PANE` its shell inherits, and is
+accepted only when that pane is a tracked opencode pane, the caller sits in no
+tmux pane, it runs under an `opencode` process and under the server pid
+recorded in `~/.local/state/opencode/service.json`, and opencode's database
+places that `ses_…` session in the pane's directory. That proves the caller is
+a tool shell of the running opencode server working in the pane's directory,
+not which pane or session it belongs to, so it speaks as the session only when
+that is the one top-level session in the directory written to since the
+pane's opencode started. Every other caller is identified by its pane alone:
+the audit log records a session-grade caller's session as `from_session`; a
+pane-grade caller has none and cannot use `triage inbox`. Pasted sends to
+these agents pass a gate that blocks on a visible permission prompt but does
+not inspect their input box.
 
 ### Peer mail
 
