@@ -1,7 +1,7 @@
 //! Hook entrypoints (`triage inbox --hook …`) that deliver mailbox mail into a
 //! running agent. They run inside the agent's hook machinery: never load
 //! config, never spawn subprocesses (but `lsof` for a pi process's directory
-//! outside Linux), never write to stderr except the Claude
+//! outside Linux and macOS), never write to stderr except the Claude
 //! waiter's delivery, and always exit 0 on error (logging to `hook.log`).
 
 use std::io::{self, Read, Write};
@@ -297,7 +297,36 @@ fn process_cwd(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
 }
 
-#[cfg(not(target_os = "linux"))]
+/// From the kernel, not `lsof`: a hook may run with any PATH.
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+            size,
+        )
+    };
+    if filled != size {
+        return None;
+    }
+    let path: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .as_flattened()
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    (!path.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&path)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_cwd(pid: u32) -> Option<PathBuf> {
     let out = std::process::Command::new("lsof")
         .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
