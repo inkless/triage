@@ -115,10 +115,11 @@ fn mark_pending_permissions(sessions: &mut [Session]) {
     let server = server.with_timeout(PERMISSION_CHECK_TIMEOUT);
     for session in busy {
         if let Ok(pending) = server.pending_permissions(&session.session_id)
-            && let Some(first) = pending.first()
+            && let Some(first) = pending.first().cloned()
         {
             session.pane_blocked = true;
             session.last_tool_use = Some((first.action.clone(), first.resources.join(" ")));
+            session.opencode_permissions = pending;
         }
     }
 }

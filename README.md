@@ -212,10 +212,11 @@ Interruption does not guarantee queued input is processed; inspect the agent
 again before using normal `send` for an urgent follow-up. `send` never interrupts.
 
 An opencode turn is interrupted through the opencode server instead of a key.
-The server must report the session busy, with no new message, tool step or
-turn start for 15 minutes, no unfinished tool call, and no pending permission
-or question, twice in a row with nothing changed in between. Queued prompts
-stay parked. pi turns cannot be interrupted: pi's session file records only
+The server must report the session busy, with no new model message, tool step
+or turn start for 15 minutes, no unfinished tool call anywhere in the turn
+(queued prompts and mail are looked past), and no pending permission or
+question, in two reads three seconds apart with nothing changed, streamed text
+included. Queued prompts stay parked. pi turns cannot be interrupted: pi's session file records only
 finished messages, so a stalled turn cannot be told from a long reply or tool
 run.
 
@@ -424,6 +425,7 @@ Toggle with `A`. Off by default; persists across restart.
 When on, each refresh spawns `claude -p --model claude-sonnet-4-6 --tools "" --name triage-auditor` for any Blocked Claude, Codex or opencode session with a captured tool request. The auditor is Claude Sonnet for both providers; triage does not spawn Codex as the reviewer. The auditor receives the session's recent recap + intent + tool + full tool input and returns `APPROVE` / `DENY` / `WAIT` with a one-line reason.
 
 - `APPROVE` / `DENY` route through the same machinery as manual `a`/`d` (Claude hook decision file when available, tmux send-keys fallback; Codex visible-prompt routing; the opencode server for the audited request id).
+- For opencode, `a`/`d` and auto mode answer only the request shown on the row, and only while it is still pending. The auditor gets the tool call's full input and the user's latest prompt; a non-shell request whose input cannot be read whole waits for a person.
 - `WAIT` surfaces the reason in the detail pane and leaves the prompt for human review.
 - Claude `AskUserQuestion` prompts never enter the auditor; semantic choices are always left for direct human review.
 

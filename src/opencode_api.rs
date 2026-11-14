@@ -108,6 +108,16 @@ pub struct Permission {
     pub action: String,
     #[serde(default)]
     pub resources: Vec<String>,
+    #[serde(default)]
+    pub source: Option<PermissionSource>,
+}
+
+/// The tool call a permission request is for.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PermissionSource {
+    #[serde(rename = "messageID")]
+    pub message_id: String,
+    pub id: String,
 }
 
 impl Permission {
@@ -123,13 +133,18 @@ pub struct Turn {
     /// When the turn started or its newest message last changed; viewing the
     /// session does not count.
     pub progress_ms: u64,
-    /// A tool call in the newest message that has not finished.
+    /// A tool call in the current turn that has not finished.
     pub running_tool: Option<String>,
+    /// False when the messages read did not reach back to the turn's start.
+    pub whole_turn_seen: bool,
     pub pending_permissions: usize,
     pub pending_forms: usize,
-    /// Changes whenever the session or its newest message does.
+    /// Changes whenever the turn's messages do, streamed text included.
     pub stamp: String,
 }
+
+/// How many of the newest messages `turn` reads looking for the turn's start.
+const TURN_WINDOW: usize = 50;
 
 #[derive(Deserialize)]
 struct Data<T> {
@@ -142,6 +157,18 @@ impl Server {
             service: load_service()?,
             timeout: io_timeout(),
         })
+    }
+
+    #[cfg(test)]
+    pub fn at(addr: SocketAddr) -> Self {
+        Self {
+            service: Service {
+                addr,
+                host: addr.to_string(),
+                password: "test".to_string(),
+            },
+            timeout: Duration::from_secs(2),
+        }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
@@ -199,15 +226,53 @@ impl Server {
     pub fn turn(&self, session: &str) -> io::Result<Turn> {
         check_session(session)?;
         let record: Value = self.get(&format!("/api/session/{session}"))?;
-        let newest: Vec<Value> = self.get(&format!("/api/session/{session}/message?limit=1"))?;
+        let messages: Vec<Value> = self.get(&format!(
+            "/api/session/{session}/message?limit={TURN_WINDOW}"
+        ))?;
         let permissions: Vec<Value> = self.get(&format!("/api/session/{session}/permission"))?;
         let forms: Vec<Value> = self.get(&format!("/api/session/{session}/form"))?;
         Ok(turn_from(
             &record,
-            newest.first(),
+            &messages,
             permissions.len(),
             forms.len(),
         ))
+    }
+
+    /// The input of one tool call, as the model wrote it.
+    pub fn tool_input(&self, session: &str, source: &PermissionSource) -> io::Result<Value> {
+        check_session(session)?;
+        let ok =
+            |id: &str| !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !ok(&source.message_id) || !ok(&source.id) {
+            return Err(io::Error::other("invalid tool call id"));
+        }
+        let message: Value = self.get(&format!(
+            "/api/session/{session}/message/{}",
+            source.message_id
+        ))?;
+        message
+            .get("content")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|part| part.get("id").and_then(Value::as_str) == Some(&source.id))
+            .and_then(|part| part.pointer("/state/input"))
+            .cloned()
+            .ok_or_else(|| io::Error::other("the tool call is not in its message"))
+    }
+
+    /// The newest prompt the user typed.
+    pub fn last_user_text(&self, session: &str) -> io::Result<Option<String>> {
+        check_session(session)?;
+        let messages: Vec<Value> = self.get(&format!(
+            "/api/session/{session}/message?limit={TURN_WINDOW}"
+        ))?;
+        Ok(messages
+            .iter()
+            .filter(|m| m.get("type").and_then(Value::as_str) == Some("user"))
+            .find_map(|m| m.get("text").and_then(Value::as_str))
+            .map(str::to_string))
     }
 
     fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> io::Result<T> {
@@ -286,12 +351,17 @@ fn expect_success(status: u16) -> io::Result<()> {
     }
 }
 
+/// `messages` are newest first. The current turn is every message since the
+/// last `idle` marker or the turn's start; only the model's own messages
+/// count as progress, so queued prompts or mail neither hide a running tool
+/// nor reset the quiet clock.
 fn turn_from(
     record: &Value,
-    newest: Option<&Value>,
+    messages: &[Value],
     pending_permissions: usize,
     pending_forms: usize,
 ) -> Turn {
+    use std::hash::{Hash, Hasher};
     let time = |key: &str| {
         record
             .pointer(&format!("/time/{key}"))
@@ -302,8 +372,44 @@ fn turn_from(
         (Some(_), None) => true,
         _ => false,
     };
-    let running_tool = newest
-        .and_then(|m| m.get("content"))
+    let started = time("busy").unwrap_or(0);
+    let mut progress_ms = started;
+    let mut running_tool = None;
+    let mut whole_turn_seen = messages.len() < TURN_WINDOW;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut seen_len = 0;
+    for message in messages {
+        let kind = message.get("type").and_then(Value::as_str);
+        let created = message.pointer("/time/created").and_then(Value::as_u64);
+        if kind == Some("idle") || created.is_some_and(|c| c < started) {
+            whole_turn_seen = true;
+            break;
+        }
+        if kind != Some("assistant") {
+            continue;
+        }
+        progress_ms = progress_ms.max(newest_time(message));
+        let text = message.to_string();
+        seen_len += text.len();
+        text.hash(&mut hasher);
+        if running_tool.is_none() {
+            running_tool = unfinished_tool(message);
+        }
+    }
+    Turn {
+        busy,
+        progress_ms,
+        running_tool,
+        whole_turn_seen,
+        pending_permissions,
+        pending_forms,
+        stamp: format!("{progress_ms}:{seen_len}:{:x}", hasher.finish()),
+    }
+}
+
+fn unfinished_tool(message: &Value) -> Option<String> {
+    message
+        .get("content")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -319,20 +425,7 @@ fn turn_from(
                 .and_then(Value::as_str)
                 .unwrap_or("tool")
                 .to_string()
-        });
-    let progress_ms = time("busy").unwrap_or(0).max(newest.map_or(0, newest_time));
-    let newest_id = newest
-        .and_then(|m| m.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    Turn {
-        busy,
-        progress_ms,
-        running_tool,
-        pending_permissions,
-        pending_forms,
-        stamp: format!("{newest_id}:{progress_ms}"),
-    }
+        })
 }
 
 /// The largest number under any `time` object, at any depth.
@@ -516,6 +609,55 @@ fn base64(input: &[u8]) -> String {
     out
 }
 
+/// A loopback stand-in for the server: answers each request with
+/// `respond(method, path)` and hands back `(method, path, body)` of each.
+#[cfg(test)]
+pub fn fake_server(
+    respond: impl Fn(&str, &str) -> (u16, String) + Send + 'static,
+) -> (Server, std::sync::mpsc::Receiver<(String, String, String)>) {
+    use std::io::BufRead;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = io::BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let mut words = line.split_whitespace();
+            let method = words.next().unwrap_or("").to_string();
+            let path = words.next().unwrap_or("").to_string();
+            let mut len = 0;
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                let header = header.trim_end().to_ascii_lowercase();
+                if header.is_empty() {
+                    break;
+                }
+                if let Some(v) = header.strip_prefix("content-length: ") {
+                    len = v.parse().unwrap();
+                }
+            }
+            let mut body = vec![0; len];
+            reader.read_exact(&mut body).unwrap();
+            let (status, answer) = respond(&method, &path);
+            let sent = tx.send((method, path, String::from_utf8_lossy(&body).into_owned()));
+            write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{answer}",
+                answer.len()
+            )
+            .unwrap();
+            if sent.is_err() {
+                break;
+            }
+        }
+    });
+    (Server::at(addr), rx)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +675,44 @@ mod tests {
     fn reads_the_status_code() {
         assert_eq!(parse_status(b"HTTP/1.1 204 No Content\r\n\r\n"), Some(204));
         assert_eq!(parse_status(b"garbage"), None);
+    }
+    fn record() -> Value {
+        serde_json::json!({"time": {"busy": 100, "idle": 50, "updated": 900, "viewed": 999}})
+    }
+
+    fn assistant(status: &str, text: &str) -> Value {
+        serde_json::json!({"id": "msg_2", "type": "assistant", "time": {"created": 110},
+            "content": [{"type": "text", "text": text},
+                        {"type": "tool", "name": "shell", "state": {"status": status}, "time": {"created": 120}}]})
+    }
+
+    #[test]
+    fn a_queued_message_does_not_hide_a_running_tool_or_count_as_progress() {
+        let queued = serde_json::json!({"id": "msg_3", "type": "user", "text": "mail", "time": {"created": 800}});
+        let idle = serde_json::json!({"id": "msg_0", "type": "idle", "time": {"created": 50}});
+        let turn = turn_from(
+            &record(),
+            &[queued, assistant("running", "building"), idle],
+            0,
+            0,
+        );
+        assert!(turn.busy);
+        assert_eq!(turn.running_tool.as_deref(), Some("shell"));
+        assert_eq!(turn.progress_ms, 120);
+        assert!(turn.whole_turn_seen);
+    }
+
+    #[test]
+    fn streamed_text_changes_the_stamp() {
+        let a = turn_from(&record(), &[assistant("completed", "par")], 0, 0);
+        let b = turn_from(&record(), &[assistant("completed", "partial")], 0, 0);
+        assert_ne!(a.stamp, b.stamp);
+    }
+
+    #[test]
+    fn a_turn_longer_than_the_window_is_not_fully_seen() {
+        let many = vec![assistant("completed", "x"); TURN_WINDOW];
+        assert!(!turn_from(&record(), &many, 0, 0).whole_turn_seen);
     }
 
     #[test]

@@ -1097,7 +1097,7 @@ fn pi_rows_can_be_neither_approved_nor_interrupted() {
 }
 
 /// A server whose session `ses_oc` went busy long ago (though a person
-/// looked at it just now) and whose newest message is `newest`.
+/// looked at it just now) and whose newest messages are `newest`.
 fn quiet_turn(newest: &'static str) -> impl Fn(&str, &str) -> (u16, String) + Send {
     move |method, path| {
         match (method, path) {
@@ -1106,7 +1106,7 @@ fn quiet_turn(newest: &'static str) -> impl Fn(&str, &str) -> (u16, String) + Se
             r#"{"data":{"id":"ses_oc","time":{"created":1,"updated":5,"busy":4,"idle":3,"viewed":9999999999999}}}"#
                 .to_string(),
         ),
-        ("GET", "/api/session/ses_oc/message?limit=1") => {
+        ("GET", "/api/session/ses_oc/message?limit=50") => {
             (200, format!(r#"{{"data":[{newest}]}}"#))
         }
         ("GET", _) => (200, r#"{"data":[]}"#.to_string()),
@@ -1128,6 +1128,7 @@ fn interrupt_stops_a_quiet_opencode_turn_through_its_server() {
     let output = fx
         .command(&["interrupt", "--to", "%30"])
         .env("TRIAGE_TEST_PANE_HARNESS", pi_and_test_server())
+        .env("TRIAGE_TEST_INTERRUPT_SETTLE_MS", "0")
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
@@ -1144,16 +1145,19 @@ fn interrupt_stops_a_quiet_opencode_turn_through_its_server() {
 
 #[test]
 fn interrupt_leaves_an_opencode_turn_with_a_running_tool() {
+    // Mail queued behind the turn is the newest message; the build under it
+    // is still running.
     let fx = Fixture::new("ocbusytool", PI_CALLER_AND_OC_TARGET);
     let requests = fake_opencode_api(
         &fx,
         quiet_turn(
-            r#"{"id":"msg_2","type":"assistant","time":{"created":5},"content":[{"type":"tool","name":"shell","state":{"status":"running"},"time":{"created":6,"ran":7}}]}"#,
+            r#"{"id":"msg_3","type":"user","text":"mail","time":{"created":9}},{"id":"msg_2","type":"assistant","time":{"created":5},"content":[{"type":"tool","name":"shell","state":{"status":"running"},"time":{"created":6,"ran":7}}]}"#,
         ),
     );
     let output = fx
         .command(&["interrupt", "--to", "%30"])
         .env("TRIAGE_TEST_PANE_HARNESS", pi_and_test_server())
+        .env("TRIAGE_TEST_INTERRUPT_SETTLE_MS", "0")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
