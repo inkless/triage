@@ -2030,7 +2030,7 @@ fn truncate_chars(s: &str, max: usize) -> String {
 
 fn agents_usage(prefix: impl Into<String>) -> String {
     let prefix = prefix.into();
-    let usage = "usage: triage agents [--json] [--include-self] [--provider cc|cx] [--cwd PATH]\n       triage agents whoami [--json]";
+    let usage = "usage: triage agents [--json] [--include-self] [--provider cc|cx|oc|opencode|pi] [--cwd PATH]\n       triage agents whoami [--json]";
     if prefix.is_empty() {
         usage.to_string()
     } else {
