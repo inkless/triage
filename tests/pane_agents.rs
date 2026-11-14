@@ -127,7 +127,7 @@ fn lists_opencode_and_pi_panes_with_session_names_and_state() {
 
     let oc = row(&rows, "%30");
     assert_eq!(oc["provider"], "oc");
-    assert_eq!(oc["name"], "opencode:%30");
+    assert_eq!(oc["name"], "Fix the parser");
     assert_eq!(oc["headline"], "Fix the parser");
     assert_eq!(oc["cwd"], "/work/oc");
     assert_eq!(oc["session_id"], "ses_oc");
@@ -179,15 +179,24 @@ fn a_missing_session_store_still_lists_the_pane() {
 }
 
 #[test]
-fn a_tmux_window_name_never_names_a_pane_agent() {
-    // pi wrote no `session_info` name; the window called "random" must not
-    // leak in as the agent's name.
+fn a_tmux_window_name_names_an_otherwise_unnamed_pane_agent() {
+    // pi wrote no `session_info` name, so the user-set window name is the best
+    // available identity for the row.
     let fx = Fixture::new(
         "window",
         r#"  echo 'pi|1.0|502|/dev/null|pi|/work/unnamed|1|%48|random'"#,
     );
     let rows = fx.agents();
-    assert_eq!(row(&rows, "%48")["name"], "pi:%48");
+    assert_eq!(row(&rows, "%48")["name"], "random");
+}
+
+#[test]
+fn a_session_name_beats_a_tmux_window_name() {
+    let fx = Fixture::new(
+        "sessionname",
+        r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|scratch-window'"#,
+    );
+    assert_eq!(row(&fx.agents(), "%30")["name"], "Fix the parser");
 }
 
 #[test]

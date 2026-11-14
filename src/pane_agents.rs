@@ -2,8 +2,9 @@
 //! opencode and pi. A pane whose foreground command is the harness becomes a
 //! row; the harness's own session store adds a name and busy/idle state when
 //! exactly one such pane sits in the session's cwd. Two panes of the same
-//! harness in one cwd cannot be told apart from outside, so both stay
-//! unnamed rather than borrowing the wrong session.
+//! harness in one cwd cannot be told apart from outside, so neither borrows a
+//! session name. Unnamed panes fall back to a user-set tmux window name, then
+//! to `provider:pane_id`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -21,10 +22,11 @@ use crate::models::{Pane, Provider, Session};
 struct SessionMeta {
     id: String,
     cwd: PathBuf,
-    /// A name the user gave the session (pi's `/name`); opencode has none.
+    /// The session's own name: pi's `/name`, opencode's renameable title.
     name: Option<String>,
-    /// An auto-generated topic (opencode's title). Shown as a detail, never
-    /// as the row's name: it describes the first prompt, not the agent.
+    /// opencode's title also feeds the headline. It starts as a summary of the
+    /// first prompt and is replaced when the user renames the session, so it
+    /// is both the best available name and the best available topic.
     topic: Option<String>,
     busy: Option<bool>,
     created_ms: u64,
@@ -230,6 +232,7 @@ fn pane_session(provider: Provider, pane: &Pane, meta: Option<&SessionMeta>) -> 
         pane.cwd.clone(),
         Some(
             meta.and_then(|m| m.name.clone())
+                .or_else(|| crate::models::useful_window_name(pane))
                 .unwrap_or_else(|| format!("{}:{}", provider.name(), pane.pane_id)),
         ),
         status.to_string(),
@@ -340,11 +343,15 @@ fn parse_opencode_rows(json: &[u8]) -> Vec<SessionMeta> {
                 (None, None) => None,
             };
             let idle_since_ms = (busy == Some(false)).then_some(row.time_idle).flatten();
+            let title = row
+                .title
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty());
             SessionMeta {
                 id: row.id,
                 cwd: PathBuf::from(row.directory),
-                name: None,
-                topic: row.title.filter(|t| !t.trim().is_empty()),
+                name: title.clone(),
+                topic: title,
                 busy,
                 created_ms: row.time_created.unwrap_or(0),
                 updated_ms: row.time_updated.unwrap_or(0),
@@ -603,10 +610,11 @@ mod tests {
         assert_eq!(metas.len(), 3);
         assert_eq!(metas[0].busy, Some(true));
         assert_eq!(metas[0].topic.as_deref(), Some("Fix parser"));
-        assert_eq!(metas[0].name, None);
+        assert_eq!(metas[0].name.as_deref(), Some("Fix parser"));
         assert_eq!(metas[0].idle_since_ms, None);
         assert_eq!(metas[1].busy, Some(false));
         assert_eq!(metas[1].topic, None);
+        assert_eq!(metas[1].name, None);
         assert_eq!(metas[1].idle_since_ms, Some(18));
         assert_eq!(metas[2].busy, None);
         assert!(parse_opencode_rows(b"not json").is_empty());
@@ -679,6 +687,27 @@ mod tests {
             assert_eq!(twin.headline, None);
             assert_eq!(twin.status, "unknown");
         }
+    }
+
+    #[test]
+    fn a_pane_is_named_by_its_session_then_its_window() {
+        let mut named = pane(10, "%10", "/w/a", "opencode");
+        named.window_name = "scratch".to_string();
+        let mut with_name = meta("ses_a", "/w/a", 9);
+        with_name.name = Some("triage-dev".to_string());
+        let sessions =
+            sessions_for_panes(Provider::Opencode, &[&named], &[with_name], &HashMap::new());
+        assert_eq!(sessions[0].name.as_deref(), Some("triage-dev"));
+
+        let mut windowed = pane(11, "%11", "/w/b", "opencode");
+        windowed.window_name = "scratch".to_string();
+        let sessions = sessions_for_panes(Provider::Opencode, &[&windowed], &[], &HashMap::new());
+        assert_eq!(sessions[0].name.as_deref(), Some("scratch"));
+
+        let mut auto_named = pane(12, "%12", "/w/c", "opencode");
+        auto_named.window_name = "opencode".to_string();
+        let sessions = sessions_for_panes(Provider::Opencode, &[&auto_named], &[], &HashMap::new());
+        assert_eq!(sessions[0].name.as_deref(), Some("opencode:%12"));
     }
 
     #[test]
