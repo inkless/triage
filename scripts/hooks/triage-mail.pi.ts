@@ -71,6 +71,15 @@ export default function (pi: ExtensionAPI) {
 		hook("session-start", id).on("close", () => wait(id));
 	});
 
+	// A new session can only be registered once pi has written it, which
+	// happens with its first message; don't wait out the backoff for that.
+	pi.on("agent_settled", async () => {
+		if (session && retry) {
+			clearTimeout(retry);
+			wait(session);
+		}
+	});
+
 	pi.on("session_shutdown", async () => {
 		stop();
 	});

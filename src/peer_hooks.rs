@@ -1,6 +1,7 @@
 //! Hook entrypoints (`triage inbox --hook …`) that deliver mailbox mail into a
 //! running agent. They run inside the agent's hook machinery: never load
-//! config, never spawn subprocesses, never write to stderr except the Claude
+//! config, never spawn subprocesses (but `lsof` for a pi process's directory
+//! outside Linux), never write to stderr except the Claude
 //! waiter's delivery, and always exit 0 on error (logging to `hook.log`).
 
 use std::io::{self, Read, Write};
@@ -212,21 +213,17 @@ fn run_pi(store: &Store, event: Event, host: HostId, payload: &Payload) -> io::R
     let agent = payload.session.as_str();
     match event {
         Event::SessionStart => {
-            store.write_host(
-                host,
-                &HostRecord {
-                    v: 1,
-                    provider: Provider::Pi,
-                    hook_version: HOOK_VERSION.to_string(),
-                    current_session: payload.session.clone(),
-                    updated_at_ms: mailbox::now_ms(),
-                },
-            )?;
-            crate::reconcile::reconcile_agent(store, agent)?;
+            if register_pi(store, host, agent)? {
+                crate::reconcile::reconcile_agent(store, agent)?;
+            }
             Ok(0)
         }
         Event::Wait => {
-            if host_current_session(store, host).as_deref() != Some(agent) {
+            let hosting = match host_current_session(store, host) {
+                Some(current) => current == agent,
+                None => register_pi(store, host, agent)?,
+            };
+            if !hosting {
                 return Ok(0);
             }
             let mailbox = store.mailbox(agent)?;
@@ -236,6 +233,58 @@ fn run_pi(store: &Store, event: Event, host: HostId, payload: &Payload) -> io::R
             "no triage hook is installed for this event",
         )),
     }
+}
+
+/// Anything the pi process runs can call these hooks with any id, so the
+/// session must be one pi recorded for the process's directory and that no
+/// other live pi process holds. pi writes a new session's file only once it
+/// has a message, so until then the process hosts nothing: its old record is
+/// dropped, and the extension's waiter registers the session when it can.
+/// A waiter never displaces a session the process already hosts.
+fn register_pi(store: &Store, host: HostId, session: &str) -> io::Result<bool> {
+    let known = process_cwd(host.pid).is_some_and(|cwd| {
+        crate::pane_agents::pi_session_file(&crate::pane_agents::pi_agent_dir(), &cwd, session)
+            .is_some()
+    });
+    let held_elsewhere = store.hosts().into_iter().any(|(other, record)| {
+        other != host
+            && record.provider == Provider::Pi
+            && record.current_session == session
+            && mailbox::liveness(other) == Liveness::Alive
+    });
+    if !known || held_elsewhere {
+        if let Some(record) = store.read_host(host).filter(|r| r.provider == Provider::Pi) {
+            store.remove_host_record(host, &record)?;
+        }
+        return Ok(false);
+    }
+    store.write_host(
+        host,
+        &HostRecord {
+            v: 1,
+            provider: Provider::Pi,
+            hook_version: HOOK_VERSION.to_string(),
+            current_session: session.to_string(),
+            updated_at_ms: mailbox::now_ms(),
+        },
+    )?;
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
 }
 
 /// The nearest ancestor that is the harness process: for Claude a pid with a

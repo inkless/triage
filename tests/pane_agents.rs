@@ -752,6 +752,16 @@ fn mail_to_a_pi_session_with_the_extension_waits_for_its_waiter() {
     };
 
     fx.record_opencode_server();
+    // pi recorded the session under its process's (the test's) directory.
+    let cwd = std::env::current_dir().unwrap();
+    let encoded = cwd
+        .to_string_lossy()
+        .trim_start_matches('/')
+        .replace('/', "-");
+    let sessions = fx.dir.join(format!(".pi/agent/sessions/--{encoded}--"));
+    fs::create_dir_all(&sessions).unwrap();
+    let header = serde_json::json!({"type": "session", "id": hosted, "cwd": cwd});
+    fs::write(sessions.join("hosted.jsonl"), format!("{header}\n")).unwrap();
     assert!(as_pi_hook("session-start").status.success());
     let rows = with_pi(&["agents", "--json", "--include-self"]);
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&rows.stdout).unwrap();

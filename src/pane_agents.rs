@@ -481,7 +481,7 @@ pub fn pi_session_in_cwd(cwd: &Path, id: &str) -> bool {
     pi_session_file(&pi_agent_dir(), cwd, id).is_some()
 }
 
-fn pi_session_file(agent_dir: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
+pub(crate) fn pi_session_file(agent_dir: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
     let dir = agent_dir.join("sessions").join(pi_session_dir_name(cwd));
     fs::read_dir(dir)
         .ok()?

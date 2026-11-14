@@ -31,6 +31,31 @@ impl Env {
         self.dir.join("state/triage")
     }
 
+    /// pi records a session once it has a message, under the pi process's
+    /// directory; the test process is the pi process here.
+    fn pi_session(&self, id: &str) {
+        let cwd = std::env::current_dir().unwrap();
+        let encoded = cwd
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .replace(['/', '\\', ':'], "-");
+        let dir = self.dir.join(format!(".pi/agent/sessions/--{encoded}--"));
+        fs::create_dir_all(&dir).unwrap();
+        let header = serde_json::json!({"type": "session", "id": id, "cwd": cwd});
+        fs::write(dir.join(format!("{id}.jsonl")), format!("{header}\n")).unwrap();
+    }
+
+    fn host_records(&self) -> Vec<serde_json::Value> {
+        let Ok(entries) = fs::read_dir(self.state().join("hosts")) else {
+            return Vec::new();
+        };
+        entries
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "json"))
+            .map(|p| serde_json::from_slice(&fs::read(p).unwrap()).unwrap())
+            .collect()
+    }
+
     fn extension(&self) -> PathBuf {
         self.dir.join(".pi/agent/extensions/triage-mail.ts")
     }
@@ -114,6 +139,8 @@ fn finish_within(mut child: Child, limit: Duration) -> Output {
 #[test]
 fn session_start_makes_the_pi_process_the_host_of_its_session() {
     let env = Env::new("start");
+    env.pi_session(S1);
+    env.pi_session(S2);
     let out = env.hook("session-start", S1);
     assert_eq!(out.status.code(), Some(0));
     assert!(out.stdout.is_empty() && out.stderr.is_empty());
@@ -135,6 +162,7 @@ fn session_start_makes_the_pi_process_the_host_of_its_session() {
 #[test]
 fn the_waiter_prints_mail_as_it_arrives_and_marks_it_delivered() {
     let env = Env::new("wait");
+    env.pi_session(S1);
     env.hook("session-start", S1);
     let waiter = env.spawn_hook("wait", S1);
     std::thread::sleep(Duration::from_millis(300));
@@ -154,6 +182,8 @@ fn the_waiter_prints_mail_as_it_arrives_and_marks_it_delivered() {
 #[test]
 fn a_waiter_for_a_session_the_process_left_exits_without_mail() {
     let env = Env::new("stale");
+    env.pi_session(S1);
+    env.pi_session(S2);
     env.hook("session-start", S1);
     env.hook("session-start", S2);
     env.write_mail(
@@ -226,4 +256,67 @@ fn install_skips_pi_when_it_is_not_installed() {
         stdout(&out)
     );
     assert!(!env.extension().exists());
+}
+
+#[test]
+fn session_start_for_a_session_pi_has_not_recorded_hosts_nothing() {
+    let env = Env::new("unknown");
+    env.pi_session(S1);
+    env.hook("session-start", S1);
+    assert_eq!(env.host_records()[0]["current_session"], S1);
+
+    // A session with no file in the pi process's directory (forged, or new
+    // and not yet written) replaces nothing: the process hosts nothing.
+    let out = env.hook("session-start", S2);
+    assert_eq!(out.status.code(), Some(0));
+    assert!(env.host_records().is_empty(), "{:?}", env.host_records());
+    env.write_mail(S2, "01900000-0000-7000-8000-0000000000d3", "not yet");
+    let out = finish_within(env.spawn_hook("wait", S2), Duration::from_secs(5));
+    assert!(out.stdout.is_empty());
+
+    // Once pi has written the session, the waiter registers it and delivers.
+    env.pi_session(S2);
+    let out = finish_within(env.spawn_hook("wait", S2), Duration::from_secs(10));
+    assert!(stdout(&out).contains("not yet"), "{}", stdout(&out));
+    assert_eq!(env.host_records()[0]["current_session"], S2);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn session_start_for_a_session_another_pi_process_holds_is_refused() {
+    let env = Env::new("foreign");
+    env.pi_session(S1);
+    env.pi_session(S2);
+    env.hook("session-start", S1);
+    // Another live process hosts S2.
+    let mut other = Command::new("sleep").arg("30").spawn().unwrap();
+    let stat = fs::read_to_string(format!("/proc/{}/stat", other.id())).unwrap();
+    let start = stat[stat.rfind(')').unwrap() + 2..]
+        .split_whitespace()
+        .nth(19)
+        .unwrap()
+        .to_string();
+    let record = serde_json::json!({"v": 1, "provider": "pi", "hook_version": "v1",
+        "current_session": S2, "updated_at_ms": 1});
+    fs::write(
+        env.state()
+            .join(format!("hosts/{}-{start}.json", other.id())),
+        record.to_string(),
+    )
+    .unwrap();
+
+    env.hook("session-start", S2);
+    let records = env.host_records();
+    let _ = other.kill();
+    let _ = other.wait();
+    assert_eq!(records.len(), 1, "{records:?}");
+    assert_eq!(records[0]["current_session"], S2);
+    assert!(
+        !fs::read_dir(env.state().join("hosts")).unwrap().any(|e| e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(&format!("{}-", std::process::id()))),
+        "the test process still hosts a session"
+    );
 }
