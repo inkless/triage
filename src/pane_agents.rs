@@ -87,9 +87,40 @@ pub fn discover(
                 }
             }
         }
+        if provider == Provider::Opencode {
+            mark_pending_permissions(&mut sessions);
+        }
         out.extend(sessions);
     }
     out
+}
+
+/// Short enough that a hung server cannot stall a refresh for long.
+const PERMISSION_CHECK_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// A busy opencode session may be waiting on a permission prompt, which only
+/// its server can say for sure: one request per such row, skipped when the
+/// server is gone.
+fn mark_pending_permissions(sessions: &mut [Session]) {
+    let mut busy = sessions
+        .iter_mut()
+        .filter(|s| s.status == "busy" && crate::mailbox::is_opencode_session(&s.session_id))
+        .peekable();
+    if busy.peek().is_none() {
+        return;
+    }
+    let Ok(server) = crate::opencode_api::Server::load() else {
+        return;
+    };
+    let server = server.with_timeout(PERMISSION_CHECK_TIMEOUT);
+    for session in busy {
+        if let Ok(pending) = server.pending_permissions(&session.session_id)
+            && let Some(first) = pending.first()
+        {
+            session.pane_blocked = true;
+            session.last_tool_use = Some((first.action.clone(), first.resources.join(" ")));
+        }
+    }
 }
 
 /// The session triage's pi extension registered for this pi process, which

@@ -32,8 +32,8 @@ impl Provider {
     }
 
     /// Harnesses triage discovers through their tmux pane rather than a
-    /// session record. They get no approve or interrupt, and a caller is
-    /// identified by its session only when its own environment names one.
+    /// session record. A caller is identified by its session only when its
+    /// own environment names one.
     pub fn pane_only(self) -> bool {
         match self {
             Provider::Claude | Provider::Codex => false,

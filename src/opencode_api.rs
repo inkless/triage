@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::Value;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
@@ -93,26 +94,283 @@ fn load_service() -> io::Result<Service> {
     })
 }
 
+/// The loopback server, ready for requests that give up after `timeout`.
+pub struct Server {
+    service: Service,
+    timeout: Duration,
+}
+
+/// A tool call waiting on the user's permission.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Permission {
+    pub id: String,
+    #[serde(default)]
+    pub action: String,
+    #[serde(default)]
+    pub resources: Vec<String>,
+}
+
+impl Permission {
+    pub fn summary(&self) -> String {
+        format!("{}: {}", self.action, self.resources.join(" "))
+    }
+}
+
+/// What the server says about a session's current turn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Turn {
+    pub busy: bool,
+    /// When the turn started or its newest message last changed; viewing the
+    /// session does not count.
+    pub progress_ms: u64,
+    /// A tool call in the newest message that has not finished.
+    pub running_tool: Option<String>,
+    pub pending_permissions: usize,
+    pub pending_forms: usize,
+    /// Changes whenever the session or its newest message does.
+    pub stamp: String,
+}
+
+#[derive(Deserialize)]
+struct Data<T> {
+    data: T,
+}
+
+impl Server {
+    pub fn load() -> io::Result<Self> {
+        Ok(Self {
+            service: load_service()?,
+            timeout: io_timeout(),
+        })
+    }
+
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    pub fn pending_permissions(&self, session: &str) -> io::Result<Vec<Permission>> {
+        check_session(session)?;
+        self.get(&format!("/api/session/{session}/permission"))
+    }
+
+    /// Answers one pending request: "once" to approve, never "always".
+    pub fn reply_permission(
+        &self,
+        session: &str,
+        request: &str,
+        approve: bool,
+    ) -> Result<(), Failure> {
+        check_session(session)?;
+        if !request.starts_with("per_")
+            || !request
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(Failure::NotDelivered(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid permission request id {request:?}"),
+            )));
+        }
+        let decision = if approve { "once" } else { "reject" };
+        let (status, _) = self.request(
+            "POST",
+            &format!("/api/session/{session}/permission/{request}/reply"),
+            Some(&serde_json::json!({ "decision": decision })),
+        )?;
+        Ok(expect_success(status)?)
+    }
+
+    /// Stops the running turn; false when the server had none to stop.
+    pub fn interrupt(&self, session: &str) -> Result<bool, Failure> {
+        check_session(session)?;
+        let (status, body) = self.request(
+            "POST",
+            &format!("/api/session/{session}/interrupt"),
+            Some(&serde_json::json!({})),
+        )?;
+        expect_success(status)?;
+        Ok(serde_json::from_slice::<Value>(&body)
+            .ok()
+            .and_then(|v| v.get("interrupted").and_then(Value::as_bool))
+            .unwrap_or(true))
+    }
+
+    pub fn turn(&self, session: &str) -> io::Result<Turn> {
+        check_session(session)?;
+        let record: Value = self.get(&format!("/api/session/{session}"))?;
+        let newest: Vec<Value> = self.get(&format!("/api/session/{session}/message?limit=1"))?;
+        let permissions: Vec<Value> = self.get(&format!("/api/session/{session}/permission"))?;
+        let forms: Vec<Value> = self.get(&format!("/api/session/{session}/form"))?;
+        Ok(turn_from(
+            &record,
+            newest.first(),
+            permissions.len(),
+            forms.len(),
+        ))
+    }
+
+    fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> io::Result<T> {
+        let (status, body) = self.request("GET", path, None).map_err(|f| match f {
+            Failure::NotDelivered(e) | Failure::Unconfirmed(e) => e,
+        })?;
+        expect_success(status)?;
+        serde_json::from_slice::<Data<T>>(&body)
+            .map(|d| d.data)
+            .map_err(|e| io::Error::other(format!("unexpected answer from {path}: {e}")))
+    }
+
+    fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<(u16, Vec<u8>), Failure> {
+        let service = &self.service;
+        let auth = base64(format!("opencode:{}", service.password).as_bytes());
+        let (content, body) = match body {
+            Some(body) => {
+                let body = body.to_string();
+                (
+                    format!(
+                        "Content-Type: application/json\r\nContent-Length: {}\r\n",
+                        body.len()
+                    ),
+                    body,
+                )
+            }
+            None => (String::new(), String::new()),
+        };
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {auth}\r\n\
+             {content}Accept: application/json\r\nConnection: close\r\n\r\n{body}",
+            host = service.host,
+        );
+        let mut stream =
+            TcpStream::connect_timeout(&service.addr, self.timeout.min(CONNECT_TIMEOUT))?;
+        stream.set_read_timeout(Some(self.timeout))?;
+        stream.set_write_timeout(Some(self.timeout))?;
+        // A request cut off part way may still have been taken.
+        stream
+            .write_all(request.as_bytes())
+            .map_err(Failure::Unconfirmed)?;
+        let mut response = Vec::new();
+        let read = stream.take(MAX_RESPONSE_BYTES).read_to_end(&mut response);
+        // A server that answers and then holds the connection open still
+        // answered.
+        match parse_status(&response) {
+            Some(status) => Ok((status, response_body(&response))),
+            None => Err(Failure::Unconfirmed(read.err().unwrap_or_else(|| {
+                io::Error::other("server sent no HTTP status line")
+            }))),
+        }
+    }
+}
+
+fn check_session(session: &str) -> io::Result<()> {
+    if crate::mailbox::is_opencode_session(session) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid opencode session id {session:?}"),
+        ))
+    }
+}
+
+fn expect_success(status: u16) -> io::Result<()> {
+    if is_success(status) {
+        Ok(())
+    } else {
+        Err(io::Error::other(format!("server answered {status}")))
+    }
+}
+
+fn turn_from(
+    record: &Value,
+    newest: Option<&Value>,
+    pending_permissions: usize,
+    pending_forms: usize,
+) -> Turn {
+    let time = |key: &str| {
+        record
+            .pointer(&format!("/time/{key}"))
+            .and_then(Value::as_u64)
+    };
+    let busy = match (time("busy"), time("idle")) {
+        (Some(busy), Some(idle)) => busy > idle,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    let running_tool = newest
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("tool"))
+        .find(|part| {
+            !matches!(
+                part.pointer("/state/status").and_then(Value::as_str),
+                Some("completed" | "error")
+            )
+        })
+        .map(|part| {
+            part.get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_string()
+        });
+    let progress_ms = time("busy").unwrap_or(0).max(newest.map_or(0, newest_time));
+    let newest_id = newest
+        .and_then(|m| m.get("id"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    Turn {
+        busy,
+        progress_ms,
+        running_tool,
+        pending_permissions,
+        pending_forms,
+        stamp: format!("{newest_id}:{progress_ms}"),
+    }
+}
+
+/// The largest number under any `time` object, at any depth.
+fn newest_time(value: &Value) -> u64 {
+    match value {
+        Value::Object(map) => map
+            .iter()
+            .map(|(key, v)| {
+                let own = match (key.as_str(), v) {
+                    ("time", Value::Object(times)) => {
+                        times.values().filter_map(Value::as_u64).max().unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                own.max(newest_time(v))
+            })
+            .max()
+            .unwrap_or(0),
+        Value::Array(items) => items.iter().map(newest_time).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
 /// Adds `text` to the session as a synthetic (non-user) message, queued
 /// behind any running turn, and lets the server start a turn when idle.
 /// A server that rejects synthetic input gets it as a queued prompt.
 pub fn post_message(session: &str, text: &str) -> Result<(), Failure> {
-    if !crate::mailbox::is_opencode_session(session) {
-        return Err(Failure::NotDelivered(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("invalid opencode session id {session:?}"),
-        )));
-    }
-    let service = load_service()?;
+    check_session(session)?;
+    let server = Server::load()?;
     let synthetic = serde_json::json!({
         "text": text,
         "description": "triage peer message",
         "delivery": "queue",
     });
-    let status = post(
-        &service,
+    let (status, _) = server.request(
+        "POST",
         &format!("/api/session/{session}/synthetic"),
-        &synthetic,
+        Some(&synthetic),
     )?;
     if is_success(status) {
         return Ok(());
@@ -121,12 +379,12 @@ pub fn post_message(session: &str, text: &str) -> Result<(), Failure> {
         return Err(io::Error::other(format!("server answered {status}")).into());
     }
     let prompt = serde_json::json!({ "text": text, "delivery": "queue" });
-    let status = post(&service, &format!("/api/session/{session}/prompt"), &prompt)?;
-    if is_success(status) {
-        Ok(())
-    } else {
-        Err(io::Error::other(format!("server answered {status}")).into())
-    }
+    let (status, _) = server.request(
+        "POST",
+        &format!("/api/session/{session}/prompt"),
+        Some(&prompt),
+    )?;
+    Ok(expect_success(status)?)
 }
 
 /// A service.json left behind by a server that has gone would hand the
@@ -198,33 +456,35 @@ fn is_success(status: u16) -> bool {
     (200..300).contains(&status)
 }
 
-fn post(service: &Service, path: &str, body: &serde_json::Value) -> Result<u16, Failure> {
-    let body = body.to_string();
-    let auth = base64(format!("opencode:{}", service.password).as_bytes());
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host}\r\nAuthorization: Basic {auth}\r\n\
-         Content-Type: application/json\r\nContent-Length: {len}\r\n\
-         Accept: application/json\r\nConnection: close\r\n\r\n{body}",
-        host = service.host,
-        len = body.len(),
-    );
-    let mut stream = TcpStream::connect_timeout(&service.addr, CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(io_timeout()))?;
-    stream.set_write_timeout(Some(io_timeout()))?;
-    // A request cut off part way may still have been taken.
-    stream
-        .write_all(request.as_bytes())
-        .map_err(Failure::Unconfirmed)?;
-    let mut response = Vec::new();
-    let read = stream.take(MAX_RESPONSE_BYTES).read_to_end(&mut response);
-    // A server that answers and then holds the connection open still
-    // answered.
-    match parse_status(&response) {
-        Some(status) => Ok(status),
-        None => Err(Failure::Unconfirmed(read.err().unwrap_or_else(|| {
-            io::Error::other("server sent no HTTP status line")
-        }))),
+/// The body after the headers, de-chunked when the server streamed it.
+fn response_body(response: &[u8]) -> Vec<u8> {
+    let Some(split) = response.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Vec::new();
+    };
+    let head = String::from_utf8_lossy(&response[..split]).to_ascii_lowercase();
+    let body = &response[split + 4..];
+    let chunked = head
+        .lines()
+        .any(|l| l.starts_with("transfer-encoding:") && l.contains("chunked"));
+    if !chunked {
+        return body.to_vec();
     }
+    let mut out = Vec::new();
+    let mut rest = body;
+    while let Some(eol) = rest.windows(2).position(|w| w == b"\r\n") {
+        let size = std::str::from_utf8(&rest[..eol])
+            .ok()
+            .and_then(|line| usize::from_str_radix(line.split(';').next()?.trim(), 16).ok());
+        let Some(size) = size.filter(|&n| n > 0) else {
+            break;
+        };
+        let Some(chunk) = rest.get(eol + 2..eol + 2 + size) else {
+            break;
+        };
+        out.extend_from_slice(chunk);
+        rest = rest.get(eol + 4 + size..).unwrap_or_default();
+    }
+    out
 }
 
 fn parse_status(response: &[u8]) -> Option<u16> {
@@ -273,5 +533,19 @@ mod tests {
     fn reads_the_status_code() {
         assert_eq!(parse_status(b"HTTP/1.1 204 No Content\r\n\r\n"), Some(204));
         assert_eq!(parse_status(b"garbage"), None);
+    }
+
+    #[test]
+    fn reads_a_plain_or_chunked_body() {
+        assert_eq!(
+            response_body(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}"),
+            b"{}"
+        );
+        assert_eq!(
+            response_body(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3\r\n:1}\r\n0\r\n\r\n"
+            ),
+            b"{\"a\":1}"
+        );
     }
 }

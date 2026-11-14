@@ -884,14 +884,11 @@ fn deliver_approve(app: &AppState) -> String {
     let Some(selected) = app.selected_session() else {
         return "no session selected".to_string();
     };
-    if selected.provider.pane_only() {
-        return format!(
-            "approve is not supported for {} agents",
-            selected.provider.name()
-        );
-    }
-    if selected.provider == models::Provider::Codex {
-        return deliver_codex_decision(selected, true);
+    match selected.provider {
+        models::Provider::Pi => return PI_HAS_NO_PROMPTS.to_string(),
+        models::Provider::Opencode => return deliver_opencode_decision(selected, true),
+        models::Provider::Codex => return deliver_codex_decision(selected, true),
+        models::Provider::Claude => {}
     }
 
     if app.approval_mode == models::ApprovalMode::Hook
@@ -925,14 +922,11 @@ fn deliver_deny(app: &AppState) -> String {
     let Some(selected) = app.selected_session() else {
         return "no session selected".to_string();
     };
-    if selected.provider.pane_only() {
-        return format!(
-            "deny is not supported for {} agents",
-            selected.provider.name()
-        );
-    }
-    if selected.provider == models::Provider::Codex {
-        return deliver_codex_decision(selected, false);
+    match selected.provider {
+        models::Provider::Pi => return PI_HAS_NO_PROMPTS.to_string(),
+        models::Provider::Opencode => return deliver_opencode_decision(selected, false),
+        models::Provider::Codex => return deliver_codex_decision(selected, false),
+        models::Provider::Claude => {}
     }
 
     if app.approval_mode == models::ApprovalMode::Hook
@@ -954,6 +948,17 @@ fn deliver_deny(app: &AppState) -> String {
         }
         Ok(()) => format!("denied → {t}"),
         Err(e) => format!("deny failed: {e}"),
+    }
+}
+
+const PI_HAS_NO_PROMPTS: &str = "pi has no permission prompts to answer";
+
+fn deliver_opencode_decision(s: &models::Session, approve: bool) -> String {
+    match agent_comm::answer_opencode_permission(&s.session_id, None, approve) {
+        Ok(summary) if approve => format!("approved opencode once: {summary}"),
+        Ok(summary) => format!("denied opencode: {summary}"),
+        Err(e) if approve => format!("opencode approve failed: {e}"),
+        Err(e) => format!("opencode deny failed: {e}"),
     }
 }
 
@@ -1130,10 +1135,7 @@ fn audit_verdict_needs_attention(decision: &str) -> bool {
 }
 
 fn is_auto_auditable_blocked(s: &models::Session) -> bool {
-    matches!(
-        s.provider,
-        models::Provider::Claude | models::Provider::Codex
-    ) && s.state == models::AttentionState::Blocked
+    s.provider != models::Provider::Pi && s.state == models::AttentionState::Blocked
 }
 
 #[derive(Debug)]
@@ -1142,16 +1144,18 @@ struct AutoAuditPayload {
     tool_input: String,
     pending: Option<approval::PendingApproval>,
     claude_prompt: Option<tmux::ClaudePermissionPrompt>,
+    opencode_request: Option<String>,
 }
 
-/// Identity of the prompt on screen: the hook's pending uuid when there is
-/// one, otherwise the tool name plus its full input.
+/// Identity of the prompt on screen: the hook's pending uuid or opencode's
+/// request id when there is one, otherwise the tool name plus its full input.
 fn prompt_fingerprint(payload: &AutoAuditPayload) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    match &payload.pending {
-        Some(pending) => pending.uuid.hash(&mut hasher),
-        None => {
+    match (&payload.pending, &payload.opencode_request) {
+        (Some(pending), _) => pending.uuid.hash(&mut hasher),
+        (None, Some(request)) => request.hash(&mut hasher),
+        (None, None) => {
             payload.tool_name.hash(&mut hasher);
             payload.tool_input.hash(&mut hasher);
         }
@@ -1165,13 +1169,24 @@ fn audit_payload_for_session(
 ) -> Option<AutoAuditPayload> {
     match s.provider {
         models::Provider::Claude => audit_payload_for_claude(s, mode),
-        models::Provider::Opencode | models::Provider::Pi => None,
+        models::Provider::Pi => None,
+        models::Provider::Opencode => {
+            let request = agent_comm::opencode_pending_request(&s.session_id, None).ok()?;
+            Some(AutoAuditPayload {
+                tool_name: request.action,
+                tool_input: request.resources.join("\n"),
+                pending: None,
+                claude_prompt: None,
+                opencode_request: Some(request.id),
+            })
+        }
         models::Provider::Codex => {
             audit_payload_for_codex(s).map(|(tool_name, tool_input)| AutoAuditPayload {
                 tool_name,
                 tool_input,
                 pending: None,
                 claude_prompt: None,
+                opencode_request: None,
             })
         }
     }
@@ -1306,6 +1321,7 @@ fn claude_audit_payload(
             tool_input: pending.tool_input_full.clone(),
             pending: Some(pending.clone()),
             claude_prompt,
+            opencode_request: None,
         });
     }
     let prompt = claude_prompt?;
@@ -1328,6 +1344,7 @@ fn claude_audit_payload(
         tool_input: prompt.body.clone(),
         pending: None,
         claude_prompt: Some(prompt),
+        opencode_request: None,
     })
 }
 
@@ -1482,6 +1499,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         let uuid = payload.pending.as_ref().map(|a| a.uuid.clone());
         let pane_target = s.pane.as_ref().map(|p| p.target.clone());
         let pane_id = s.pane.as_ref().map(|p| p.pane_id.clone());
+        let session_id = s.session_id.clone();
         let provider = s.provider;
         let approval_mode = app.approval_mode;
         let tx = app.audit_tx.clone();
@@ -1527,6 +1545,14 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
                     } else {
                         Err("codex session has no pane".to_string())
                     }
+                }
+                (models::Provider::Opencode, "APPROVE" | "DENY") => {
+                    agent_comm::answer_opencode_permission(
+                        &session_id,
+                        payload.opencode_request.as_deref(),
+                        v.decision == "APPROVE",
+                    )
+                    .map(|_| ())
                 }
                 _ => Ok(()), // WAIT: leave for human
             };
@@ -1761,7 +1787,8 @@ fn jump_to_selected(app: &mut AppState) -> bool {
 mod tests {
     use super::{
         AutoAuditPayload, Cli, Command, audit_payload_for_claude, audit_verdict_needs_attention,
-        is_auto_auditable_claude_tool, prompt_fingerprint, should_alert_actionable_transition,
+        is_auto_auditable_blocked, is_auto_auditable_claude_tool, prompt_fingerprint,
+        should_alert_actionable_transition,
     };
     use crate::approval::PendingApproval;
     use crate::models::{AttentionState, Provider, Session};
@@ -2215,6 +2242,7 @@ esac
             tool_input: input.to_string(),
             pending: None,
             claude_prompt: None,
+            opencode_request: None,
         };
 
         // Back-to-back Jira creates arrive inside one refresh tick, so the
@@ -2228,6 +2256,40 @@ esac
             prompt_fingerprint(&payload("summary: first")),
             prompt_fingerprint(&payload("summary: second"))
         );
+    }
+
+    #[test]
+    fn a_repeated_opencode_call_is_a_new_prompt() {
+        let payload = |request: &str| AutoAuditPayload {
+            tool_name: "shell".to_string(),
+            tool_input: "cargo test".to_string(),
+            pending: None,
+            claude_prompt: None,
+            opencode_request: Some(request.to_string()),
+        };
+        assert_ne!(
+            prompt_fingerprint(&payload("per_1")),
+            prompt_fingerprint(&payload("per_2"))
+        );
+    }
+
+    #[test]
+    fn blocked_opencode_rows_are_audited_and_pi_rows_never() {
+        let mut s = Session::new(
+            Provider::Opencode,
+            1,
+            "ses_a".to_string(),
+            PathBuf::from("/w"),
+            None,
+            "busy".to_string(),
+            0,
+            0,
+            None,
+        );
+        s.state = AttentionState::Blocked;
+        assert!(is_auto_auditable_blocked(&s));
+        s.provider = Provider::Pi;
+        assert!(!is_auto_auditable_blocked(&s));
     }
 
     #[test]

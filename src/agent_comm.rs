@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::config::{Config, SendMode};
 use crate::mailbox::{self, Claim, DeliveredVia, HostId, Message, RenderItem, State, Store};
 use crate::models::{AttentionState, Provider, Session, session_display_label};
+use crate::opencode_api::Failure;
 use crate::persist::{self, AliasKey};
 use crate::{classifier, codex, snapshot, tmux, transcript};
 
@@ -75,6 +76,11 @@ fn run_interrupt(args: &[String]) -> Result<String, CliError> {
     };
     let sessions = load_snapshot()?;
     let initial = resolve_target(&sessions, &selector)?;
+    match initial.provider {
+        Provider::Opencode => return interrupt_opencode(initial, &selector, dry_run),
+        Provider::Pi => return Err(CliError::denied(PI_CANNOT_INTERRUPT)),
+        Provider::Claude | Provider::Codex => {}
+    }
     interrupt_eligibility(initial, SystemTime::now()).map_err(CliError::denied)?;
     let stamp = transcript_stamp(initial)?;
     let pane_id = target_id(initial);
@@ -125,6 +131,110 @@ fn run_interrupt(args: &[String]) -> Result<String, CliError> {
     ))
 }
 
+const PI_CANNOT_INTERRUPT: &str = "interrupt is not supported for pi: its session file records only finished messages, so a stalled turn cannot be told from a long model reply or tool run";
+
+/// opencode is interrupted through its server, so nothing reaches the pane;
+/// the turn must still be provably quiet, read twice with no change.
+fn interrupt_opencode(target: &Session, selector: &str, dry_run: bool) -> Result<String, CliError> {
+    if !mailbox::is_opencode_session(&target.session_id) {
+        return Err(CliError::denied(
+            "target is not matched to an opencode session",
+        ));
+    }
+    let server = crate::opencode_api::Server::load()
+        .map_err(|e| CliError::runtime(format!("opencode server unavailable: {e}")))?;
+    let read = || {
+        server.turn(&target.session_id).map_err(|e| {
+            CliError::runtime(format!(
+                "cannot read the session from the opencode server: {e}"
+            ))
+        })
+    };
+    let first = read()?;
+    opencode_interrupt_eligibility(&first, unix_ms()).map_err(CliError::denied)?;
+    if read()? != first {
+        return Err(CliError::denied(
+            "target session changed during interrupt checks; retry after inspecting progress",
+        ));
+    }
+    let pane_id = target_id(target);
+    if dry_run {
+        return Ok(format!(
+            "dry-run: would interrupt {pane_id} ({}) through the opencode server",
+            target_label(target)
+        ));
+    }
+    let interrupted = match server.interrupt(&target.session_id) {
+        Ok(interrupted) => interrupted,
+        Err(Failure::NotDelivered(error)) => {
+            return Err(CliError::delivery(format!("interrupt failed: {error}")));
+        }
+        Err(Failure::Unconfirmed(error)) => {
+            if let Err(e) = append_message_audit(&AuditEntry::new(
+                "interrupt",
+                selector,
+                target,
+                "interrupt-unconfirmed",
+                Some(&error.to_string()),
+                None,
+            )) {
+                eprintln!("warning: failed to append interrupt audit: {e}");
+            }
+            return Err(CliError::delivery(format!(
+                "interrupt reached the opencode server but got no answer ({error}); the turn may have stopped, so it was not retried: check {pane_id}"
+            )));
+        }
+    };
+    if !interrupted {
+        return Ok(format!(
+            "the opencode server had no running turn to interrupt for {pane_id}"
+        ));
+    }
+    if let Err(error) = append_message_audit(&AuditEntry::new(
+        "interrupt",
+        selector,
+        target,
+        "interrupted",
+        None,
+        None,
+    )) {
+        eprintln!("warning: failed to append interrupt audit: {error}");
+    }
+    Ok(format!(
+        "interrupted {pane_id} through the opencode server; queued input stays parked"
+    ))
+}
+
+fn opencode_interrupt_eligibility(
+    turn: &crate::opencode_api::Turn,
+    now_ms: u64,
+) -> Result<(), &'static str> {
+    let quiet_ms = now_ms.saturating_sub(turn.progress_ms);
+    if !turn.busy || quiet_ms < classifier::NO_PROGRESS_THRESHOLD.as_millis() as u64 {
+        return Err(
+            "requires an active opencode turn with no observable progress for at least 15 minutes",
+        );
+    }
+    if turn.pending_permissions > 0 {
+        return Err("target is waiting on a permission prompt; approve or deny it instead");
+    }
+    if turn.pending_forms > 0 {
+        return Err("target is waiting on a question for the user");
+    }
+    if turn.running_tool.is_some() {
+        return Err(
+            "target has an unfinished tool call; quiet tools are not proof of a stalled turn",
+        );
+    }
+    Ok(())
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 fn parse_interrupt_args(args: &[String]) -> Result<(Option<String>, bool), CliError> {
     if args
         .iter()
@@ -168,12 +278,13 @@ pub fn cli_approve(args: &[String]) -> i32 {
     }
 }
 
-const APPROVE_USAGE: &str = "usage: triage approve --to TARGET [--deny] [--dry-run]\n       TARGET: pane id, pane target, name, agent id or its last 8 characters";
+const APPROVE_USAGE: &str = "usage: triage approve --to TARGET [--deny] [--dry-run] [--request ID]\n       TARGET: pane id, pane target, name, agent id or its last 8 characters\n       ID: the opencode permission request to answer when several are pending";
 
 struct ApproveArgs {
     selector: String,
     deny: bool,
     dry_run: bool,
+    request: Option<String>,
 }
 
 fn parse_approve_args(args: &[String]) -> Result<Option<ApproveArgs>, CliError> {
@@ -186,11 +297,20 @@ fn parse_approve_args(args: &[String]) -> Result<Option<ApproveArgs>, CliError> 
     let mut selector = None;
     let mut deny = false;
     let mut dry_run = false;
+    let mut request = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--to" if selector.is_none() => {
                 selector = Some(
+                    args.next()
+                        .filter(|value| !value.starts_with('-'))
+                        .ok_or_else(|| CliError::usage(APPROVE_USAGE))?
+                        .clone(),
+                );
+            }
+            "--request" if request.is_none() => {
+                request = Some(
                     args.next()
                         .filter(|value| !value.starts_with('-'))
                         .ok_or_else(|| CliError::usage(APPROVE_USAGE))?
@@ -207,6 +327,7 @@ fn parse_approve_args(args: &[String]) -> Result<Option<ApproveArgs>, CliError> 
         selector,
         deny,
         dry_run,
+        request,
     }))
 }
 
@@ -226,8 +347,16 @@ fn run_approve(args: &[String]) -> Result<String, CliError> {
     }
 
     let verb = if args.deny { "deny" } else { "approve" };
-    let prompt = match inspect_permission_prompt(target, args.deny) {
-        Ok(prompt) => prompt,
+    let inspected = match (target.provider, &args.request) {
+        (Provider::Opencode, request) => {
+            opencode_pending_request(&target.session_id, request.as_deref())
+                .map(|request| (request.summary(), Some(request)))
+        }
+        (_, Some(_)) => Err("--request names an opencode permission request".to_string()),
+        _ => inspect_permission_prompt(target, args.deny).map(|prompt| (prompt, None)),
+    };
+    let (prompt, request) = match inspected {
+        Ok(inspected) => inspected,
         Err(reason) => {
             let verdict = format!("{verb}-refused");
             let entry = AuditEntry::new(
@@ -252,10 +381,34 @@ fn run_approve(args: &[String]) -> Result<String, CliError> {
             "dry-run: would {verb} {pane_id} ({label}): {headline}"
         ));
     }
-    let key = if args.deny { "Escape" } else { "Enter" };
-    tmux::send_keys(&pane_id, &[key])
-        .map_err(|error| CliError::delivery(format!("{verb} failed: {error}")))?;
     let verdict = if args.deny { "denied" } else { "approved" };
+    match &request {
+        Some(request) => match reply_opencode(&target.session_id, request, !args.deny) {
+            Ok(()) => Ok(()),
+            Err(Failure::Unconfirmed(error)) => {
+                let entry = AuditEntry::new(
+                    &sender,
+                    &args.selector,
+                    target,
+                    &format!("{verdict}-unconfirmed"),
+                    Some(&error.to_string()),
+                    Some(&prompt),
+                );
+                if let Err(error) = append_message_audit(&entry) {
+                    eprintln!("warning: failed to append approve audit: {error}");
+                }
+                return Err(CliError::delivery(format!(
+                    "{verb} reached the opencode server but got no answer ({error}); it may have taken effect, so it was not retried: check {pane_id}"
+                )));
+            }
+            Err(Failure::NotDelivered(error)) => Err(error.to_string()),
+        },
+        None => {
+            let key = if args.deny { "Escape" } else { "Enter" };
+            tmux::send_keys(&pane_id, &[key]).map_err(|error| error.to_string())
+        }
+    }
+    .map_err(|error| CliError::delivery(format!("{verb} failed: {error}")))?;
     let entry = AuditEntry::new(
         &sender,
         &args.selector,
@@ -270,10 +423,82 @@ fn run_approve(args: &[String]) -> Result<String, CliError> {
     Ok(format!("{verdict} {pane_id} ({label}): {headline}"))
 }
 
+const PI_HAS_NO_PROMPTS: &str = "pi has no tool-permission prompts to approve or deny";
+
+/// The pending opencode permission request `request` names, or the only one
+/// when it names none. opencode answers by request id, so the choice has to
+/// be unambiguous.
+pub fn opencode_pending_request(
+    session: &str,
+    request: Option<&str>,
+) -> Result<crate::opencode_api::Permission, String> {
+    if !mailbox::is_opencode_session(session) {
+        return Err("target is not matched to an opencode session".to_string());
+    }
+    let pending = crate::opencode_api::Server::load()
+        .and_then(|server| server.pending_permissions(session))
+        .map_err(|e| format!("cannot read pending permissions from the opencode server: {e}"))?;
+    pick_permission(pending, request)
+}
+
+fn pick_permission(
+    pending: Vec<crate::opencode_api::Permission>,
+    request: Option<&str>,
+) -> Result<crate::opencode_api::Permission, String> {
+    if let Some(id) = request {
+        return pending
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| format!("no pending permission request {id}"));
+    }
+    match <[_; 1]>::try_from(pending) {
+        Ok([one]) => Ok(one),
+        Err(pending) if pending.is_empty() => Err("no pending permission request".to_string()),
+        Err(pending) => Err(format!(
+            "{} permission requests are pending; name one with --request: {}",
+            pending.len(),
+            pending
+                .iter()
+                .map(|p| format!("{} ({})", p.id, p.summary()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn reply_opencode(
+    session: &str,
+    request: &crate::opencode_api::Permission,
+    approve: bool,
+) -> Result<(), Failure> {
+    crate::opencode_api::Server::load()?.reply_permission(session, &request.id, approve)
+}
+
+/// Answers an opencode row's pending permission request: `expected` when
+/// given (and still pending), otherwise the only one. Returns what was
+/// answered.
+pub fn answer_opencode_permission(
+    session: &str,
+    expected: Option<&str>,
+    approve: bool,
+) -> Result<String, String> {
+    let request = opencode_pending_request(session, expected)?;
+    reply_opencode(session, &request, approve).map_err(|failure| match failure {
+        Failure::Unconfirmed(e) => format!(
+            "the opencode server got the reply but did not answer ({e}); it may have taken effect, so it was not retried"
+        ),
+        Failure::NotDelivered(e) => e.to_string(),
+    })?;
+    Ok(request.summary())
+}
+
 /// Capture the target's live screen and prove it shows a permission prompt
 /// whose highlighted option makes Enter (approve) or Escape (deny) correct.
 /// Returns the prompt body for the audit trail.
 fn inspect_permission_prompt(target: &Session, deny: bool) -> Result<String, String> {
+    if target.provider == Provider::Pi {
+        return Err(PI_HAS_NO_PROMPTS.to_string());
+    }
     let Some(pane) = &target.pane else {
         return Err("target has no tmux pane".to_string());
     };
@@ -319,9 +544,7 @@ fn evaluate_approve_gate(
             }
             Ok(tmux::parse_codex_pending_full(&plain).unwrap_or_default())
         }
-        Provider::Opencode | Provider::Pi => {
-            Err("approve is not supported for opencode or pi agents")
-        }
+        Provider::Opencode | Provider::Pi => Err("no pane prompt to inspect"),
     }
 }
 
@@ -1729,7 +1952,8 @@ fn agent_row(store: &Store, s: &Session) -> AgentRow {
         can_receive: gate.can_send,
         no_progress_seconds: classifier::no_progress_age(s, SystemTime::now())
             .map(|age| age.as_secs()),
-        pending_tool: s.provider == Provider::Codex && s.last_tool_use.is_some(),
+        pending_tool: matches!(s.provider, Provider::Codex | Provider::Opencode)
+            && s.last_tool_use.is_some(),
         deny_reason: (!gate.can_send).then_some(gate.reason),
         pane_target: s.pane.as_ref().map(|p| p.target.clone()),
         pane_id: s.pane.as_ref().map(|p| p.pane_id.clone()),
@@ -2818,6 +3042,37 @@ mod tests {
             active: false,
         });
         s
+    }
+
+    #[test]
+    fn opencode_interrupt_needs_a_busy_turn_quiet_for_the_threshold() {
+        let threshold = classifier::NO_PROGRESS_THRESHOLD.as_millis() as u64;
+        let quiet = crate::opencode_api::Turn {
+            busy: true,
+            progress_ms: 1_000,
+            running_tool: None,
+            pending_permissions: 0,
+            pending_forms: 0,
+            stamp: String::new(),
+        };
+        let now = 1_000 + threshold;
+        assert_eq!(opencode_interrupt_eligibility(&quiet, now), Ok(()));
+        assert!(opencode_interrupt_eligibility(&quiet, now - 1).is_err());
+        let idle = crate::opencode_api::Turn {
+            busy: false,
+            ..quiet.clone()
+        };
+        assert!(opencode_interrupt_eligibility(&idle, now).is_err());
+        let asking = crate::opencode_api::Turn {
+            pending_permissions: 1,
+            ..quiet.clone()
+        };
+        assert!(opencode_interrupt_eligibility(&asking, now).is_err());
+        let questioning = crate::opencode_api::Turn {
+            pending_forms: 1,
+            ..quiet
+        };
+        assert!(opencode_interrupt_eligibility(&questioning, now).is_err());
     }
 
     #[test]
