@@ -44,11 +44,16 @@ pub fn discover(
     let mut by_provider: HashMap<Provider, Vec<&Pane>> = HashMap::new();
     let mut started = HashMap::new();
     for pane in panes.values().filter(|p| !skip.contains(&p.pane_id)) {
-        if let Some((provider, harness)) = pane_provider(pane, &children, &comm) {
-            by_provider.entry(provider).or_default().push(pane);
-            if let Some(ms) = harness.and_then(process_started_ms) {
-                started.insert(pane.pane_id.clone(), ms);
-            }
+        let Some((provider, harness)) = pane_provider(pane, &children, &comm) else {
+            continue;
+        };
+        let run = harness.map(|pid| harness_run(provider, pid));
+        if run.as_ref().is_some_and(|run| !run.interactive) {
+            continue;
+        }
+        by_provider.entry(provider).or_default().push(pane);
+        if let Some(ms) = run.and_then(|run| run.started_ms) {
+            started.insert(pane.pane_id.clone(), ms);
         }
     }
     let mut out = Vec::new();
@@ -63,15 +68,49 @@ pub fn discover(
     out
 }
 
-/// Wall-clock start of a process, from `ps`'s elapsed time (portable across
-/// Linux and macOS, unlike the kernels' own start fields).
-fn process_started_ms(pid: u32) -> Option<u64> {
+#[derive(Debug, PartialEq)]
+struct HarnessRun {
+    started_ms: Option<u64>,
+    /// False for a server or one-shot run (`opencode serve`, `pi -p`): no
+    /// one reads its pane, so it is not listed or sent to.
+    interactive: bool,
+}
+
+/// One `ps` per harness pane: start time from elapsed time (portable across
+/// Linux and macOS, unlike the kernels' own start fields) and arguments.
+fn harness_run(provider: Provider, pid: u32) -> HarnessRun {
     let out = Command::new("ps")
-        .args(["-o", "etime=", "-p", &pid.to_string()])
+        .args(["-o", "etime=,args=", "-p", &pid.to_string()])
         .output()
-        .ok()?;
-    let elapsed = crate::agent_comm::elapsed_seconds(String::from_utf8_lossy(&out.stdout).trim())?;
-    time_to_ms(SystemTime::now()).checked_sub(elapsed * 1000)
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    parse_harness_run(provider, &out, time_to_ms(SystemTime::now()))
+}
+
+fn parse_harness_run(provider: Provider, ps_out: &str, now_ms: u64) -> HarnessRun {
+    let line = ps_out.trim();
+    let (etime, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let started_ms = crate::agent_comm::elapsed_seconds(etime)
+        .and_then(|elapsed| now_ms.checked_sub(elapsed * 1000));
+    let args: Vec<&str> = args.split_whitespace().skip(1).collect();
+    let interactive = match provider {
+        Provider::Opencode => !args
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .is_some_and(|sub| matches!(*sub, "serve" | "run" | "web" | "acp")),
+        Provider::Pi => !args.iter().enumerate().any(|(i, a)| {
+            matches!(*a, "-p" | "--print" | "--mode=rpc" | "--mode=json")
+                || (*a == "--mode"
+                    && args
+                        .get(i + 1)
+                        .is_some_and(|m| matches!(*m, "rpc" | "json")))
+        }),
+        Provider::Claude | Provider::Codex => true,
+    };
+    HarnessRun {
+        started_ms,
+        interactive,
+    }
 }
 
 fn children_of(ppid_map: &HashMap<u32, u32>) -> HashMap<u32, Vec<u32>> {
@@ -511,6 +550,47 @@ mod tests {
     }
 
     #[test]
+    fn finds_a_harness_that_is_the_pane_process() {
+        let comm = |pid: u32| (pid == 13).then(|| "pi".to_string());
+        let exec = pane(13, "%5", "/w", "pi");
+        assert_eq!(
+            pane_provider(&exec, &HashMap::new(), &comm),
+            Some((Provider::Pi, Some(13)))
+        );
+    }
+
+    #[test]
+    fn server_and_one_shot_harness_runs_are_not_interactive() {
+        let interactive = |provider, out| parse_harness_run(provider, out, 100_000).interactive;
+        for out in [
+            "01:02 opencode serve --port 4096",
+            "01:02 /usr/bin/opencode run fix it",
+            "01:02 opencode --print-logs web",
+        ] {
+            assert!(!interactive(Provider::Opencode, out), "{out}");
+        }
+        for out in ["01:02 opencode", "01:02 opencode -c", "01:02 opencode /w/a"] {
+            assert!(interactive(Provider::Opencode, out), "{out}");
+        }
+        for out in [
+            "01:02 pi -p hello",
+            "01:02 pi --print hello",
+            "01:02 pi --mode rpc",
+            "01:02 pi --mode=json",
+        ] {
+            assert!(!interactive(Provider::Pi, out), "{out}");
+        }
+        for out in ["01:02 pi", "01:02 pi --mode text", "01:02 pi --continue"] {
+            assert!(interactive(Provider::Pi, out), "{out}");
+        }
+        assert_eq!(
+            parse_harness_run(Provider::Pi, "  01:02 pi\n", 100_000).started_ms,
+            Some(38_000)
+        );
+        assert!(interactive(Provider::Pi, ""));
+    }
+
+    #[test]
     fn parses_opencode_session_rows() {
         let json = br#"[
             {"id":"ses_busy","directory":"/w/a","title":"Fix parser","parent_id":null,
@@ -537,16 +617,6 @@ mod tests {
         assert_eq!(
             pi_session_dir_name(Path::new("/home/inkless/workspace/bazhen")),
             "--home-inkless-workspace-bazhen--"
-        );
-    }
-
-    #[test]
-    fn finds_a_harness_that_is_the_pane_process() {
-        let comm = |pid: u32| (pid == 13).then(|| "pi".to_string());
-        let exec = pane(13, "%5", "/w", "pi");
-        assert_eq!(
-            pane_provider(&exec, &HashMap::new(), &comm),
-            Some((Provider::Pi, Some(13)))
         );
     }
 

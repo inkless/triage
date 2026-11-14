@@ -60,6 +60,7 @@ esac
                 "ps",
                 r#"
 case "$*" in
+*etime*) [ -n "$HARNESS_ARGS" ] && echo "  00:05 $HARNESS_ARGS" ;;
 *tty*|*comm*) ;;
 *) echo "$PPID 777001"; echo "777001 777000"; echo "777000 1" ;;
 esac
@@ -87,6 +88,7 @@ esac
             .env_remove("OPENCODE_SESSION_ID")
             .env_remove("TMUX_PANE")
             .env("CAPTURE", "")
+            .env_remove("HARNESS_ARGS")
             .env_remove("CODEX_THREAD_ID");
         command
     }
@@ -371,4 +373,45 @@ fn opencode_env_from_inside_another_pane_is_refused() {
         stderr(&output)
     );
     assert!(!fx.dir.join("pasted").exists());
+}
+
+#[test]
+fn a_server_or_one_shot_harness_pane_is_not_listed() {
+    // A real process named `opencode` as the pane's own process, so
+    // discovery finds the harness pid and asks `ps` for its arguments.
+    let fx = Fixture::new(
+        "serve",
+        "  echo \"oc|1.0|$HARNESS_PID|/dev/null|opencode|/work/oc|1|%30|opencode\"",
+    );
+    let bin = fx.dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    fs::copy("/bin/sleep", bin.join("opencode")).unwrap();
+    // Another test thread's fork can briefly hold the copy's write handle.
+    let mut harness = (0..50)
+        .find_map(
+            |_| match Command::new(bin.join("opencode")).arg("30").spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                }
+                spawned => Some(spawned.unwrap()),
+            },
+        )
+        .unwrap();
+    let agents = |args: &str| {
+        let output = fx
+            .command(&["agents", "--json"])
+            .env("HARNESS_PID", harness.id().to_string())
+            .env("HARNESS_ARGS", args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        serde_json::from_slice::<Vec<serde_json::Value>>(&output.stdout).unwrap()
+    };
+    let interactive = agents("opencode");
+    let server = agents("opencode serve --port 4096");
+    harness.kill().unwrap();
+    harness.wait().unwrap();
+    assert_eq!(interactive.len(), 1, "{interactive:?}");
+    assert!(server.is_empty(), "{server:?}");
 }
