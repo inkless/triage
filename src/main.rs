@@ -16,6 +16,7 @@ mod pane_agents;
 mod peer_hooks;
 mod persist;
 mod reconcile;
+mod refresher;
 mod snapshot;
 mod spawn_agent;
 mod tmux;
@@ -24,6 +25,7 @@ mod transport;
 mod ui;
 mod watcher;
 
+use std::collections::HashMap;
 use std::io;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -36,13 +38,17 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
+use crate::persist::AliasKey;
+use crate::refresher::{Refresher, WorkerGone};
 use crate::ui::{AppState, draw};
 use crate::watcher::FsWatcher;
 
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
+/// Input poll timeout while discovery runs, so its result lands promptly.
+const RESULT_POLL: Duration = Duration::from_millis(25);
 /// Minimum gap between watcher-triggered refreshes. Without this, an actively
-/// writing jsonl can fire fs events fast enough that refresh runs every loop
-/// iteration, blocking key handling. The configured refresh-interval still
+/// writing jsonl can fire fs events fast enough that discovery never rests.
+/// The configured refresh-interval still
 /// applies as the upper bound when nothing is changing.
 const WATCHER_DEBOUNCE: Duration = Duration::from_millis(400);
 /// Preview-rail re-capture interval for the *same* pane (TRI-138). Selection
@@ -351,9 +357,12 @@ fn run(
     app.zoom_on_jump = zoom_on_jump;
     let refresh_interval = Duration::from_secs(app.config.thresholds.refresh_seconds.max(1));
     let watcher = FsWatcher::spawn().ok();
+    let mut refresher = spawn_discovery(refresh_interval);
 
-    refresh(&mut app);
-    let mut last_refresh = Instant::now();
+    refresher
+        .start(app.aliases.clone())
+        .map_err(discovery_stopped)?;
+    apply_discovery(&mut app, refresher.wait().map_err(discovery_stopped)?);
     // Preview-rail capture cadence (TRI-138): retarget instantly when the
     // selected pane changes, otherwise re-capture the same pane at most every
     // PREVIEW_REFRESH. Keeps holding `j`/`k` from firing a capture per repeat.
@@ -378,27 +387,90 @@ fn run(
         }
         terminal.draw(|f| draw(f, &mut app, now))?;
 
-        if event::poll(TICK_INTERVAL)? {
-            match event::read()? {
-                Event::Key(k) if k.kind == KeyEventKind::Press => {
-                    if !handle_key(&mut app, k.code, k.modifiers) {
-                        return Ok(());
-                    }
-                    app.clamp_selection();
+        let timeout = if refresher.in_flight() {
+            RESULT_POLL
+        } else {
+            TICK_INTERVAL
+        };
+        if event::poll(timeout)? {
+            let first = event::read()?;
+            let pending = || -> io::Result<Option<Event>> {
+                if event::poll(Duration::ZERO)? {
+                    event::read().map(Some)
+                } else {
+                    Ok(None)
                 }
-                Event::Resize(_, _) => {}
-                _ => {}
+            };
+            if !handle_events(&mut app, first, pending)? {
+                return Ok(());
             }
         }
 
-        let elapsed = last_refresh.elapsed();
-        let due = elapsed >= refresh_interval;
         let triggered = watcher.as_ref().map(|w| w.drain()).unwrap_or(false);
-        if due || (triggered && elapsed >= WATCHER_DEBOUNCE) {
-            refresh(&mut app);
-            last_refresh = Instant::now();
+        if let Some(discovery) = refresher
+            .try_finish(Instant::now())
+            .map_err(discovery_stopped)?
+        {
+            apply_discovery(&mut app, discovery);
         }
+        refresher
+            .poll_start(Instant::now(), triggered, || app.aliases.clone())
+            .map_err(discovery_stopped)?;
     }
+}
+
+/// Handles `first` and every event already queued behind it, so a burst of
+/// keys is applied before the next redraw. Returns false when a key quits.
+fn handle_events(
+    app: &mut AppState,
+    first: Event,
+    mut pending: impl FnMut() -> io::Result<Option<Event>>,
+) -> io::Result<bool> {
+    let mut next = Some(first);
+    while let Some(event) = next {
+        if let Event::Key(k) = event
+            && k.kind == KeyEventKind::Press
+        {
+            if !handle_key(app, k.code, k.modifiers) {
+                return Ok(false);
+            }
+            app.clamp_selection();
+        }
+        next = pending()?;
+    }
+    Ok(true)
+}
+
+struct Discovery {
+    client_width: u16,
+    sessions: Vec<models::Session>,
+    codex_errors: Vec<String>,
+}
+
+fn spawn_discovery(interval: Duration) -> Refresher<HashMap<AliasKey, String>, Discovery> {
+    let mut digest_cache = transcript::DigestCache::new();
+    let mut codex_cache = codex::CodexDigestCache::new();
+    Refresher::spawn(interval, WATCHER_DEBOUNCE, move |aliases| {
+        // `should_zoom_on_jump` decides auto-zoom from the calling client's
+        // width, not the triage pane's (a laptop split-screen makes a narrow
+        // pane on a wide client). Zero outside tmux disables auto-zoom.
+        let client_width = tmux::current_client_width().unwrap_or(0);
+        let sessions = snapshot::discover_sessions(
+            SystemTime::now(),
+            &mut digest_cache,
+            &mut codex_cache,
+            &aliases,
+        );
+        Discovery {
+            client_width,
+            sessions,
+            codex_errors: codex_cache.discovery_errors.clone(),
+        }
+    })
+}
+
+fn discovery_stopped(_: WorkerGone) -> io::Error {
+    io::Error::other("session discovery stopped unexpectedly")
 }
 
 fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
@@ -1003,27 +1075,16 @@ fn route_codex_decision(target: &str, approve: bool) -> Result<(), String> {
     tmux::send_keys(target, &[key]).map_err(|e| e.to_string())
 }
 
-fn refresh(app: &mut AppState) {
-    // Cache calling client's width once per tick — `should_zoom_on_jump`
-    // reads this to decide whether to auto-zoom on Enter. Cheap (single
-    // tmux subprocess). Falls to 0 outside tmux; that disables auto-zoom,
-    // leaving the explicit --zoom-on-jump / --exit-on-jump flags as the
-    // only zoom path. See specs/notify-self-host.md context for why pane
-    // width was wrong (laptop split-screen produces narrow pane on a
-    // wide-client terminal).
-    app.last_client_width = tmux::current_client_width().unwrap_or(0);
-    let now = SystemTime::now();
-    let mut sessions = snapshot::discover_sessions(
-        now,
-        &mut app.digest_cache,
-        &mut app.codex_cache,
-        &app.aliases,
-    );
+fn apply_discovery(app: &mut AppState, discovery: Discovery) {
+    app.last_client_width = discovery.client_width;
+    let mut sessions = discovery.sessions;
+    // A rename made while discovery ran is not in the aliases it was given.
+    ui::apply_aliases_to_sessions(&mut sessions, &app.aliases);
 
-    if !app.codex_cache.discovery_errors.is_empty() {
+    if !discovery.codex_errors.is_empty() {
         app.status_msg = Some(format!(
             "Codex discovery unavailable: {}",
-            app.codex_cache.discovery_errors.join("; ")
+            discovery.codex_errors.join("; ")
         ));
         return;
     }
@@ -1116,9 +1177,8 @@ fn refresh(app: &mut AppState) {
     app.last_states = sessions.iter().map(|s| (s.pid, s.state)).collect();
     app.notifications_armed = true;
 
-    app.sessions = sessions;
+    app.replace_sessions(sessions);
     maintain_mailbox(app);
-    app.clamp_selection();
     app.status_msg = None;
 }
 
@@ -1817,8 +1877,8 @@ fn jump_to_selected(app: &mut AppState) -> bool {
 mod tests {
     use super::{
         AutoAuditPayload, Cli, Command, audit_payload_for_claude, audit_payload_for_session,
-        audit_verdict_needs_attention, is_auto_auditable_blocked, is_auto_auditable_claude_tool,
-        prompt_fingerprint, should_alert_actionable_transition,
+        audit_verdict_needs_attention, handle_events, is_auto_auditable_blocked,
+        is_auto_auditable_claude_tool, prompt_fingerprint, should_alert_actionable_transition,
     };
     use crate::approval::PendingApproval;
     use crate::models::{AttentionState, Provider, Session};
@@ -1828,6 +1888,28 @@ mod tests {
 
     fn parse(parts: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("triage").chain(parts.iter().copied()))
+    }
+
+    #[test]
+    fn queued_keys_are_all_handled_before_the_next_redraw() {
+        use crossterm::event::{Event, KeyCode, KeyEvent};
+        let key = |c| Event::Key(KeyEvent::from(KeyCode::Char(c)));
+        let mut app = crate::ui::AppState::new();
+        app.filter.clear();
+        app.sessions = (1..=5)
+            .map(|pid| Session {
+                pid,
+                ..auto_test_session()
+            })
+            .collect();
+        app.selected.select(Some(0));
+        let mut queued = vec![key('j'), key('j'), key('k'), key('j')].into_iter();
+
+        let keep_running = handle_events(&mut app, key('j'), || Ok(queued.next())).unwrap();
+
+        assert!(keep_running);
+        assert_eq!(app.selected.selected(), Some(3));
+        assert!(queued.next().is_none());
     }
 
     #[test]
