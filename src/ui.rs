@@ -51,6 +51,8 @@ pub struct AppState {
     /// compact table; Bottom = below the full-width table.
     pub preview_pos: PreviewPos,
     pub status_msg: Option<String>,
+    /// Seconds the running discovery has gone past its stall threshold.
+    pub discovery_stalled_secs: Option<u64>,
     /// Triage-local row aliases keyed by provider + alias session id. For
     /// Codex this is the root thread id so aliases follow spawned child
     /// threads without following unrelated pane reuse.
@@ -226,6 +228,7 @@ impl AppState {
             preview: None,
             preview_pos: PreviewPos::default(),
             status_msg: None,
+            discovery_stalled_secs: None,
             aliases,
             muted,
             pinned,
@@ -2431,6 +2434,20 @@ mod tests {
     }
 
     #[test]
+    fn a_stalled_refresh_is_shown_unless_a_status_message_is_up() {
+        let mut app = AppState::new();
+        app.status_msg = None;
+        assert_eq!(footer_message(&app), None);
+        app.discovery_stalled_secs = Some(7);
+        assert_eq!(
+            footer_message(&app).as_deref(),
+            Some("  refresh stalled 7s")
+        );
+        app.status_msg = Some("approved".into());
+        assert_eq!(footer_message(&app).as_deref(), Some("approved"));
+    }
+
+    #[test]
     fn new_sessions_keep_the_cursor_on_the_same_row() {
         let mut app = AppState::new();
         app.filter.clear();
@@ -3160,11 +3177,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         );
         return;
     }
-    let line = if let Some(msg) = &app.status_msg {
-        Line::from(Span::styled(
-            msg.clone(),
-            Style::default().fg(Color::Yellow),
-        ))
+    let line = if let Some(msg) = footer_message(app) {
+        Line::from(Span::styled(msg, Style::default().fg(Color::Yellow)))
     } else {
         let hint = match LayoutMode::from_width(area.width) {
             LayoutMode::Narrow => " ⏎ r a/d / ? q".to_string(),
@@ -3176,6 +3190,13 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+fn footer_message(app: &AppState) -> Option<String> {
+    app.status_msg.clone().or_else(|| {
+        app.discovery_stalled_secs
+            .map(|secs| format!("  refresh stalled {secs}s"))
+    })
 }
 
 /// Case-insensitive substring match against everything a user might want

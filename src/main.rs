@@ -38,7 +38,6 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 
-use crate::persist::AliasKey;
 use crate::refresher::{Refresher, WorkerGone};
 use crate::ui::{AppState, draw};
 use crate::watcher::FsWatcher;
@@ -46,6 +45,8 @@ use crate::watcher::FsWatcher;
 const TICK_INTERVAL: Duration = Duration::from_millis(250);
 /// Input poll timeout while discovery runs, so its result lands promptly.
 const RESULT_POLL: Duration = Duration::from_millis(25);
+/// How long discovery may run before the footer says it is stuck.
+const DISCOVERY_STALL: Duration = Duration::from_secs(5);
 /// Minimum gap between watcher-triggered refreshes. Without this, an actively
 /// writing jsonl can fire fs events fast enough that discovery never rests.
 /// The configured refresh-interval still
@@ -360,9 +361,10 @@ fn run(
     let mut refresher = spawn_discovery(refresh_interval);
 
     refresher
-        .start(app.aliases.clone())
+        .start(Instant::now(), ())
         .map_err(discovery_stopped)?;
     apply_discovery(&mut app, refresher.wait().map_err(discovery_stopped)?);
+    let mut frame = FrameClock::default();
     // Preview-rail capture cadence (TRI-138): retarget instantly when the
     // selected pane changes, otherwise re-capture the same pane at most every
     // PREVIEW_REFRESH. Keeps holding `j`/`k` from firing a capture per repeat.
@@ -370,7 +372,6 @@ fn run(
     let mut last_preview_pane: Option<String> = None;
 
     loop {
-        let now = SystemTime::now();
         if app.preview_open {
             let target = app
                 .selected_session()
@@ -381,11 +382,18 @@ fn run(
                 app.capture_selected_preview();
                 last_preview = Instant::now();
                 last_preview_pane = target;
+                frame.mark();
             }
         } else if last_preview_pane.is_some() {
             last_preview_pane = None;
         }
-        terminal.draw(|f| draw(f, &mut app, now))?;
+        app.discovery_stalled_secs = refresher
+            .running_for(Instant::now())
+            .filter(|running| *running >= DISCOVERY_STALL)
+            .map(|running| running.as_secs());
+        if frame.due(Instant::now()) {
+            terminal.draw(|f| draw(f, &mut app, SystemTime::now()))?;
+        }
 
         let timeout = if refresher.in_flight() {
             RESULT_POLL
@@ -404,6 +412,7 @@ fn run(
             if !handle_events(&mut app, first, pending)? {
                 return Ok(());
             }
+            frame.mark();
         }
 
         let triggered = watcher.as_ref().map(|w| w.drain()).unwrap_or(false);
@@ -412,10 +421,36 @@ fn run(
             .map_err(discovery_stopped)?
         {
             apply_discovery(&mut app, discovery);
+            frame.mark();
         }
         refresher
-            .poll_start(Instant::now(), triggered, || app.aliases.clone())
+            .poll_start(Instant::now(), triggered, || ())
             .map_err(discovery_stopped)?;
+    }
+}
+
+/// Redraws after a change, and otherwise once per tick so ages keep moving.
+#[derive(Default)]
+struct FrameClock {
+    last: Option<Instant>,
+    dirty: bool,
+}
+
+impl FrameClock {
+    fn mark(&mut self) {
+        self.dirty = true;
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        let due = self.dirty
+            || self
+                .last
+                .is_none_or(|last| now.saturating_duration_since(last) >= TICK_INTERVAL);
+        if due {
+            self.dirty = false;
+            self.last = Some(now);
+        }
+        due
     }
 }
 
@@ -447,10 +482,13 @@ struct Discovery {
     codex_errors: Vec<String>,
 }
 
-fn spawn_discovery(interval: Duration) -> Refresher<HashMap<AliasKey, String>, Discovery> {
+/// Discovery runs without aliases; the UI thread applies its current ones to
+/// each result, so a rename or clear made meanwhile is never undone.
+fn spawn_discovery(interval: Duration) -> Refresher<(), Discovery> {
     let mut digest_cache = transcript::DigestCache::new();
     let mut codex_cache = codex::CodexDigestCache::new();
-    Refresher::spawn(interval, WATCHER_DEBOUNCE, move |aliases| {
+    let no_aliases = HashMap::new();
+    Refresher::spawn(interval, WATCHER_DEBOUNCE, move |()| {
         // `should_zoom_on_jump` decides auto-zoom from the calling client's
         // width, not the triage pane's (a laptop split-screen makes a narrow
         // pane on a wide client). Zero outside tmux disables auto-zoom.
@@ -459,7 +497,7 @@ fn spawn_discovery(interval: Duration) -> Refresher<HashMap<AliasKey, String>, D
             SystemTime::now(),
             &mut digest_cache,
             &mut codex_cache,
-            &aliases,
+            &no_aliases,
         );
         Discovery {
             client_width,
@@ -469,8 +507,8 @@ fn spawn_discovery(interval: Duration) -> Refresher<HashMap<AliasKey, String>, D
     })
 }
 
-fn discovery_stopped(_: WorkerGone) -> io::Error {
-    io::Error::other("session discovery stopped unexpectedly")
+fn discovery_stopped(WorkerGone(reason): WorkerGone) -> io::Error {
+    io::Error::other(format!("session discovery stopped: {reason}"))
 }
 
 fn handle_key(app: &mut AppState, code: KeyCode, mods: KeyModifiers) -> bool {
@@ -1078,7 +1116,6 @@ fn route_codex_decision(target: &str, approve: bool) -> Result<(), String> {
 fn apply_discovery(app: &mut AppState, discovery: Discovery) {
     app.last_client_width = discovery.client_width;
     let mut sessions = discovery.sessions;
-    // A rename made while discovery ran is not in the aliases it was given.
     ui::apply_aliases_to_sessions(&mut sessions, &app.aliases);
 
     if !discovery.codex_errors.is_empty() {
@@ -1876,9 +1913,10 @@ fn jump_to_selected(app: &mut AppState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AutoAuditPayload, Cli, Command, audit_payload_for_claude, audit_payload_for_session,
-        audit_verdict_needs_attention, handle_events, is_auto_auditable_blocked,
-        is_auto_auditable_claude_tool, prompt_fingerprint, should_alert_actionable_transition,
+        AutoAuditPayload, Cli, Command, FrameClock, TICK_INTERVAL, audit_payload_for_claude,
+        audit_payload_for_session, audit_verdict_needs_attention, handle_events,
+        is_auto_auditable_blocked, is_auto_auditable_claude_tool, prompt_fingerprint,
+        should_alert_actionable_transition,
     };
     use crate::approval::PendingApproval;
     use crate::models::{AttentionState, Provider, Session};
@@ -1888,6 +1926,19 @@ mod tests {
 
     fn parse(parts: &[&str]) -> Result<Cli, clap::Error> {
         Cli::try_parse_from(std::iter::once("triage").chain(parts.iter().copied()))
+    }
+
+    #[test]
+    fn frames_are_drawn_on_change_or_once_per_tick() {
+        let t0 = std::time::Instant::now();
+        let mut frame = FrameClock::default();
+        assert!(frame.due(t0));
+        assert!(!frame.due(t0 + TICK_INTERVAL / 10));
+        assert!(!frame.due(t0 + TICK_INTERVAL / 2));
+        frame.mark();
+        assert!(frame.due(t0 + TICK_INTERVAL / 2));
+        assert!(!frame.due(t0 + TICK_INTERVAL));
+        assert!(frame.due(t0 + TICK_INTERVAL * 3 / 2));
     }
 
     #[test]

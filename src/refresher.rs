@@ -1,3 +1,5 @@
+use std::any::Any;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
@@ -5,8 +7,8 @@ use std::time::{Duration, Instant};
 /// watcher triggers that arrive meanwhile collapse into one follow-up refresh.
 pub struct Refresher<Req, Res> {
     tx: Sender<Req>,
-    rx: Receiver<Res>,
-    in_flight: bool,
+    rx: Receiver<Result<Res, String>>,
+    started: Option<Instant>,
     retrigger: bool,
     last_done: Instant,
     interval: Duration,
@@ -14,7 +16,7 @@ pub struct Refresher<Req, Res> {
 }
 
 #[derive(Debug)]
-pub struct WorkerGone;
+pub struct WorkerGone(pub String);
 
 impl<Req: Send + 'static, Res: Send + 'static> Refresher<Req, Res> {
     pub fn spawn(
@@ -26,7 +28,10 @@ impl<Req: Send + 'static, Res: Send + 'static> Refresher<Req, Res> {
         let (worker_tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             while let Ok(req) = worker_rx.recv() {
-                if worker_tx.send(work(req)).is_err() {
+                let res = panic::catch_unwind(AssertUnwindSafe(|| work(req)))
+                    .map_err(|payload| panic_message(payload.as_ref()));
+                let failed = res.is_err();
+                if worker_tx.send(res).is_err() || failed {
                     break;
                 }
             }
@@ -34,7 +39,7 @@ impl<Req: Send + 'static, Res: Send + 'static> Refresher<Req, Res> {
         Self {
             tx,
             rx,
-            in_flight: false,
+            started: None,
             retrigger: false,
             last_done: Instant::now(),
             interval,
@@ -43,12 +48,17 @@ impl<Req: Send + 'static, Res: Send + 'static> Refresher<Req, Res> {
     }
 
     pub fn in_flight(&self) -> bool {
-        self.in_flight
+        self.started.is_some()
     }
 
-    pub fn start(&mut self, req: Req) -> Result<(), WorkerGone> {
-        self.tx.send(req).map_err(|_| WorkerGone)?;
-        self.in_flight = true;
+    pub fn running_for(&self, now: Instant) -> Option<Duration> {
+        self.started
+            .map(|started| now.saturating_duration_since(started))
+    }
+
+    pub fn start(&mut self, now: Instant, req: Req) -> Result<(), WorkerGone> {
+        self.tx.send(req).map_err(|_| gone())?;
+        self.started = Some(now);
         self.retrigger = false;
         Ok(())
     }
@@ -62,35 +72,48 @@ impl<Req: Send + 'static, Res: Send + 'static> Refresher<Req, Res> {
         req: impl FnOnce() -> Req,
     ) -> Result<bool, WorkerGone> {
         self.retrigger |= triggered;
-        if self.in_flight {
+        if self.in_flight() {
             return Ok(false);
         }
         let elapsed = now.saturating_duration_since(self.last_done);
         if elapsed < self.interval && !(self.retrigger && elapsed >= self.debounce) {
             return Ok(false);
         }
-        self.start(req())?;
+        self.start(now, req())?;
         Ok(true)
     }
 
     pub fn try_finish(&mut self, now: Instant) -> Result<Option<Res>, WorkerGone> {
         match self.rx.try_recv() {
-            Ok(res) => Ok(Some(self.finished(now, res))),
+            Ok(res) => self.finished(now, res).map(Some),
             Err(TryRecvError::Empty) => Ok(None),
-            Err(TryRecvError::Disconnected) => Err(WorkerGone),
+            Err(TryRecvError::Disconnected) => Err(gone()),
         }
     }
 
     pub fn wait(&mut self) -> Result<Res, WorkerGone> {
-        let res = self.rx.recv().map_err(|_| WorkerGone)?;
-        Ok(self.finished(Instant::now(), res))
+        let res = self.rx.recv().map_err(|_| gone())?;
+        self.finished(Instant::now(), res)
     }
 
-    fn finished(&mut self, now: Instant, res: Res) -> Res {
-        self.in_flight = false;
+    fn finished(&mut self, now: Instant, res: Result<Res, String>) -> Result<Res, WorkerGone> {
+        self.started = None;
         self.last_done = now;
-        res
+        res.map_err(WorkerGone)
     }
+}
+
+fn gone() -> WorkerGone {
+    WorkerGone("worker exited".to_string())
+}
+
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|s| s.to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown cause".to_string());
+    format!("panicked: {detail}")
 }
 
 #[cfg(test)]
@@ -164,10 +187,22 @@ mod tests {
     }
 
     #[test]
-    fn a_dead_worker_is_reported() {
+    fn running_time_is_reported_until_the_refresh_finishes() {
+        let (mut refresher, gate) = gated();
+        let t0 = Instant::now();
+        assert_eq!(refresher.running_for(t0), None);
+        refresher.start(t0, 1).unwrap();
+        assert_eq!(refresher.running_for(t0 + INTERVAL * 5), Some(INTERVAL * 5));
+        finish(&mut refresher, &gate, t0 + INTERVAL * 5);
+        assert_eq!(refresher.running_for(t0 + INTERVAL * 6), None);
+    }
+
+    #[test]
+    fn a_dead_worker_reports_why_it_died() {
         let mut refresher: Refresher<u32, u32> =
             Refresher::spawn(INTERVAL, DEBOUNCE, |_| panic!("discovery failed"));
-        refresher.start(1).unwrap();
-        assert!(refresher.wait().is_err());
+        refresher.start(Instant::now(), 1).unwrap();
+        let WorkerGone(reason) = refresher.wait().unwrap_err();
+        assert!(reason.contains("discovery failed"), "{reason}");
     }
 }
