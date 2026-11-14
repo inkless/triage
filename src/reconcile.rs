@@ -239,10 +239,10 @@ pub fn reconcile_all(store: &Store) -> io::Result<()> {
 
 fn dead_marker(store: &Store, host: HostId, record: &crate::mailbox::HostRecord) -> PathBuf {
     let suffix = match record.provider {
-        crate::models::Provider::Claude => String::new(),
-        crate::models::Provider::Codex
-        | crate::models::Provider::Opencode
-        | crate::models::Provider::Pi => format!("@{}", record.current_session),
+        crate::models::Provider::Claude | crate::models::Provider::Pi => String::new(),
+        crate::models::Provider::Codex | crate::models::Provider::Opencode => {
+            format!("@{}", record.current_session)
+        }
     };
     store
         .root()

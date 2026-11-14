@@ -66,7 +66,7 @@ esac
 case "$*" in
 *etime*) [ -n "$HARNESS_ARGS" ] && echo "  00:05 $HARNESS_ARGS" ;;
 *tty*|*comm*) ;;
-*) echo "$PPID 777001"; echo "777001 777000"; echo "777000 1" ;;
+*) echo "$PPID 777001"; echo "777001 777000"; echo "777000 1"; if [ -n "$EXTRA_PS" ]; then echo "$EXTRA_PS"; fi ;;
 esac
 "#,
             ),
@@ -687,4 +687,70 @@ fn a_failing_or_unsafe_server_falls_back_to_a_paste() {
         stderr(&output)
     );
     assert_eq!(mail(&fx, "ses_oc", "pasted").len(), 2);
+}
+
+#[test]
+fn mail_to_a_pi_session_with_the_extension_waits_for_its_waiter() {
+    // The test process plays the pi process inside pane %31 (root 502); the
+    // extension registered a session other than the newest file in /work/pi.
+    let fx = Fixture::new("pihost", OC_CALLER_AND_PI_TARGET);
+    let pi = std::process::id().to_string();
+    let hosted = "019a8f3c-0000-7000-8000-0000000000e1";
+    let harnesses = format!("777001,{pi}");
+    let as_pi_hook = |event: &str| {
+        let mut child = fx
+            .command(&["inbox", "--hook", "pi", event, "--triage-hook=v1"])
+            .env("TRIAGE_TEST_PANE_HARNESS", &pi)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let payload = serde_json::json!({ "session_id": hosted }).to_string();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+    let with_pi = |args: &[&str]| {
+        fx.command(args)
+            .env("TRIAGE_TEST_PANE_HARNESS", &harnesses)
+            .env("EXTRA_PS", format!("{pi} 502"))
+            .env("OPENCODE_SESSION_ID", "ses_oc")
+            .env("TMUX_PANE", "%30")
+            .output()
+            .unwrap()
+    };
+
+    fx.record_opencode_server();
+    assert!(as_pi_hook("session-start").status.success());
+    let rows = with_pi(&["agents", "--json", "--include-self"]);
+    let rows: Vec<serde_json::Value> = serde_json::from_slice(&rows.stdout).unwrap();
+    assert_eq!(row(&rows, "%31")["session_id"], hosted);
+    assert_eq!(row(&rows, "%31")["agent_id"], hosted);
+
+    let output = with_pi(&[
+        "send",
+        "--mode",
+        "mailbox",
+        "--to",
+        "%31",
+        "--message",
+        "hi",
+    ]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).starts_with("queued for"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!fx.dir.join("pasted").exists());
+    assert_eq!(mail(&fx, hosted, "pending").len(), 1);
+
+    let delivered = as_pi_hook("wait");
+    assert!(delivered.status.success());
+    assert!(String::from_utf8_lossy(&delivered.stdout).contains("\nhi\n"));
+    assert_eq!(mail(&fx, hosted, "delivered").len(), 1);
 }

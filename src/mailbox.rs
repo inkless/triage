@@ -202,6 +202,7 @@ pub enum DeliveredVia {
     CodexPostToolUse,
     LegacyPaste,
     OpencodeServer,
+    PiExtension,
     Inbox,
     InboxShow,
 }
@@ -432,10 +433,12 @@ impl Store {
         }
     }
 
+    /// A Claude or pi process runs one session at a time, so its record is
+    /// keyed by the process; a Codex process runs several threads at once.
     fn host_key(host: HostId, provider: Provider, session: &str) -> String {
         match provider {
-            Provider::Claude => host.key(),
-            Provider::Codex | Provider::Opencode | Provider::Pi => {
+            Provider::Claude | Provider::Pi => host.key(),
+            Provider::Codex | Provider::Opencode => {
                 format!("{}@{session}", host.key())
             }
         }

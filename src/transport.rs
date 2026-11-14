@@ -1,6 +1,6 @@
 //! Wake pointers for agents with pending mail, sent by a detached helper that
 //! runs as a singleton per agent. It is the only thing that nudges a session:
-//! `codex queue` for Codex, and a draft-gated tmux pointer for a Claude
+//! `codex queue` for Codex, and a draft-gated tmux pointer for a Claude or pi
 //! session whose waiter is gone.
 
 use std::collections::BTreeSet;
@@ -166,10 +166,7 @@ fn helper_pass(store: &Store, agent: &str, grace: Duration) -> io::Result<()> {
         .collect();
     let text = pointer_text(pending.len(), &senders);
     match record.provider {
-        Provider::Opencode | Provider::Pi => Err(io::Error::other(format!(
-            "{} sessions have no mailbox wake",
-            record.provider.name()
-        ))),
+        Provider::Opencode => Err(io::Error::other("opencode sessions have no mailbox wake")),
         Provider::Codex => {
             if live_pointer(store, agent) {
                 return Ok(());
@@ -200,11 +197,12 @@ fn helper_pass(store: &Store, agent: &str, grace: Duration) -> io::Result<()> {
             fs::write(pointer_marker(store, agent), serde_json::to_vec(&marker)?)?;
             Ok(())
         }
-        Provider::Claude => {
+        Provider::Claude | Provider::Pi => {
             if store.try_lock(LockKind::Waiter, agent)?.is_none() {
                 return Ok(());
             }
-            crate::agent_comm::paste_wake_pointer(host.pid, &text).map_err(io::Error::other)
+            crate::agent_comm::paste_wake_pointer(host.pid, &record.current_session, &text)
+                .map_err(io::Error::other)
         }
     }
 }

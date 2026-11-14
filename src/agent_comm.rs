@@ -1211,7 +1211,7 @@ struct AgentIdentity {
 
 fn agent_identity(store: &Store, s: &Session) -> Option<AgentIdentity> {
     if s.provider.pane_only() {
-        return pane_agent_identity(s);
+        return pane_agent_identity(store, s);
     }
     let host = mailbox::proc_info(s.pid).ok().map(|info| HostId {
         pid: s.pid,
@@ -1234,8 +1234,9 @@ fn agent_identity(store: &Store, s: &Session) -> Option<AgentIdentity> {
 }
 
 /// An opencode or pi agent is its session. A row only matched to a pane, or
-/// an id of the wrong shape for its harness, has no mailbox identity.
-fn pane_agent_identity(s: &Session) -> Option<AgentIdentity> {
+/// an id of the wrong shape for its harness, has no mailbox identity. A pi
+/// session's host is the live pi process whose extension registered it.
+fn pane_agent_identity(store: &Store, s: &Session) -> Option<AgentIdentity> {
     let valid = match s.provider {
         Provider::Opencode => mailbox::is_opencode_session(&s.session_id),
         Provider::Pi => mailbox::is_uuid(&s.session_id),
@@ -1244,9 +1245,20 @@ fn pane_agent_identity(s: &Session) -> Option<AgentIdentity> {
     valid.then(|| AgentIdentity {
         agent: s.session_id.clone(),
         session: s.session_id.clone(),
-        host: None,
+        host: (s.provider == Provider::Pi)
+            .then(|| live_pi_host(store, &s.session_id))
+            .flatten(),
         provider: s.provider,
     })
+}
+
+fn live_pi_host(store: &Store, session: &str) -> Option<HostId> {
+    store
+        .hosts()
+        .into_iter()
+        .filter(|(_, r)| r.provider == Provider::Pi && r.current_session == session)
+        .map(|(host, _)| host)
+        .find(|&host| mailbox::liveness(host) == mailbox::Liveness::Alive)
 }
 
 pub(crate) fn session_agent_id(store: &Store, s: &Session) -> Option<String> {
@@ -1353,14 +1365,15 @@ fn format_user_reply(body: &str) -> Result<String, CliError> {
     Ok(body)
 }
 
-/// Claude backstop wake for a session whose waiter is gone: the same pointer
+/// Claude and pi backstop wake for a session whose waiter is gone: the pointer
 /// text a Codex session gets, pasted only if the session is idle and the
 /// usual send gate passes.
-pub fn paste_wake_pointer(host_pid: u32, text: &str) -> Result<(), String> {
+pub fn paste_wake_pointer(host_pid: u32, session: &str, text: &str) -> Result<(), String> {
     let sessions = load_snapshot().map_err(|e| e.message)?;
+    // A pi row's pid is its pane, not the pi process.
     let target = sessions
         .iter()
-        .find(|s| s.pid == host_pid)
+        .find(|s| s.pid == host_pid || (s.provider == Provider::Pi && s.session_id == session))
         .ok_or_else(|| format!("no tracked session for pid {host_pid}"))?;
     if target.status == "busy" {
         return Ok(());
@@ -1849,9 +1862,7 @@ fn resolve_caller(
 }
 
 fn is_pane_harness(pid: u32, provider: Provider) -> bool {
-    if cfg!(debug_assertions)
-        && std::env::var("TRIAGE_TEST_PANE_HARNESS").is_ok_and(|v| v == pid.to_string())
-    {
+    if crate::peer_hooks::is_test_pane_harness(pid) {
         return true;
     }
     mailbox::proc_info(pid).is_ok_and(|info| is_harness_comm(&info.comm, provider))

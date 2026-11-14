@@ -34,6 +34,8 @@ enum Event {
     Stop,
     UserPromptSubmit,
     PostToolUse,
+    /// pi's mail waiter, spawned by triage's pi extension.
+    Wait,
 }
 
 struct HookArgs {
@@ -47,7 +49,7 @@ struct Payload {
     transcript_path: Option<PathBuf>,
 }
 
-/// `triage inbox --hook <claude|codex> <event> [--wait] --triage-hook=v1`.
+/// `triage inbox --hook <claude|codex|pi> <event> [--wait] --triage-hook=v1`.
 /// Returns the process exit code.
 pub fn cli(args: &[String]) -> i32 {
     // Triage's own one-shot `claude -p --name triage-auditor` audit call
@@ -81,13 +83,15 @@ fn parse_args(args: &[String]) -> io::Result<HookArgs> {
     let provider = match args.first().map(String::as_str) {
         Some("claude") => Provider::Claude,
         Some("codex") => Provider::Codex,
-        _ => return Err(bad("expected claude or codex")),
+        Some("pi") => Provider::Pi,
+        _ => return Err(bad("expected claude, codex or pi")),
     };
     let event = match args.get(1).map(String::as_str) {
         Some("session-start") => Event::SessionStart,
         Some("stop") => Event::Stop,
         Some("user-prompt-submit") => Event::UserPromptSubmit,
         Some("post-tool-use") => Event::PostToolUse,
+        Some("wait") => Event::Wait,
         _ => return Err(bad("unknown hook event")),
     };
     let mut wait = false;
@@ -147,6 +151,9 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
     let payload = parse_payload(stdin, hook.provider)?;
     let host = find_host(hook.provider)
         .ok_or_else(|| io::Error::other("no harness process among this hook's ancestors"))?;
+    if hook.provider == Provider::Pi {
+        return run_pi(store, hook.event, host, &payload);
+    }
     let agent = register(store, host, hook.provider, &payload.session, hook.event)?;
     let mailbox = store.mailbox(&agent)?;
     match (hook.provider, hook.event) {
@@ -155,7 +162,7 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
             if !hook.wait {
                 return Ok(0);
             }
-            wait_for_mail(store, &mailbox, &agent, host, &payload)
+            wait_for_mail(store, &mailbox, &agent, host, &payload, Provider::Claude)
         }
         (Provider::Claude, Event::PostToolUse) => drain(
             store,
@@ -167,6 +174,7 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
             DeliveredVia::ClaudePostToolUse,
         ),
         (Provider::Claude, Event::UserPromptSubmit)
+        | (Provider::Claude | Provider::Codex, Event::Wait)
         | (Provider::Codex, Event::Stop)
         | (Provider::Opencode | Provider::Pi, _) => Err(io::Error::other(
             "no triage hook is installed for this event",
@@ -195,8 +203,43 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
     }
 }
 
+/// pi's extension starts `session-start` when a session begins, which makes
+/// the pi process the host of that session, then keeps one `wait` running:
+/// it blocks until mail arrives, prints it and exits for the extension to
+/// inject. Each pi process runs one session at a time, so the host record
+/// names its current one, and a waiter for any other session just exits.
+fn run_pi(store: &Store, event: Event, host: HostId, payload: &Payload) -> io::Result<i32> {
+    let agent = payload.session.as_str();
+    match event {
+        Event::SessionStart => {
+            store.write_host(
+                host,
+                &HostRecord {
+                    v: 1,
+                    provider: Provider::Pi,
+                    hook_version: HOOK_VERSION.to_string(),
+                    current_session: payload.session.clone(),
+                    updated_at_ms: mailbox::now_ms(),
+                },
+            )?;
+            crate::reconcile::reconcile_agent(store, agent)?;
+            Ok(0)
+        }
+        Event::Wait => {
+            if host_current_session(store, host).as_deref() != Some(agent) {
+                return Ok(0);
+            }
+            let mailbox = store.mailbox(agent)?;
+            wait_for_mail(store, &mailbox, agent, host, payload, Provider::Pi)
+        }
+        Event::Stop | Event::UserPromptSubmit | Event::PostToolUse => Err(io::Error::other(
+            "no triage hook is installed for this event",
+        )),
+    }
+}
+
 /// The nearest ancestor that is the harness process: for Claude a pid with a
-/// `~/.claude/sessions/<pid>.json` record, for Codex a process named `codex`.
+/// `~/.claude/sessions/<pid>.json` record, for Codex a process named `codex`., for pi a process named `pi`.
 fn find_host(provider: Provider) -> Option<HostId> {
     let sessions_dir = crate::discovery::sessions_dir();
     let mut pid = std::os::unix::process::parent_id();
@@ -208,7 +251,8 @@ fn find_host(provider: Provider) -> Option<HostId> {
         let is_host = match provider {
             Provider::Claude => sessions_dir.join(format!("{pid}.json")).exists(),
             Provider::Codex => info.comm == "codex" || is_test_codex_host(pid),
-            Provider::Opencode | Provider::Pi => false,
+            Provider::Pi => info.comm == "pi" || is_test_pane_harness(pid),
+            Provider::Opencode => false,
         };
         if is_host {
             return Some(HostId {
@@ -226,6 +270,14 @@ fn find_host(provider: Provider) -> Option<HostId> {
 fn is_test_codex_host(pid: u32) -> bool {
     cfg!(debug_assertions)
         && std::env::var("TRIAGE_TEST_CODEX_HOST").is_ok_and(|v| v == pid.to_string())
+}
+
+/// Integration tests can't run a real opencode or pi either; debug builds let
+/// them name pids (comma-separated) that stand in for harness processes.
+pub(crate) fn is_test_pane_harness(pid: u32) -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("TRIAGE_TEST_PANE_HARNESS")
+            .is_ok_and(|v| v.split(',').any(|p| p == pid.to_string()))
 }
 
 /// Links the session into its agent's lineage and records the host's current
@@ -300,8 +352,11 @@ fn wait_for_mail(
     agent: &str,
     host: HostId,
     payload: &Payload,
+    reader: Provider,
 ) -> io::Result<i32> {
-    block_sigterm();
+    if reader == Provider::Claude {
+        block_sigterm();
+    }
     let started = Instant::now();
     let deadline = started + Duration::from_secs(WAITER_TIMEOUT_SECS) - WAITER_DEADLINE_MARGIN;
     let _lock = loop {
@@ -367,13 +422,12 @@ fn wait_for_mail(
                 printed_at_ms: None,
                 head_only: false,
             };
-            if let Some(batch) = claim_batch(
-                mailbox,
-                &payload.session,
-                host,
-                Provider::Claude,
-                &claim_template,
-            )? {
+            if let Some(batch) =
+                claim_batch(mailbox, &payload.session, host, reader, &claim_template)?
+            {
+                if reader == Provider::Pi {
+                    return hand_to_pi(mailbox, &batch);
+                }
                 let mut stderr = io::stderr().lock();
                 stderr.write_all(batch.text.as_bytes())?;
                 stderr.flush()?;
@@ -388,6 +442,28 @@ fn wait_for_mail(
         }
         let _ = rx.recv_timeout(RESCAN_INTERVAL);
     }
+}
+
+/// The pi extension injects whatever the waiter prints once it exits, so
+/// printed mail counts as delivered.
+fn hand_to_pi(mailbox: &Mailbox, batch: &Batch) -> io::Result<i32> {
+    let written = io::stdout()
+        .lock()
+        .write_all(batch.text.as_bytes())
+        .and_then(|()| io::stdout().flush());
+    for (inflight, claim) in &batch.claims {
+        if written.is_ok() {
+            let to = if claim.head_only {
+                State::Notified
+            } else {
+                State::Delivered
+            };
+            mailbox.commit(inflight, to, DeliveredVia::PiExtension, mailbox::now_ms())?;
+        } else {
+            mailbox.release(inflight)?;
+        }
+    }
+    written.map(|()| 0)
 }
 
 struct Batch {

@@ -41,10 +41,17 @@ pub fn discover(
     skip: &HashSet<String>,
 ) -> Vec<Session> {
     let children = children_of(ppid_map);
-    let comm = |pid: u32| crate::mailbox::proc_info(pid).ok().map(|info| info.comm);
+    let store = crate::mailbox::Store::open_default();
     let mut by_provider: HashMap<Provider, Vec<&Pane>> = HashMap::new();
     let mut started = HashMap::new();
+    let mut hosted = HashMap::new();
     for pane in panes.values().filter(|p| !skip.contains(&p.pane_id)) {
+        let comm = |pid: u32| {
+            if crate::peer_hooks::is_test_pane_harness(pid) {
+                return Some(pane.current_command.clone());
+            }
+            crate::mailbox::proc_info(pid).ok().map(|info| info.comm)
+        };
         let Some((provider, harness)) = pane_provider(pane, &children, &comm) else {
             continue;
         };
@@ -56,6 +63,11 @@ pub fn discover(
         if let Some(ms) = run.and_then(|run| run.started_ms) {
             started.insert(pane.pane_id.clone(), ms);
         }
+        if provider == Provider::Pi
+            && let Some(session) = harness.and_then(|pid| hosted_pi_session(&store, pid))
+        {
+            hosted.insert(pane.pane_id.clone(), session);
+        }
     }
     let mut out = Vec::new();
     for (provider, panes) in by_provider {
@@ -64,9 +76,47 @@ pub fn discover(
             Provider::Pi => pi_metas(&pi_agent_dir(), &panes),
             Provider::Claude | Provider::Codex => continue,
         };
-        out.extend(sessions_for_panes(provider, &panes, &metas, &started));
+        let mut sessions = sessions_for_panes(provider, &panes, &metas, &started);
+        if provider == Provider::Pi {
+            for (session, pane) in sessions.iter_mut().zip(&panes) {
+                if let Some(id) = hosted.get(&pane.pane_id)
+                    && &session.session_id != id
+                {
+                    let meta = hosted_pi_meta(&pi_agent_dir(), pane, id);
+                    *session = pane_session(provider, pane, Some(&meta));
+                }
+            }
+        }
+        out.extend(sessions);
     }
     out
+}
+
+/// The session triage's pi extension registered for this pi process, which
+/// outranks any guess from the session files in its directory.
+fn hosted_pi_session(store: &crate::mailbox::Store, pid: u32) -> Option<String> {
+    let host = crate::mailbox::HostId {
+        pid,
+        start: crate::mailbox::proc_info(pid).ok()?.start,
+    };
+    store
+        .read_host(host)
+        .filter(|record| record.provider == Provider::Pi)
+        .map(|record| record.current_session)
+}
+
+fn hosted_pi_meta(agent_dir: &Path, pane: &Pane, id: &str) -> SessionMeta {
+    pi_session_file(agent_dir, &pane.cwd, id)
+        .and_then(|path| {
+            let text = fs::read_to_string(&path).ok()?;
+            let modified = fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            parse_pi_session(&text, time_to_ms(modified))
+        })
+        .filter(|meta| meta.id == id)
+        .unwrap_or_else(|| SessionMeta {
+            id: id.to_string(),
+            ..fresh_meta(pane)
+        })
 }
 
 #[derive(Debug, PartialEq)]
@@ -355,7 +405,7 @@ fn parse_opencode_rows(json: &[u8]) -> Vec<SessionMeta> {
         .collect()
 }
 
-fn pi_agent_dir() -> PathBuf {
+pub(crate) fn pi_agent_dir() -> PathBuf {
     std::env::var_os("PI_CODING_AGENT_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
