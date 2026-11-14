@@ -935,6 +935,12 @@ fn run_inbox(args: &[String]) -> Result<(), CliError> {
         Some(session) => session_in_caller_chain(&sessions, session, &parents)?,
         None => resolve_current_caller(&sessions, &parents)?,
     };
+    if caller.provider.pane_only() {
+        return Err(CliError::runtime(format!(
+            "triage mail is not supported for {} agents yet; messages sent to them are pasted into their pane",
+            caller.provider.name()
+        )));
+    }
     let store = Store::open_default();
     reconcile_quietly(&store);
     let identity = agent_identity(&store, caller).ok_or_else(|| {

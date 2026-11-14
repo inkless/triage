@@ -252,6 +252,18 @@ fn a_pi_pane_sends_to_an_opencode_pane_under_its_pane_name() {
     let me: serde_json::Value = serde_json::from_slice(&whoami.stdout).unwrap();
     assert_eq!(me["pane_id"], "%31");
     assert_eq!(me["provider"], "pi");
+
+    let inbox = fx
+        .command(&["inbox"])
+        .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+        .output()
+        .unwrap();
+    assert!(!inbox.status.success());
+    assert!(
+        stderr(&inbox).contains("triage mail is not supported for pi agents yet"),
+        "{}",
+        stderr(&inbox)
+    );
 }
 
 #[test]
