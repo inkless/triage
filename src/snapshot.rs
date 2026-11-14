@@ -3,7 +3,7 @@ use std::time::SystemTime;
 
 use crate::models::{Pane, Provider, Session, useful_window_name};
 use crate::persist::AliasKey;
-use crate::{approval, classifier, codex, discovery, tmux, transcript, ui};
+use crate::{approval, classifier, codex, discovery, pane_agents, tmux, transcript, ui};
 
 pub fn discover_sessions(
     now: SystemTime,
@@ -36,6 +36,7 @@ pub fn discover_sessions_with_panes(
 
     let mut codex_sessions = codex::discover_live_sessions(&panes, &ppid_map, codex_cache);
     sessions.append(&mut codex_sessions);
+    sessions.extend(pane_agents::discover(&panes));
 
     enrich_permission_prompts(&mut sessions);
     let pending = approval::read_pending();

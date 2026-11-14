@@ -403,7 +403,7 @@ impl Store {
 
     pub fn agent_for(&self, provider: Provider, session: &str) -> String {
         match provider {
-            Provider::Codex => session.to_string(),
+            Provider::Codex | Provider::Opencode | Provider::Pi => session.to_string(),
             Provider::Claude => self
                 .lineage_root(session)
                 .unwrap_or_else(|| session.to_string()),
@@ -413,7 +413,9 @@ impl Store {
     fn host_key(host: HostId, provider: Provider, session: &str) -> String {
         match provider {
             Provider::Claude => host.key(),
-            Provider::Codex => format!("{}@{session}", host.key()),
+            Provider::Codex | Provider::Opencode | Provider::Pi => {
+                format!("{}@{session}", host.key())
+            }
         }
     }
 
@@ -1037,10 +1039,7 @@ fn render_batch_with(
 fn render_one(item: &RenderItem, fence: &str, head_only: bool) -> String {
     let msg = item.msg;
     let from = short_id(&msg.from.agent);
-    let provider = match msg.from.provider {
-        Provider::Claude => "claude",
-        Provider::Codex => "codex",
-    };
+    let provider = msg.from.provider.name();
     let mut marker = format!("id={}", msg.id);
     if let Some(nonce) = item.nonce {
         marker.push_str(&format!(" n={nonce}"));

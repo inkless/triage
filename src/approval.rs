@@ -1140,6 +1140,7 @@ fn print_waiters() {
             (Provider::Claude, Ok(Some(_))) => "no waiter",
             (Provider::Claude, Err(_)) => "waiter unknown",
             (Provider::Codex, _) => "sync hooks",
+            (Provider::Opencode | Provider::Pi, _) => "no hooks",
         };
         println!(
             "pid {:<7} {:<6} agent {} session {}  {waiter}",

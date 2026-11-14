@@ -90,7 +90,9 @@ fn session_label(session: &Session) -> String {
         .unwrap_or_else(|| "session".to_string());
     match session.provider {
         Provider::Claude => label,
-        Provider::Codex => format!("cx {label}"),
+        Provider::Codex | Provider::Opencode | Provider::Pi => {
+            format!("{} {label}", session.provider.label())
+        }
     }
 }
 

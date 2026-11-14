@@ -319,6 +319,9 @@ fn evaluate_approve_gate(
             }
             Ok(tmux::parse_codex_pending_full(&plain).unwrap_or_default())
         }
+        Provider::Opencode | Provider::Pi => {
+            Err("approve is not supported for opencode or pi agents")
+        }
     }
 }
 
@@ -1137,6 +1140,10 @@ struct AgentIdentity {
 }
 
 fn agent_identity(store: &Store, s: &Session) -> Option<AgentIdentity> {
+    // No hooks run in opencode/pi, so they have no mailbox; sends paste.
+    if s.provider.pane_only() {
+        return None;
+    }
     let host = mailbox::proc_info(s.pid).ok().map(|info| HostId {
         pid: s.pid,
         start: info.start,
@@ -1593,6 +1600,8 @@ fn provider_matches(provider: Provider, value: &str) -> bool {
     match provider {
         Provider::Claude => matches!(value.as_str(), "cc" | "claude" | "claude-code"),
         Provider::Codex => matches!(value.as_str(), "cx" | "codex"),
+        Provider::Opencode => matches!(value.as_str(), "oc" | "opencode"),
+        Provider::Pi => value == "pi",
     }
 }
 

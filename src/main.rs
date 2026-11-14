@@ -11,6 +11,7 @@ mod mailbox;
 mod messages;
 mod models;
 mod notify_os;
+mod pane_agents;
 mod peer_hooks;
 mod persist;
 mod reconcile;
@@ -882,6 +883,12 @@ fn deliver_approve(app: &AppState) -> String {
     let Some(selected) = app.selected_session() else {
         return "no session selected".to_string();
     };
+    if selected.provider.pane_only() {
+        return format!(
+            "approve is not supported for {} agents",
+            selected.provider.name()
+        );
+    }
     if selected.provider == models::Provider::Codex {
         return deliver_codex_decision(selected, true);
     }
@@ -917,6 +924,12 @@ fn deliver_deny(app: &AppState) -> String {
     let Some(selected) = app.selected_session() else {
         return "no session selected".to_string();
     };
+    if selected.provider.pane_only() {
+        return format!(
+            "deny is not supported for {} agents",
+            selected.provider.name()
+        );
+    }
     if selected.provider == models::Provider::Codex {
         return deliver_codex_decision(selected, false);
     }
@@ -1151,6 +1164,7 @@ fn audit_payload_for_session(
 ) -> Option<AutoAuditPayload> {
     match s.provider {
         models::Provider::Claude => audit_payload_for_claude(s, mode),
+        models::Provider::Opencode | models::Provider::Pi => None,
         models::Provider::Codex => {
             audit_payload_for_codex(s).map(|(tool_name, tool_input)| AutoAuditPayload {
                 tool_name,

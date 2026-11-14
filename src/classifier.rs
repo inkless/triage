@@ -26,8 +26,10 @@ fn has_fresh_busy_evidence(session: &Session, now: SystemTime) -> bool {
 }
 
 pub fn classify(session: &Session, now: SystemTime) -> AttentionState {
-    if session.provider == Provider::Codex {
-        return classify_codex(session, now);
+    match session.provider {
+        Provider::Codex => return classify_codex(session, now),
+        Provider::Opencode | Provider::Pi => return classify_pane_only(session, now),
+        Provider::Claude => {}
     }
 
     if session.last_stop_had_errors {
@@ -131,6 +133,28 @@ pub fn no_progress_age(session: &Session, now: SystemTime) -> Option<Duration> {
     }
     let age = now.duration_since(session.last_progress_at?).ok()?;
     (age >= NO_PROGRESS_THRESHOLD).then_some(age)
+}
+
+/// opencode/pi: best-effort state from the harness's own busy/idle record.
+/// `last_stop_at` is when the session last went idle; without a matched
+/// session there is nothing to go on.
+fn classify_pane_only(session: &Session, now: SystemTime) -> AttentionState {
+    if session.pane_blocked {
+        return AttentionState::Blocked;
+    }
+    match session.status.as_str() {
+        "busy" => AttentionState::Working,
+        "idle" => match session
+            .last_stop_at
+            .and_then(|t| now.duration_since(t).ok())
+        {
+            Some(age) if age <= JUST_FINISHED_WINDOW => AttentionState::JustFinished,
+            Some(age) if age >= IDLE_LONG_THRESHOLD => AttentionState::IdleLong,
+            Some(_) => AttentionState::IdleShort,
+            None => AttentionState::Fresh,
+        },
+        _ => AttentionState::Unknown,
+    }
 }
 
 fn classify_codex(session: &Session, now: SystemTime) -> AttentionState {

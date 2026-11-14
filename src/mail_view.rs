@@ -251,6 +251,8 @@ fn provider_tag(p: Provider) -> &'static str {
     match p {
         Provider::Claude => "cc",
         Provider::Codex => "cx",
+        Provider::Opencode => "oc",
+        Provider::Pi => "pi",
     }
 }
 
