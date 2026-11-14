@@ -12,6 +12,12 @@ Codex CLI:
 - `~/.codex/sessions/**/rollout-*.jsonl` — prompts, messages, tool calls, token counts
 - `~/.codex/state_5.sqlite` — native thread titles, agent labels, parent/child thread roots
 
+opencode and pi (pane-level only):
+- a tmux pane whose foreground command, or a child of its shell, is `opencode` or `pi`
+- `~/.local/share/opencode/opencode.db` (`session_v2`) and `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl` — session title and busy/idle state, used only when one pane of that harness is in the session's cwd
+
+These rows support listing, preview, jump and `triage send`; they have no cost or context rollups, mailbox, hooks, approve or interrupt.
+
 Shared:
 - `tmux list-panes -a` — joined via process-ancestor walk from the agent PID
 
