@@ -443,7 +443,7 @@ fn baseline_service(command: &[&str], parent: Option<BaselineService>) -> Option
     }
 }
 
-fn elapsed_seconds(raw: &str) -> Option<u64> {
+pub(crate) fn elapsed_seconds(raw: &str) -> Option<u64> {
     let (days, time) = match raw.split_once('-') {
         Some((days, time)) => (days.parse::<u64>().ok()?, time),
         None => (0, raw),
