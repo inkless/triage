@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -391,6 +392,35 @@ fn pi_metas(agent_dir: &Path, panes: &[&Pane]) -> Vec<SessionMeta> {
             parse_pi_session(&text, time_to_ms(modified))
         })
         .collect()
+}
+
+/// Whether pi recorded a session `id` for `cwd`: a session file there whose
+/// header carries that id.
+pub fn pi_session_in_cwd(cwd: &Path, id: &str) -> bool {
+    pi_session_file(&pi_agent_dir(), cwd, id).is_some()
+}
+
+fn pi_session_file(agent_dir: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
+    let dir = agent_dir.join("sessions").join(pi_session_dir_name(cwd));
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .find(|p| pi_header_id(p).as_deref() == Some(id))
+}
+
+fn pi_header_id(path: &Path) -> Option<String> {
+    let mut first = String::new();
+    BufReader::new(fs::File::open(path).ok()?)
+        .take(64 * 1024)
+        .read_line(&mut first)
+        .ok()?;
+    let header: Value = serde_json::from_str(&first).ok()?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    header.get("id")?.as_str().map(str::to_string)
 }
 
 fn latest_jsonl(dir: &Path) -> Option<PathBuf> {

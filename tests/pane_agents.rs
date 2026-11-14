@@ -86,6 +86,8 @@ esac
             .env_remove("PI_CODING_AGENT_DIR")
             .env_remove("TRIAGE_TEST_PANE_HARNESS")
             .env_remove("OPENCODE_SESSION_ID")
+            .env_remove("PI_SESSION_ID")
+            .env_remove("PI_SESSION_FILE")
             .env_remove("TMUX_PANE")
             .env("CAPTURE", "")
             .env_remove("HARNESS_ARGS")
@@ -243,6 +245,7 @@ fn a_pi_pane_sends_to_an_opencode_pane_under_its_pane_name() {
     assert_eq!(audit.len(), 1, "{audit:?}");
     assert_eq!(audit[0]["from"], "pi:%31");
     assert_eq!(audit[0]["verdict"], "sent");
+    assert_eq!(audit[0]["from_session"], serde_json::Value::Null);
     assert_eq!(audit[0]["target_id"], "%30");
     assert_eq!(audit[0]["target_provider"], "oc");
 
@@ -329,6 +332,7 @@ fn an_opencode_tool_shell_sends_as_its_pane() {
     assert_eq!(pasted, "[triage message from opencode:%30] hi pi");
     let sent = audit(&fx);
     assert_eq!(sent[0]["from"], "opencode:%30");
+    assert_eq!(sent[0]["from_session"], "ses_oc");
     assert_eq!(sent[0]["target_id"], "%31");
 
     let output = send("ses_from_another_dir");
@@ -414,4 +418,32 @@ fn a_server_or_one_shot_harness_pane_is_not_listed() {
     harness.wait().unwrap();
     assert_eq!(interactive.len(), 1, "{interactive:?}");
     assert!(server.is_empty(), "{server:?}");
+}
+
+#[test]
+fn a_pi_tool_shell_sends_as_the_session_its_env_names() {
+    let fx = Fixture::new("pisession", PI_CALLER_AND_OC_TARGET);
+    let send = |session: &str| {
+        fx.command(&["send", "--to", "%30", "--message", "hello oc"])
+            .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+            .env("PI_SESSION_ID", session)
+            .env("PI_SESSION_FILE", "/unused")
+            .output()
+            .unwrap()
+    };
+
+    let output = send("01a1-pi");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let sent = audit(&fx);
+    assert_eq!(sent[0]["from"], "pi:%31");
+    assert_eq!(sent[0]["from_session"], "01a1-pi");
+
+    let output = send("not-a-session-here");
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("is not a pi session in /work/pi"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(audit(&fx).len(), 1);
 }

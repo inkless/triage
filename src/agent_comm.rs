@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -216,7 +216,7 @@ fn run_approve(args: &[String]) -> Result<String, CliError> {
     };
     let sessions = load_snapshot()?;
     let parents = tmux::build_ppid_map();
-    let caller = resolve_current_caller(&sessions, &parents)?;
+    let caller = &resolve_current_caller(&sessions, &parents)?;
     let sender = sender_label(caller);
     let store = Store::open_default();
     reconcile_quietly(&store);
@@ -651,7 +651,12 @@ fn run_agents(args: &[String]) -> Result<(), CliError> {
 
     let rows = sessions
         .iter()
-        .filter(|s| args.include_self || caller.is_none_or(|caller| !same_session(s, caller)))
+        .filter(|s| {
+            args.include_self
+                || caller
+                    .as_ref()
+                    .is_none_or(|caller| !same_session(s, caller))
+        })
         .filter(|s| {
             args.provider
                 .as_deref()
@@ -714,7 +719,7 @@ fn run_whoami(args: &[String]) -> Result<(), CliError> {
 
     let sessions = load_snapshot()?;
     let parents = tmux::build_ppid_map();
-    let caller = resolve_current_caller(&sessions, &parents)?;
+    let caller = &resolve_current_caller(&sessions, &parents)?;
     let store = Store::open_default();
     let row = agent_row(&store, caller);
 
@@ -759,8 +764,9 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
     let mode = args.mode.unwrap_or_else(|| Config::load().send.mode);
     let sessions = load_snapshot()?;
     let parents = tmux::build_ppid_map();
-    let caller = resolve_current_caller(&sessions, &parents)?;
+    let caller = &resolve_current_caller(&sessions, &parents)?;
     let sender = sender_label(caller);
+    let from_session = caller_session(caller);
     let body = read_message_body(&args)?;
     let body = validate_body(&body)?;
     let store = Store::open_default();
@@ -775,7 +781,14 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
     match mode {
         SendMode::Legacy => {
             let formatted = format_message(&sender, &body);
-            let result = deliver_to(target, selector, &sender, &formatted, args.dry_run)?;
+            let result = deliver_to(
+                target,
+                selector,
+                &sender,
+                from_session,
+                &formatted,
+                args.dry_run,
+            )?;
             if !args.dry_run
                 && let (Some(from), Some(to)) = (&from, &to)
             {
@@ -792,7 +805,14 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
         SendMode::Mailbox => {
             let (Some(from), Some(to)) = (from, to) else {
                 let formatted = format_message(&sender, &body);
-                return deliver_to(target, selector, &sender, &formatted, args.dry_run);
+                return deliver_to(
+                    target,
+                    selector,
+                    &sender,
+                    from_session,
+                    &formatted,
+                    args.dry_run,
+                );
             };
             let short = mailbox::short_id(&to.agent);
             let msg = new_message(&from, caller, &to, &body);
@@ -800,7 +820,8 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
                 // A paste lands in the target's history as a user prompt, so it
                 // uses the compact one-line form, not the fenced hook rendering.
                 let text = format_message(&sender, &body);
-                let result = deliver_to(target, selector, &sender, &text, args.dry_run)?;
+                let result =
+                    deliver_to(target, selector, &sender, from_session, &text, args.dry_run)?;
                 if !args.dry_run
                     && let Err(e) = store
                         .mailbox(&to.agent)
@@ -932,7 +953,7 @@ fn run_inbox(args: &[String]) -> Result<(), CliError> {
     let sessions = load_snapshot()?;
     let parents = tmux::build_ppid_map();
     let caller = match &session_arg {
-        Some(session) => session_in_caller_chain(&sessions, session, &parents)?,
+        Some(session) => session_in_caller_chain(&sessions, session, &parents)?.clone(),
         None => resolve_current_caller(&sessions, &parents)?,
     };
     if caller.provider.pane_only() {
@@ -943,7 +964,7 @@ fn run_inbox(args: &[String]) -> Result<(), CliError> {
     }
     let store = Store::open_default();
     reconcile_quietly(&store);
-    let identity = agent_identity(&store, caller).ok_or_else(|| {
+    let identity = agent_identity(&store, &caller).ok_or_else(|| {
         CliError::runtime("the calling session has no mailbox identity (session id is not a UUID)")
     })?;
     let is_current = caller.session_id == identity.session;
@@ -952,7 +973,7 @@ fn run_inbox(args: &[String]) -> Result<(), CliError> {
         .map_err(|e| CliError::runtime(e.to_string()))?;
     match show {
         Some(id) => inbox_show(&mailbox, &id, caller.provider, is_current, json),
-        None => inbox_list(&mailbox, caller, &identity, is_current, json),
+        None => inbox_list(&mailbox, &caller, &identity, is_current, json),
     }
 }
 
@@ -1305,19 +1326,23 @@ fn deliver_message(
 ) -> Result<String, CliError> {
     let sessions = load_snapshot()?;
     let target = resolve_target(&sessions, selector)?;
-    deliver_to(target, selector, sender, message, dry_run)
+    deliver_to(target, selector, sender, None, message, dry_run)
 }
 
 fn deliver_to(
     target: &Session,
     selector: &str,
     sender: &str,
+    from_session: Option<&str>,
     message: &str,
     dry_run: bool,
 ) -> Result<String, CliError> {
     let gate = evaluate_send_gate(target);
     if !gate.can_send {
-        let _ = append_message_audit(&AuditEntry::denied(sender, selector, target, &gate.reason));
+        let _ = append_message_audit(
+            &AuditEntry::denied(sender, selector, target, &gate.reason)
+                .with_from_session(from_session),
+        );
         return Err(CliError::denied(gate.reason));
     }
 
@@ -1336,7 +1361,9 @@ fn deliver_to(
     tmux::paste_text_and_enter(&pane.pane_id, message)
         .map_err(|e| CliError::delivery(format!("send failed: {e}")))?;
 
-    if let Err(e) = append_message_audit(&AuditEntry::sent(sender, selector, target, message)) {
+    if let Err(e) = append_message_audit(
+        &AuditEntry::sent(sender, selector, target, message).with_from_session(from_session),
+    ) {
         eprintln!("warning: failed to append agent-message audit: {e}");
     }
 
@@ -1725,14 +1752,18 @@ struct PaneProbe<'a> {
     opencode_env: Option<(String, String)>,
     opencode_session_dir: &'a dyn Fn(&str) -> Option<PathBuf>,
     opencode_server_pid: Option<u32>,
+    /// `PI_SESSION_ID`, unless pi marked the session ephemeral by leaving
+    /// `PI_SESSION_FILE` unset.
+    pi_session: Option<String>,
+    pi_session_in_cwd: &'a dyn Fn(&Path, &str) -> bool,
 }
 
-fn resolve_caller<'a>(
-    sessions: &'a [Session],
+fn resolve_caller(
+    sessions: &[Session],
     pid: u32,
     parents: &HashMap<u32, u32>,
     codex_thread: Option<&str>,
-) -> Result<&'a Session, CliError> {
+) -> Result<Session, CliError> {
     let pane_roots = std::cell::OnceCell::new();
     let opencode_env = std::env::var("OPENCODE_SESSION_ID")
         .ok()
@@ -1750,6 +1781,11 @@ fn resolve_caller<'a>(
         },
         is_harness: &is_pane_harness,
         opencode_session_dir: &crate::pane_agents::opencode_session_dir,
+        pi_session: std::env::var("PI_SESSION_ID")
+            .ok()
+            .filter(|id| !id.is_empty())
+            .filter(|_| std::env::var_os("PI_SESSION_FILE").is_some_and(|f| !f.is_empty())),
+        pi_session_in_cwd: &crate::pane_agents::pi_session_in_cwd,
     };
     resolve_caller_with(sessions, pid, parents, codex_thread, &probe)
 }
@@ -1773,12 +1809,10 @@ fn is_harness_comm(comm: &str, provider: Provider) -> bool {
     }
 }
 
-/// opencode and pi run no triage hooks and publish no per-process session
-/// record, so their callers are identified by tmux pane, NOT by session: the
-/// caller must be, or descend from, a harness process inside exactly one
-/// tracked pane. This names the pane (`opencode:%30`), never which of the harness's
-/// sessions is speaking — weaker than the Claude/Codex guarantee, and not to
-/// be read as session-grade identity.
+/// opencode and pi callers are found by tmux pane: the caller must be, or
+/// descend from, a harness process inside exactly one tracked pane. That
+/// names the pane, not which of the harness's sessions is speaking; the
+/// session comes only from the caller's environment (`pane_caller_session`).
 fn check_pane_only_caller(
     walked: &[u32],
     pane_root: u32,
@@ -1827,12 +1861,12 @@ fn check_pane_only_caller(
 /// opencode records in its `service.json`; and opencode's database places the
 /// session in the pane's directory. The pane claim itself is not proven: a
 /// tool shell of that server can name any opencode pane in its session's
-/// directory. Like the process-walk path, this is pane-grade identity.
-fn resolve_opencode_caller<'a>(
-    sessions: &'a [Session],
+/// directory.
+fn resolve_opencode_caller(
+    sessions: &[Session],
     walked: &[u32],
     probe: &PaneProbe,
-) -> Result<Option<&'a Session>, CliError> {
+) -> Result<Option<Session>, CliError> {
     let Some((session_id, pane_id)) = &probe.opencode_env else {
         return Ok(None);
     };
@@ -1874,16 +1908,53 @@ fn resolve_opencode_caller<'a>(
             "OPENCODE_SESSION_ID {session_id} is not a session in {pane_id}'s directory"
         )));
     }
-    Ok(Some(session))
+    let mut caller = session.clone();
+    caller.session_id = session_id.clone();
+    Ok(Some(caller))
 }
 
-fn resolve_caller_with<'a>(
-    sessions: &'a [Session],
+/// A pi caller whose `PI_SESSION_ID` names a session recorded for the
+/// pane's directory speaks as that session, even when the pane's row could
+/// not be matched to one. An id that names no such session is refused.
+/// Without one the caller is identified by its pane alone.
+fn pane_caller_session(session: &Session, probe: &PaneProbe) -> Result<Session, CliError> {
+    let mut caller = session.clone();
+    caller.session_id = match (&session.pane, &probe.pi_session) {
+        (_, Some(id)) if session.provider == Provider::Pi => {
+            if !(probe.pi_session_in_cwd)(&session.cwd, id) {
+                return Err(CliError::denied(format!(
+                    "PI_SESSION_ID {id} is not a pi session in {}",
+                    session.cwd.display()
+                )));
+            }
+            id.clone()
+        }
+        (Some(pane), _) => pane.pane_id.clone(),
+        (None, _) => return Err(CliError::denied("calling pane agent has no tmux pane")),
+    };
+    Ok(caller)
+}
+
+/// The caller's own session id when it is known: always for Claude and
+/// Codex, and for opencode and pi only when their environment named it.
+fn caller_session(caller: &Session) -> Option<&str> {
+    let pane_grade = caller.provider.pane_only()
+        && caller
+            .pane
+            .as_ref()
+            .is_none_or(|pane| pane.pane_id == caller.session_id);
+    (!pane_grade).then_some(caller.session_id.as_str())
+}
+
+/// Pane-only callers come back with `session_id` set to the session their
+/// environment names, or to their pane id when it names none.
+fn resolve_caller_with(
+    sessions: &[Session],
     pid: u32,
     parents: &HashMap<u32, u32>,
     codex_thread: Option<&str>,
     probe: &PaneProbe,
-) -> Result<&'a Session, CliError> {
+) -> Result<Session, CliError> {
     let mut current = pid;
     let mut seen = std::collections::HashSet::new();
     let mut walked = Vec::new();
@@ -1899,7 +1970,7 @@ fn resolve_caller_with<'a>(
                 if let Some(selected_session) = selected.next()
                     && selected.next().is_none()
                 {
-                    return Ok(selected_session);
+                    return Ok(selected_session.clone());
                 }
                 return Err(CliError::denied(
                     "CODEX_THREAD_ID does not identify a unique thread on the calling Codex process",
@@ -1912,8 +1983,9 @@ fn resolve_caller_with<'a>(
             }
             if session.provider.pane_only() {
                 check_pane_only_caller(&walked, current, parents, session.provider, probe)?;
+                return pane_caller_session(session, probe);
             }
-            return Ok(session);
+            return Ok(session.clone());
         }
         walked.push(current);
         let Some(parent) = parents.get(&current) else {
@@ -1929,10 +2001,10 @@ fn resolve_caller_with<'a>(
     ))
 }
 
-fn resolve_current_caller<'a>(
-    sessions: &'a [Session],
+fn resolve_current_caller(
+    sessions: &[Session],
     parents: &HashMap<u32, u32>,
-) -> Result<&'a Session, CliError> {
+) -> Result<Session, CliError> {
     let thread = std::env::var("CODEX_THREAD_ID").ok();
     resolve_caller(sessions, std::process::id(), parents, thread.as_deref())
 }
@@ -1947,7 +2019,12 @@ fn sender_label(caller: &Session) -> String {
     }
 }
 
+/// A pane-only caller may carry a session its pane's row was never matched
+/// to, so for those providers the pane is what makes two rows the same agent.
 fn same_session(a: &Session, b: &Session) -> bool {
+    if a.provider.pane_only() && a.provider == b.provider {
+        return a.pane.as_ref().map(|p| &p.pane_id) == b.pane.as_ref().map(|p| &p.pane_id);
+    }
     a.provider == b.provider && a.pid == b.pid && a.session_id == b.session_id
 }
 
@@ -1955,6 +2032,7 @@ fn same_session(a: &Session, b: &Session) -> bool {
 struct AuditEntry {
     ts: u64,
     from: String,
+    from_session: Option<String>,
     selector: String,
     target_id: String,
     target_provider: String,
@@ -1986,6 +2064,7 @@ impl AuditEntry {
         Self {
             ts: unix_secs(),
             from: sender.to_string(),
+            from_session: None,
             selector: selector.to_string(),
             target_id: target_id(target),
             target_provider: target.provider.label().to_string(),
@@ -1996,6 +2075,11 @@ impl AuditEntry {
             message_preview: message.map(|m| truncate_chars(&m.replace('\n', " "), 120)),
             message_len: message.map(|m| m.chars().count()),
         }
+    }
+
+    fn with_from_session(mut self, session: Option<&str>) -> Self {
+        self.from_session = session.map(str::to_string);
+        self
     }
 }
 
@@ -2167,9 +2251,11 @@ mod tests {
             opencode_env: None,
             opencode_session_dir: &|_| None,
             opencode_server_pid: None,
+            pi_session: None,
+            pi_session_in_cwd: &|_, _| false,
         };
         resolve_caller_with(sessions, 400, parents, None, &probe)
-            .map(sender_label)
+            .map(|caller| identified(&caller))
             .map_err(|e| e.message)
     }
 
@@ -2178,8 +2264,8 @@ mod tests {
         // triage(400) → bash(350) → opencode(300) → fish(200, pane root)
         let parents = HashMap::from([(400, 350), (350, 300), (300, 200), (200, 1)]);
         for (provider, sender) in [
-            (Provider::Opencode, "opencode:%30"),
-            (Provider::Pi, "pi:%30"),
+            (Provider::Opencode, "opencode:%30 -"),
+            (Provider::Pi, "pi:%30 -"),
         ] {
             let sessions = [pane_only_session(provider, 200)];
             assert_eq!(
@@ -2196,7 +2282,7 @@ mod tests {
         let sessions = [pane_only_session(Provider::Pi, 200)];
         assert_eq!(
             resolve_pane_only(&sessions, &parents, 200, &[200]).as_deref(),
-            Ok("pi:%30")
+            Ok("pi:%30 -")
         );
     }
 
@@ -2224,6 +2310,69 @@ mod tests {
             let err = resolve_pane_only(&sessions, &parents, 300, roots).unwrap_err();
             assert!(err.contains("more than one tmux pane"), "{err}");
         }
+    }
+
+    /// The sender label and the session the caller is known by (`-` when
+    /// only its pane is).
+    fn identified(caller: &Session) -> String {
+        format!(
+            "{} {}",
+            sender_label(caller),
+            caller_session(caller).unwrap_or("-")
+        )
+    }
+
+    fn resolve_pi_env(sessions: &[Session], env: Option<&str>) -> Result<String, String> {
+        // triage(400) → bash(350) → pi(300) → fish(200, pane root)
+        let parents = HashMap::from([(400, 350), (350, 300), (300, 200), (200, 1)]);
+        let probe = PaneProbe {
+            is_pane_root: &|pid| pid == 200,
+            is_harness: &|pid, _| pid == 300,
+            opencode_env: None,
+            opencode_session_dir: &|_| None,
+            opencode_server_pid: None,
+            pi_session: env.map(str::to_string),
+            pi_session_in_cwd: &|cwd, id| cwd == Path::new("/tmp/project") && id == "pi-known",
+        };
+        resolve_caller_with(sessions, 400, &parents, None, &probe)
+            .map(|caller| identified(&caller))
+            .map_err(|e| e.message)
+    }
+
+    #[test]
+    fn pi_caller_speaks_as_the_session_its_env_names() {
+        let row = pane_only_session(Provider::Pi, 200);
+        assert_eq!(
+            resolve_pi_env(std::slice::from_ref(&row), Some("pi-known")).as_deref(),
+            Ok("pi:%30 pi-known")
+        );
+        // Even when the row itself was never matched to a session.
+        let mut unmatched = row.clone();
+        unmatched.session_id = "%30".into();
+        assert_eq!(
+            resolve_pi_env(&[unmatched], Some("pi-known")).as_deref(),
+            Ok("pi:%30 pi-known")
+        );
+        // The row's own guess is never taken as the caller's session.
+        assert_eq!(resolve_pi_env(&[row], None).as_deref(), Ok("pi:%30 -"));
+    }
+
+    #[test]
+    fn pi_session_env_naming_no_session_in_the_pane_cwd_is_refused() {
+        let row = pane_only_session(Provider::Pi, 200);
+        let err = resolve_pi_env(&[row], Some("pi-elsewhere")).unwrap_err();
+        assert!(err.contains("is not a pi session in /tmp/project"), "{err}");
+    }
+
+    #[test]
+    fn a_pane_only_caller_is_itself_even_under_another_session_id() {
+        let row = pane_only_session(Provider::Pi, 200);
+        let mut caller = row.clone();
+        caller.session_id = "pi-known".into();
+        assert!(same_session(&row, &caller));
+        let mut other_pane = row.clone();
+        other_pane.pane.as_mut().unwrap().pane_id = "%31".into();
+        assert!(!same_session(&other_pane, &caller));
     }
 
     /// A tool shell under the shared opencode server, not in any pane:
@@ -2259,9 +2408,11 @@ mod tests {
             opencode_env: Some((call.session.to_string(), call.pane.to_string())),
             opencode_session_dir: &|_| Some(dir.clone()),
             opencode_server_pid: call.server,
+            pi_session: None,
+            pi_session_in_cwd: &|_, _| false,
         };
         resolve_caller_with(sessions, 400, &parents, None, &probe)
-            .map(sender_label)
+            .map(|caller| identified(&caller))
             .map_err(|e| e.message)
     }
 
@@ -2270,7 +2421,7 @@ mod tests {
         let sessions = [pane_only_session(Provider::Opencode, 200)];
         assert_eq!(
             resolve_opencode_env(&sessions, OpencodeCall::default()).as_deref(),
-            Ok("opencode:%30")
+            Ok("opencode:%30 ses_x")
         );
         // A second session in the pane's directory is still this pane.
         let other = OpencodeCall {
@@ -2279,7 +2430,7 @@ mod tests {
         };
         assert_eq!(
             resolve_opencode_env(&sessions, other).as_deref(),
-            Ok("opencode:%30")
+            Ok("opencode:%30 ses_y")
         );
     }
 
@@ -2377,7 +2528,7 @@ mod tests {
         };
         assert_eq!(
             resolve_opencode_env(&sessions, call).as_deref(),
-            Ok("target (%42)")
+            Ok("target (%42) sid")
         );
     }
 
