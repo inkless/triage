@@ -166,9 +166,11 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
             "PostToolUse",
             DeliveredVia::ClaudePostToolUse,
         ),
-        (Provider::Claude, Event::UserPromptSubmit) | (Provider::Codex, Event::Stop) => Err(
-            io::Error::other("no triage hook is installed for this event"),
-        ),
+        (Provider::Claude, Event::UserPromptSubmit)
+        | (Provider::Codex, Event::Stop)
+        | (Provider::Opencode | Provider::Pi, _) => Err(io::Error::other(
+            "no triage hook is installed for this event",
+        )),
         (Provider::Codex, Event::SessionStart) => Ok(0),
         (Provider::Codex, Event::UserPromptSubmit | Event::PostToolUse) => {
             if hook.event == Event::UserPromptSubmit {
@@ -206,6 +208,7 @@ fn find_host(provider: Provider) -> Option<HostId> {
         let is_host = match provider {
             Provider::Claude => sessions_dir.join(format!("{pid}.json")).exists(),
             Provider::Codex => info.comm == "codex" || is_test_codex_host(pid),
+            Provider::Opencode | Provider::Pi => false,
         };
         if is_host {
             return Some(HostId {

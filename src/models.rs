@@ -8,6 +8,8 @@ use crate::approval::PendingApproval;
 pub enum Provider {
     Claude,
     Codex,
+    Opencode,
+    Pi,
 }
 
 impl Provider {
@@ -15,6 +17,27 @@ impl Provider {
         match self {
             Provider::Claude => "cc",
             Provider::Codex => "cx",
+            Provider::Opencode => "oc",
+            Provider::Pi => "pi",
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Provider::Claude => "claude",
+            Provider::Codex => "codex",
+            Provider::Opencode => "opencode",
+            Provider::Pi => "pi",
+        }
+    }
+
+    /// Harnesses triage tracks only through their tmux pane: listing, preview,
+    /// jump and pasted `triage send`. Their identity is the pane, not a
+    /// session, and they get no mailbox, hooks, approve or interrupt.
+    pub fn pane_only(self) -> bool {
+        match self {
+            Provider::Claude | Provider::Codex => false,
+            Provider::Opencode | Provider::Pi => true,
         }
     }
 }

@@ -1515,6 +1515,7 @@ fn build_row(
         match s.provider {
             Provider::Claude => Style::default().fg(Color::DarkGray),
             Provider::Codex => Style::default().fg(Color::Cyan),
+            Provider::Opencode | Provider::Pi => Style::default().fg(Color::Yellow),
         }
     };
     let cwd_style = if is_selected && !s.muted {
@@ -3109,7 +3110,9 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
 /// tmux session name, and the full cwd path. `q` is already lowercased by
 /// the caller. Returning early on any hit keeps this cheap on large fleets.
 fn session_matches_filter(s: &Session, q: &str) -> bool {
-    if s.provider.label().contains(q) || (s.provider == Provider::Codex && "codex".contains(q)) {
+    if s.provider.label().contains(q)
+        || (s.provider != Provider::Claude && s.provider.name().contains(q))
+    {
         return true;
     }
     if let Some(name) = &s.name

@@ -166,6 +166,10 @@ fn helper_pass(store: &Store, agent: &str, grace: Duration) -> io::Result<()> {
         .collect();
     let text = pointer_text(pending.len(), &senders);
     match record.provider {
+        Provider::Opencode | Provider::Pi => Err(io::Error::other(format!(
+            "{} sessions have no mailbox wake",
+            record.provider.name()
+        ))),
         Provider::Codex => {
             if live_pointer(store, agent) {
                 return Ok(());
