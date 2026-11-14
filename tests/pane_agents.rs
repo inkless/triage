@@ -495,9 +495,11 @@ fn mail(fx: &Fixture, agent: &str, state: &str) -> Vec<serde_json::Value> {
 }
 
 impl Fixture {
+    /// The test process also stands in for the opencode server behind
+    /// `fake_opencode_server`.
     fn as_pi(&self, args: &[&str]) -> Output {
         self.command(args)
-            .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+            .env("TRIAGE_TEST_PANE_HARNESS", pi_and_test_server())
             .env("PI_SESSION_ID", PI_SESSION)
             .env("PI_SESSION_FILE", "/unused")
             .output()
@@ -583,7 +585,8 @@ fn fake_opencode_server(
     fs::create_dir_all(fx.dir.join("state/opencode")).unwrap();
     fs::write(
         fx.dir.join("state/opencode/service.json"),
-        serde_json::json!({"url": url, "pid": 1, "password": "s3cret"}).to_string(),
+        serde_json::json!({"url": url, "pid": std::process::id(), "password": "s3cret"})
+            .to_string(),
     )
     .unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -687,6 +690,67 @@ fn a_server_without_synthetic_input_gets_a_queued_prompt() {
     assert_eq!(mail(&fx, "ses_oc", "delivered").len(), 1);
 }
 
+fn pi_and_test_server() -> String {
+    format!("777001,{}", std::process::id())
+}
+
+/// Points service.json at `pid` while the fake server keeps listening.
+fn record_server_pid(fx: &Fixture, pid: u32) {
+    let path = fx.dir.join("state/opencode/service.json");
+    let mut service: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    service["pid"] = pid.into();
+    fs::write(path, service.to_string()).unwrap();
+}
+
+#[test]
+fn a_stale_service_record_gets_neither_the_password_nor_the_mail() {
+    let fx = Fixture::new("ocstale", PI_CALLER_AND_OC_TARGET);
+    let requests = fake_opencode_server(&fx, |_| 200);
+
+    let mut gone = Command::new("true").spawn().unwrap();
+    gone.wait().unwrap();
+    record_server_pid(&fx, gone.id());
+    let output = fx.as_pi(&["send", "--to", "%30", "--message", "first"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not a running opencode server"),
+        "{}",
+        stderr(&output)
+    );
+
+    // A live process that is not opencode.
+    let mut other = Command::new("sleep").arg("30").spawn().unwrap();
+    record_server_pid(&fx, other.id());
+    let output = fx.as_pi(&["send", "--to", "%30", "--message", "second"]);
+    assert!(
+        stderr(&output).contains("not a running opencode server"),
+        "{}",
+        stderr(&output)
+    );
+
+    // An opencode process that does not hold the port the record names.
+    if cfg!(target_os = "linux") {
+        let output = fx
+            .command(&["send", "--to", "%30", "--message", "third"])
+            .env("TRIAGE_TEST_PANE_HARNESS", format!("777001,{}", other.id()))
+            .env("PI_SESSION_ID", PI_SESSION)
+            .env("PI_SESSION_FILE", "/unused")
+            .output()
+            .unwrap();
+        assert!(
+            stderr(&output).contains("does not own the listening port"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    let _ = other.kill();
+    let _ = other.wait();
+
+    assert_eq!(requests.try_iter().count(), 0);
+    assert!(mail(&fx, "ses_oc", "delivered").is_empty());
+    assert!(!mail(&fx, "ses_oc", "pasted").is_empty());
+}
+
 /// A `status_for` answer: read the request, then never reply.
 const STALL: u16 = 0;
 
@@ -696,7 +760,7 @@ fn a_server_that_takes_the_request_but_never_answers_gets_no_paste() {
     let requests = fake_opencode_server(&fx, |_| STALL);
     let output = fx
         .command(&["send", "--to", "%30", "--message", "maybe twice"])
-        .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+        .env("TRIAGE_TEST_PANE_HARNESS", pi_and_test_server())
         .env("PI_SESSION_ID", PI_SESSION)
         .env("PI_SESSION_FILE", "/unused")
         .env("TRIAGE_TEST_HTTP_TIMEOUT_MS", "300")

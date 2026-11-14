@@ -50,6 +50,7 @@ fn io_timeout() -> Duration {
 #[derive(Deserialize)]
 struct ServiceFile {
     url: String,
+    pid: u32,
     password: String,
 }
 
@@ -84,6 +85,7 @@ fn load_service() -> io::Result<Service> {
         .to_socket_addrs()?
         .find(|addr| addr.ip().is_loopback())
         .ok_or_else(|| io::Error::other(format!("server URL {:?} is not loopback", file.url)))?;
+    check_server(file.pid, addr.port())?;
     Ok(Service {
         addr,
         host: host.to_string(),
@@ -125,6 +127,71 @@ pub fn post_message(session: &str, text: &str) -> Result<(), Failure> {
     } else {
         Err(io::Error::other(format!("server answered {status}")).into())
     }
+}
+
+/// A service.json left behind by a server that has gone would hand the
+/// password and the mail to whatever now listens on that port, so the pid it
+/// names must be a live opencode process that holds the listening socket.
+fn check_server(pid: u32, port: u16) -> io::Result<()> {
+    let info = crate::mailbox::proc_info(pid).map_err(|_| {
+        io::Error::other(format!(
+            "service.json names pid {pid}, which is not a running opencode server"
+        ))
+    })?;
+    if info.comm != "opencode" && !crate::peer_hooks::is_test_pane_harness(pid) {
+        return Err(io::Error::other(format!(
+            "service.json names pid {pid}, which is not a running opencode server"
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    if !owns_listener(pid, port) {
+        return Err(io::Error::other(format!(
+            "opencode pid {pid} does not own the listening port {port}"
+        )));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = port;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn owns_listener(pid: u32, port: u16) -> bool {
+    let inodes = listening_inodes(port);
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.flatten().any(|fd| {
+        std::fs::read_link(fd.path()).is_ok_and(|target| {
+            target
+                .to_str()
+                .and_then(|t| t.strip_prefix("socket:["))
+                .and_then(|t| t.strip_suffix(']'))
+                .is_some_and(|inode| inodes.iter().any(|i| i == inode))
+        })
+    })
+}
+
+/// Socket inodes listening on `port`, from `/proc/net/tcp{,6}`.
+#[cfg(target_os = "linux")]
+fn listening_inodes(port: u16) -> Vec<String> {
+    const LISTEN: &str = "0A";
+    ["/proc/net/tcp", "/proc/net/tcp6"]
+        .iter()
+        .filter_map(|path| std::fs::read_to_string(path).ok())
+        .flat_map(|table| {
+            table
+                .lines()
+                .skip(1)
+                .filter_map(|line| {
+                    let fields: Vec<&str> = line.split_whitespace().collect();
+                    let local_port = fields.get(1)?.rsplit_once(':')?.1;
+                    (u16::from_str_radix(local_port, 16).ok()? == port && *fields.get(3)? == LISTEN)
+                        .then(|| fields.get(9).map(|inode| inode.to_string()))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 fn is_success(status: u16) -> bool {
