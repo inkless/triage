@@ -425,6 +425,24 @@ fn a_server_or_one_shot_harness_pane_is_not_listed() {
 }
 
 #[test]
+fn two_pi_panes_in_one_directory_send_under_their_pane_only() {
+    let fx = Fixture::new(
+        "pitwins",
+        r#"  echo 'pi|1.0|777000|/dev/null|pi|/work/pi|1|%31|pi'
+  echo 'pi|2.0|503|/dev/null|pi|/work/pi|1|%33|pi'
+  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'"#,
+    );
+    let output = fx.as_pi(&["send", "--to", "%30", "--message", "hello oc"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let sent = audit(&fx);
+    assert_eq!(sent[0]["from"], "pi:%31");
+    assert_eq!(sent[0]["from_session"], serde_json::Value::Null);
+    let inbox = fx.as_pi(&["inbox"]);
+    assert!(!inbox.status.success());
+    assert!(stderr(&inbox).contains("cannot tell which pi session is calling"));
+}
+
+#[test]
 fn a_pi_tool_shell_sends_as_the_session_its_env_names() {
     let fx = Fixture::new("pisession", PI_CALLER_AND_OC_TARGET);
     let send = |session: &str| {

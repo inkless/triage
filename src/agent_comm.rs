@@ -1252,6 +1252,17 @@ fn pane_agent_identity(store: &Store, s: &Session) -> Option<AgentIdentity> {
     })
 }
 
+fn live_pi_host_session(store: &Store, pid: u32) -> Option<String> {
+    let host = HostId {
+        pid,
+        start: mailbox::proc_info(pid).ok()?.start,
+    };
+    store
+        .read_host(host)
+        .filter(|record| record.provider == Provider::Pi)
+        .map(|record| record.current_session)
+}
+
 fn live_pi_host(store: &Store, session: &str) -> Option<HostId> {
     store
         .hosts()
@@ -1827,6 +1838,10 @@ struct PaneProbe<'a> {
     /// `PI_SESSION_FILE` unset.
     pi_session: Option<String>,
     pi_session_in_cwd: &'a dyn Fn(&Path, &str) -> bool,
+    /// The session triage's pi extension registered for a live pi process.
+    pi_host_session: &'a dyn Fn(u32) -> Option<String>,
+    /// Whether a live pi process other than the given one hosts the session.
+    pi_hosted_elsewhere: &'a dyn Fn(&str, u32) -> bool,
 }
 
 fn resolve_caller(
@@ -1857,6 +1872,10 @@ fn resolve_caller(
             .filter(|id| !id.is_empty())
             .filter(|_| std::env::var_os("PI_SESSION_FILE").is_some_and(|f| !f.is_empty())),
         pi_session_in_cwd: &crate::pane_agents::pi_session_in_cwd,
+        pi_host_session: &|pid| live_pi_host_session(&Store::open_default(), pid),
+        pi_hosted_elsewhere: &|session, pid| {
+            live_pi_host(&Store::open_default(), session).is_some_and(|host| host.pid != pid)
+        },
     };
     resolve_caller_with(sessions, pid, parents, codex_thread, &probe)
 }
@@ -1888,18 +1907,18 @@ fn check_pane_only_caller(
     parents: &HashMap<u32, u32>,
     provider: Provider,
     probe: &PaneProbe,
-) -> Result<(), CliError> {
-    if !walked
+) -> Result<u32, CliError> {
+    let Some(&harness) = walked
         .iter()
         .chain([&pane_root])
-        .any(|&pid| (probe.is_harness)(pid, provider))
-    {
+        .find(|&&pid| (probe.is_harness)(pid, provider))
+    else {
         return Err(CliError::denied(format!(
             "calling process is in a {} pane but not under its {} process",
             provider.name(),
             provider.name()
         )));
-    }
+    };
     let mut above = Vec::new();
     let mut current = pane_root;
     let mut seen = HashSet::new();
@@ -1919,7 +1938,7 @@ fn check_pane_only_caller(
             "calling process sits under more than one tmux pane; cannot tell which agent is sending",
         ));
     }
-    Ok(())
+    Ok(harness)
 }
 
 /// opencode runs tool shells under its shared `opencode serve` process, not
@@ -1982,25 +2001,60 @@ fn resolve_opencode_caller(
     Ok(Some(caller))
 }
 
-/// A pi caller whose `PI_SESSION_ID` names a session recorded for the
-/// pane's directory speaks as that session, even when the pane's row could
-/// not be matched to one. An id that names no such session is refused.
-/// Without one the caller is identified by its pane alone.
-fn pane_caller_session(session: &Session, probe: &PaneProbe) -> Result<Session, CliError> {
+/// A pi caller speaks as the session its `PI_SESSION_ID` names only when
+/// that is a pi session recorded for the pane's directory and nothing else
+/// could own it: the session triage's extension registered for the caller's
+/// pi process, or, with no registration, a session no other live pi process
+/// holds while this is the only pi pane in the directory. An id that
+/// contradicts those records is refused; one that can't be told apart from
+/// another pane's leaves the caller identified by its pane alone.
+fn pane_caller_session(
+    sessions: &[Session],
+    session: &Session,
+    harness: u32,
+    probe: &PaneProbe,
+) -> Result<Session, CliError> {
+    let Some(pane) = &session.pane else {
+        return Err(CliError::denied("calling pane agent has no tmux pane"));
+    };
     let mut caller = session.clone();
-    caller.session_id = match (&session.pane, &probe.pi_session) {
-        (_, Some(id)) if session.provider == Provider::Pi => {
-            if !(probe.pi_session_in_cwd)(&session.cwd, id) {
+    caller.session_id = pane.pane_id.clone();
+    let Some(id) = probe
+        .pi_session
+        .as_ref()
+        .filter(|_| session.provider == Provider::Pi)
+    else {
+        return Ok(caller);
+    };
+    if !(probe.pi_session_in_cwd)(&session.cwd, id) {
+        return Err(CliError::denied(format!(
+            "PI_SESSION_ID {id} is not a pi session in {}",
+            session.cwd.display()
+        )));
+    }
+    match (probe.pi_host_session)(harness) {
+        Some(hosted) if &hosted != id => {
+            return Err(CliError::denied(format!(
+                "PI_SESSION_ID {id} is not the session this pi process runs"
+            )));
+        }
+        Some(_) => {}
+        None => {
+            if (probe.pi_hosted_elsewhere)(id, harness) {
                 return Err(CliError::denied(format!(
-                    "PI_SESSION_ID {id} is not a pi session in {}",
-                    session.cwd.display()
+                    "PI_SESSION_ID {id} belongs to another pi process"
                 )));
             }
-            id.clone()
+            let pi_panes_here = sessions
+                .iter()
+                .filter(|s| s.provider == Provider::Pi && s.pane.is_some() && s.cwd == session.cwd)
+                .count();
+            if pi_panes_here != 1 {
+                return Ok(caller);
+            }
         }
-        (Some(pane), _) => pane.pane_id.clone(),
-        (None, _) => return Err(CliError::denied("calling pane agent has no tmux pane")),
-    };
+    }
+    caller.session_id = id.clone();
     Ok(caller)
 }
 
@@ -2051,8 +2105,9 @@ fn resolve_caller_with(
                 ));
             }
             if session.provider.pane_only() {
-                check_pane_only_caller(&walked, current, parents, session.provider, probe)?;
-                return pane_caller_session(session, probe);
+                let harness =
+                    check_pane_only_caller(&walked, current, parents, session.provider, probe)?;
+                return pane_caller_session(sessions, session, harness, probe);
             }
             return Ok(session.clone());
         }
@@ -2322,6 +2377,8 @@ mod tests {
             opencode_server_pid: None,
             pi_session: None,
             pi_session_in_cwd: &|_, _| false,
+            pi_host_session: &|_| None,
+            pi_hosted_elsewhere: &|_, _| false,
         };
         resolve_caller_with(sessions, 400, parents, None, &probe)
             .map(|caller| identified(&caller))
@@ -2392,6 +2449,17 @@ mod tests {
     }
 
     fn resolve_pi_env(sessions: &[Session], env: Option<&str>) -> Result<String, String> {
+        resolve_pi_hosted(sessions, env, None, None)
+    }
+
+    /// `hosted`: the session registered for the caller's pi process (300);
+    /// `elsewhere`: a session another live pi process holds.
+    fn resolve_pi_hosted(
+        sessions: &[Session],
+        env: Option<&str>,
+        hosted: Option<&str>,
+        elsewhere: Option<&str>,
+    ) -> Result<String, String> {
         // triage(400) → bash(350) → pi(300) → fish(200, pane root)
         let parents = HashMap::from([(400, 350), (350, 300), (300, 200), (200, 1)]);
         let probe = PaneProbe {
@@ -2401,7 +2469,11 @@ mod tests {
             opencode_session_dir: &|_| None,
             opencode_server_pid: None,
             pi_session: env.map(str::to_string),
-            pi_session_in_cwd: &|cwd, id| cwd == Path::new("/tmp/project") && id == "pi-known",
+            pi_session_in_cwd: &|cwd, id| {
+                cwd == Path::new("/tmp/project") && matches!(id, "pi-known" | "pi-other")
+            },
+            pi_host_session: &|pid| hosted.filter(|_| pid == 300).map(str::to_string),
+            pi_hosted_elsewhere: &|id, pid| pid == 300 && elsewhere == Some(id),
         };
         resolve_caller_with(sessions, 400, &parents, None, &probe)
             .map(|caller| identified(&caller))
@@ -2424,6 +2496,39 @@ mod tests {
         );
         // The row's own guess is never taken as the caller's session.
         assert_eq!(resolve_pi_env(&[row], None).as_deref(), Ok("pi:%30 -"));
+    }
+
+    #[test]
+    fn pi_caller_must_name_the_session_its_own_pi_process_runs() {
+        let row = pane_only_session(Provider::Pi, 200);
+        let rows = std::slice::from_ref(&row);
+        assert_eq!(
+            resolve_pi_hosted(rows, Some("pi-known"), Some("pi-known"), None).as_deref(),
+            Ok("pi:%30 pi-known")
+        );
+        let err = resolve_pi_hosted(rows, Some("pi-other"), Some("pi-known"), None).unwrap_err();
+        assert!(
+            err.contains("not the session this pi process runs"),
+            "{err}"
+        );
+        let err = resolve_pi_hosted(rows, Some("pi-other"), None, Some("pi-other")).unwrap_err();
+        assert!(err.contains("belongs to another pi process"), "{err}");
+    }
+
+    #[test]
+    fn two_unregistered_pi_panes_in_one_directory_leave_the_caller_at_pane_grade() {
+        let row = pane_only_session(Provider::Pi, 200);
+        let mut twin = pane_only_session(Provider::Pi, 900);
+        twin.pane.as_mut().unwrap().pane_id = "%31".into();
+        assert_eq!(
+            resolve_pi_env(&[row.clone(), twin.clone()], Some("pi-known")).as_deref(),
+            Ok("pi:%30 -")
+        );
+        // The caller's own registration still settles it.
+        assert_eq!(
+            resolve_pi_hosted(&[row, twin], Some("pi-known"), Some("pi-known"), None).as_deref(),
+            Ok("pi:%30 pi-known")
+        );
     }
 
     #[test]
@@ -2479,6 +2584,8 @@ mod tests {
             opencode_server_pid: call.server,
             pi_session: None,
             pi_session_in_cwd: &|_, _| false,
+            pi_host_session: &|_| None,
+            pi_hosted_elsewhere: &|_, _| false,
         };
         resolve_caller_with(sessions, 400, &parents, None, &probe)
             .map(|caller| identified(&caller))
