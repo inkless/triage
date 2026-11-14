@@ -1,4 +1,6 @@
 use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -535,4 +537,154 @@ fn opencode_and_pi_sessions_have_mailboxes() {
     assert!(String::from_utf8_lossy(&inbox.stdout).contains("read me"));
     assert!(mail(&fx, "ses_oc", "pending").is_empty());
     assert_eq!(mail(&fx, "ses_oc", "delivered").len(), 1);
+}
+
+struct Request {
+    path: String,
+    authorization: String,
+    body: serde_json::Value,
+}
+
+/// A loopback stand-in for the opencode server: answers each request with
+/// `status_for(path)` and hands the requests back once the test is done.
+fn fake_opencode_server(
+    fx: &Fixture,
+    status_for: fn(&str) -> u16,
+) -> std::sync::mpsc::Receiver<Request> {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    fs::create_dir_all(fx.dir.join("state/opencode")).unwrap();
+    fs::write(
+        fx.dir.join("state/opencode/service.json"),
+        serde_json::json!({"url": url, "pid": 1, "password": "s3cret"}).to_string(),
+    )
+    .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+            let (mut authorization, mut len) = (String::new(), 0);
+            loop {
+                let mut header = String::new();
+                reader.read_line(&mut header).unwrap();
+                let header = header.trim_end();
+                if header.is_empty() {
+                    break;
+                }
+                let (name, value) = header.split_once(": ").unwrap();
+                match name.to_ascii_lowercase().as_str() {
+                    "authorization" => authorization = value.to_string(),
+                    "content-length" => len = value.parse().unwrap(),
+                    _ => {}
+                }
+            }
+            let mut body = vec![0; len];
+            reader.read_exact(&mut body).unwrap();
+            let status = status_for(&path);
+            let body = serde_json::from_slice(&body).unwrap();
+            // Recorded before answering, so it is there once the sender exits.
+            let sent = tx.send(Request {
+                path,
+                authorization,
+                body,
+            });
+            write!(stream, "HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n").unwrap();
+            if sent.is_err() {
+                break;
+            }
+        }
+    });
+    rx
+}
+
+#[test]
+fn mail_to_opencode_goes_through_its_server_not_the_pane() {
+    let fx = Fixture::new("ocapi", PI_CALLER_AND_OC_TARGET);
+    let requests = fake_opencode_server(&fx, |_| 200);
+    let output = fx.as_pi(&["send", "--to", "%30", "--wait", "--message", "over the API"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("delivered"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(!fx.dir.join("pasted").exists());
+
+    let request = requests.try_recv().unwrap();
+    assert_eq!(request.path, "/api/session/ses_oc/synthetic");
+    // base64("opencode:s3cret")
+    assert_eq!(request.authorization, "Basic b3BlbmNvZGU6czNjcmV0");
+    let text = request.body["text"].as_str().unwrap();
+    assert!(text.starts_with("📨 Peer message from"), "{text}");
+    assert!(text.contains("\nover the API\n"), "{text}");
+    assert!(text.contains("Reply: triage send --to "), "{text}");
+    assert_eq!(request.body["delivery"], "queue");
+    assert!(requests.try_recv().is_err());
+
+    let delivered = mail(&fx, "ses_oc", "delivered");
+    assert_eq!(delivered.len(), 1, "{delivered:?}");
+    assert_eq!(delivered[0]["delivered_via"], "opencode-server");
+    assert_eq!(delivered[0]["from"]["agent"], PI_SESSION);
+    assert_eq!(audit(&fx)[0]["verdict"], "sent");
+}
+
+#[test]
+fn a_server_without_synthetic_input_gets_a_queued_prompt() {
+    let fx = Fixture::new("ocprompt", PI_CALLER_AND_OC_TARGET);
+    let requests = fake_opencode_server(&fx, |path| {
+        if path.ends_with("/synthetic") {
+            404
+        } else {
+            200
+        }
+    });
+    let output = fx.as_pi(&["send", "--to", "%30", "--message", "fallback"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!fx.dir.join("pasted").exists());
+    let paths: Vec<String> = requests.try_iter().map(|r| r.path).collect();
+    assert_eq!(
+        paths,
+        [
+            "/api/session/ses_oc/synthetic",
+            "/api/session/ses_oc/prompt"
+        ]
+    );
+    assert_eq!(mail(&fx, "ses_oc", "delivered").len(), 1);
+}
+
+#[test]
+fn a_failing_or_unsafe_server_falls_back_to_a_paste() {
+    let fx = Fixture::new("ocfail", PI_CALLER_AND_OC_TARGET);
+    let requests = fake_opencode_server(&fx, |_| 500);
+    let output = fx.as_pi(&["send", "--to", "%30", "--message", "paste me"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("pasting it instead"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(requests.try_iter().count(), 1);
+    let pasted = fs::read_to_string(fx.dir.join("pasted")).unwrap();
+    assert_eq!(pasted, "[triage message from pi:%31] paste me");
+    assert!(mail(&fx, "ses_oc", "delivered").is_empty());
+    assert_eq!(mail(&fx, "ses_oc", "pasted").len(), 1);
+
+    // The password never leaves the machine.
+    fs::write(
+        fx.dir.join("state/opencode/service.json"),
+        r#"{"url":"http://192.0.2.1:4096","pid":1,"password":"s3cret"}"#,
+    )
+    .unwrap();
+    let output = fx.as_pi(&["send", "--to", "%30", "--message", "again"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not loopback"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(mail(&fx, "ses_oc", "pasted").len(), 2);
 }

@@ -201,6 +201,7 @@ pub enum DeliveredVia {
     CodexUserPromptSubmit,
     CodexPostToolUse,
     LegacyPaste,
+    OpencodeServer,
     Inbox,
     InboxShow,
 }
@@ -657,6 +658,14 @@ impl Mailbox {
         msg.delivered_at_ms = Some(now);
         msg.delivered_via = Some(DeliveredVia::LegacyPaste);
         self.publish(State::Pasted, &msg)
+    }
+
+    /// For a channel that confirms delivery synchronously.
+    pub fn record_delivered(&self, msg: &Message, via: DeliveredVia, now: u64) -> io::Result<()> {
+        let mut msg = msg.clone();
+        msg.delivered_at_ms = Some(now);
+        msg.delivered_via = Some(via);
+        self.publish(State::Delivered, &msg)
     }
 
     /// Message ids in `state`, oldest first. Not meaningful for `Inflight`.

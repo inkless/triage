@@ -816,6 +816,30 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
             };
             let short = mailbox::short_id(&to.agent);
             let msg = new_message(&from, caller, &to, &body);
+            if to.provider == Provider::Opencode {
+                let label = target_label(target);
+                if args.dry_run {
+                    return Ok(format!(
+                        "dry-run: would deliver from {sender} to {label} (agent {short}) through the opencode server"
+                    ));
+                }
+                match deliver_through_opencode(&store, &msg) {
+                    Ok(()) => {
+                        let entry = AuditEntry::sent(&sender, selector, target, &body)
+                            .with_from_session(from_session);
+                        if let Err(e) = append_message_audit(&entry) {
+                            eprintln!("warning: failed to append agent-message audit: {e}");
+                        }
+                        return Ok(format!(
+                            "delivered to {label} (agent {short}) through the opencode server id={}",
+                            msg.id
+                        ));
+                    }
+                    Err(e) => eprintln!(
+                        "warning: the opencode server did not take the message ({e}); pasting it instead"
+                    ),
+                }
+            }
             if !hook_capable(&store, &to) {
                 // A paste lands in the target's history as a user prompt, so it
                 // uses the compact one-line form, not the fenced hook rendering.
@@ -862,6 +886,25 @@ fn reconcile_quietly(store: &Store) {
     if let Err(e) = crate::reconcile::reconcile_all(store) {
         store.log_hook_error("reconcile", &e);
     }
+}
+
+/// Hands the message to the opencode server in the same rendering hook
+/// delivery uses, and records it delivered once the server accepted it.
+fn deliver_through_opencode(store: &Store, msg: &Message) -> io::Result<()> {
+    let item = RenderItem {
+        msg,
+        nonce: None,
+        sent_before_clear: false,
+        reader_is_claude: false,
+    };
+    let (text, _) = mailbox::render_batch(&[item], usize::MAX);
+    crate::opencode_api::post_message(&msg.to.session_at_send, &text)?;
+    if let Err(e) = store.mailbox(&msg.to.agent).and_then(|mailbox| {
+        mailbox.record_delivered(msg, DeliveredVia::OpencodeServer, mailbox::now_ms())
+    }) {
+        eprintln!("warning: delivered, but failed to record the message in the mailbox: {e}");
+    }
+    Ok(())
 }
 
 /// A target takes mailbox delivery only while its host process is alive and
