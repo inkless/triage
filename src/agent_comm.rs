@@ -956,16 +956,16 @@ fn run_inbox(args: &[String]) -> Result<(), CliError> {
         Some(session) => session_in_caller_chain(&sessions, session, &parents)?.clone(),
         None => resolve_current_caller(&sessions, &parents)?,
     };
-    if caller.provider.pane_only() {
-        return Err(CliError::runtime(format!(
-            "triage mail is not supported for {} agents yet; messages sent to them are pasted into their pane",
-            caller.provider.name()
-        )));
-    }
     let store = Store::open_default();
     reconcile_quietly(&store);
-    let identity = agent_identity(&store, &caller).ok_or_else(|| {
-        CliError::runtime("the calling session has no mailbox identity (session id is not a UUID)")
+    let identity = agent_identity(&store, &caller).ok_or_else(|| match caller.provider {
+        Provider::Opencode | Provider::Pi => CliError::runtime(format!(
+            "cannot tell which {} session is calling: run triage inbox from the agent's own tool shell",
+            caller.provider.name()
+        )),
+        Provider::Claude | Provider::Codex => CliError::runtime(
+            "the calling session has no mailbox identity (session id is not a UUID)",
+        ),
     })?;
     let is_current = caller.session_id == identity.session;
     let mailbox = store
@@ -1167,9 +1167,8 @@ struct AgentIdentity {
 }
 
 fn agent_identity(store: &Store, s: &Session) -> Option<AgentIdentity> {
-    // No hooks run in opencode/pi, so they have no mailbox; sends paste.
     if s.provider.pane_only() {
-        return None;
+        return pane_agent_identity(s);
     }
     let host = mailbox::proc_info(s.pid).ok().map(|info| HostId {
         pid: s.pid,
@@ -1187,6 +1186,22 @@ fn agent_identity(store: &Store, s: &Session) -> Option<AgentIdentity> {
         agent,
         session,
         host,
+        provider: s.provider,
+    })
+}
+
+/// An opencode or pi agent is its session. A row only matched to a pane, or
+/// an id of the wrong shape for its harness, has no mailbox identity.
+fn pane_agent_identity(s: &Session) -> Option<AgentIdentity> {
+    let valid = match s.provider {
+        Provider::Opencode => mailbox::is_opencode_session(&s.session_id),
+        Provider::Pi => mailbox::is_uuid(&s.session_id),
+        Provider::Claude | Provider::Codex => false,
+    };
+    valid.then(|| AgentIdentity {
+        agent: s.session_id.clone(),
+        session: s.session_id.clone(),
+        host: None,
         provider: s.provider,
     })
 }

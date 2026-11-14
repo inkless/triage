@@ -3,6 +3,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+const PI_SESSION: &str = "019a8f3c-0000-7000-8000-0000000000a1";
+
 struct Fixture {
     dir: PathBuf,
 }
@@ -24,7 +26,7 @@ impl Fixture {
         fs::write(
             dir.join(".pi/agent/sessions/--work-pi--/2026-10-14T18-49-13-644Z_01a1.jsonl"),
             concat!(
-                r#"{"type":"session","version":3,"id":"01a1-pi","timestamp":"2026-10-14T18:49:13.644Z","cwd":"/work/pi"}"#,
+                r#"{"type":"session","version":3,"id":"019a8f3c-0000-7000-8000-0000000000a1","timestamp":"2026-10-14T18:49:13.644Z","cwd":"/work/pi"}"#,
                 "\n",
                 r#"{"type":"session_info","id":"i1","timestamp":"2026-10-14T18:49:14Z","name":"pi-worker"}"#,
                 "\n",
@@ -133,14 +135,14 @@ fn lists_opencode_and_pi_panes_with_session_names_and_state() {
     assert_eq!(oc["headline"], "Fix the parser");
     assert_eq!(oc["cwd"], "/work/oc");
     assert_eq!(oc["session_id"], "ses_oc");
-    assert_eq!(oc["agent_id"], serde_json::Value::Null);
+    assert_eq!(oc["agent_id"], "ses_oc");
     assert_ne!(oc["state"], "Working");
 
     let pi = row(&rows, "%31");
     assert_eq!(pi["provider"], "pi");
     assert_eq!(pi["name"], "pi-worker");
     assert_eq!(pi["cwd"], "/work/pi");
-    assert_eq!(pi["session_id"], "01a1-pi");
+    assert_eq!(pi["session_id"], PI_SESSION);
     assert_eq!(pi["state"], "Working");
 
     let only_pi = fx.run(&["agents", "--json", "--provider", "pi"]);
@@ -266,7 +268,7 @@ fn a_pi_pane_sends_to_an_opencode_pane_under_its_pane_name() {
         .unwrap();
     assert!(!inbox.status.success());
     assert!(
-        stderr(&inbox).contains("triage mail is not supported for pi agents yet"),
+        stderr(&inbox).contains("cannot tell which pi session is calling"),
         "{}",
         stderr(&inbox)
     );
@@ -432,11 +434,11 @@ fn a_pi_tool_shell_sends_as_the_session_its_env_names() {
             .unwrap()
     };
 
-    let output = send("01a1-pi");
+    let output = send(PI_SESSION);
     assert!(output.status.success(), "{}", stderr(&output));
     let sent = audit(&fx);
     assert_eq!(sent[0]["from"], "pi:%31");
-    assert_eq!(sent[0]["from_session"], "01a1-pi");
+    assert_eq!(sent[0]["from_session"], PI_SESSION);
 
     let output = send("not-a-session-here");
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
@@ -446,4 +448,91 @@ fn a_pi_tool_shell_sends_as_the_session_its_env_names() {
         stderr(&output)
     );
     assert_eq!(audit(&fx).len(), 1);
+}
+
+/// The caller's process chain reaches no pane: an opencode tool shell.
+const OC_CALLER_AND_PI_TARGET: &str = r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'
+  echo 'pi|1.0|502|/dev/null|pi|/work/pi|1|%31|pi'"#;
+
+fn mail(fx: &Fixture, agent: &str, state: &str) -> Vec<serde_json::Value> {
+    let Ok(entries) = fs::read_dir(fx.dir.join(format!("state/triage/mail/{agent}/{state}")))
+    else {
+        return Vec::new();
+    };
+    entries
+        .map(|e| serde_json::from_slice(&fs::read(e.unwrap().path()).unwrap()).unwrap())
+        .collect()
+}
+
+impl Fixture {
+    fn as_pi(&self, args: &[&str]) -> Output {
+        self.command(args)
+            .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+            .env("PI_SESSION_ID", PI_SESSION)
+            .env("PI_SESSION_FILE", "/unused")
+            .output()
+            .unwrap()
+    }
+
+    /// 777001 is in every caller's chain, so it can stand in for the
+    /// opencode server as well.
+    fn record_opencode_server(&self) {
+        fs::create_dir_all(self.dir.join("state/opencode")).unwrap();
+        fs::write(
+            self.dir.join("state/opencode/service.json"),
+            r#"{"url":"http://127.0.0.1:4096","pid":777001,"password":"x"}"#,
+        )
+        .unwrap();
+    }
+
+    fn as_opencode(&self, args: &[&str]) -> Output {
+        self.record_opencode_server();
+        self.command(args)
+            .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+            .env("OPENCODE_SESSION_ID", "ses_oc")
+            .env("TMUX_PANE", "%30")
+            .output()
+            .unwrap()
+    }
+}
+
+#[test]
+fn opencode_and_pi_sessions_have_mailboxes() {
+    let fx = Fixture::new("mailbox", PI_CALLER_AND_OC_TARGET);
+
+    let send = ["send", "--mode", "mailbox", "--to"];
+    let output = fx.as_pi(&[&send[..], &["%30", "--message", "to oc"]].concat());
+    assert!(output.status.success(), "{}", stderr(&output));
+    let to_oc = mail(&fx, "ses_oc", "pasted");
+    assert_eq!(to_oc.len(), 1, "{to_oc:?}");
+    assert_eq!(to_oc[0]["from"]["agent"], PI_SESSION);
+    assert_eq!(to_oc[0]["from"]["provider"], "pi");
+    assert_eq!(to_oc[0]["body"], "to oc");
+
+    let inbox = fx.as_pi(&["inbox"]);
+    assert!(inbox.status.success(), "{}", stderr(&inbox));
+    assert!(String::from_utf8_lossy(&inbox.stdout).contains("No pending messages"));
+
+    // An opencode caller is reached through its env, not a pane walk.
+    let fx = Fixture::new("mailbox-oc", OC_CALLER_AND_PI_TARGET);
+    let output = fx.as_opencode(&[&send[..], &["%31", "--message", "to pi"]].concat());
+    assert!(output.status.success(), "{}", stderr(&output));
+    let to_pi = mail(&fx, PI_SESSION, "pasted");
+    assert_eq!(to_pi.len(), 1, "{to_pi:?}");
+    assert_eq!(to_pi[0]["from"]["agent"], "ses_oc");
+
+    let id = "01900000-0000-7000-8000-0000000000c1";
+    let mut pending = to_pi[0].clone();
+    pending["to"]["agent"] = "ses_oc".into();
+    pending["to"]["session_at_send"] = "ses_oc".into();
+    pending["id"] = id.into();
+    pending["body"] = "read me".into();
+    let dir = fx.dir.join("state/triage/mail/ses_oc/pending");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join(format!("{id}.json")), pending.to_string()).unwrap();
+    let inbox = fx.as_opencode(&["inbox"]);
+    assert!(inbox.status.success(), "{}", stderr(&inbox));
+    assert!(String::from_utf8_lossy(&inbox.stdout).contains("read me"));
+    assert!(mail(&fx, "ses_oc", "pending").is_empty());
+    assert_eq!(mail(&fx, "ses_oc", "delivered").len(), 1);
 }
