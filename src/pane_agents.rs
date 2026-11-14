@@ -21,7 +21,11 @@ use crate::models::{Pane, Provider, Session};
 struct SessionMeta {
     id: String,
     cwd: PathBuf,
-    title: Option<String>,
+    /// A name the user gave the session (pi's `/name`); opencode has none.
+    name: Option<String>,
+    /// An auto-generated topic (opencode's title). Shown as a detail, never
+    /// as the row's name: it describes the first prompt, not the agent.
+    topic: Option<String>,
     busy: Option<bool>,
     created_ms: u64,
     updated_ms: u64,
@@ -91,7 +95,10 @@ fn pane_session(provider: Provider, pane: &Pane, meta: Option<&SessionMeta>) -> 
         pane.pid,
         meta.map_or_else(|| pane.pane_id.clone(), |m| m.id.clone()),
         pane.cwd.clone(),
-        meta.and_then(|m| m.title.clone()),
+        Some(
+            meta.and_then(|m| m.name.clone())
+                .unwrap_or_else(|| format!("{}:{}", provider.name(), pane.pane_id)),
+        ),
         status.to_string(),
         meta.map_or(0, |m| m.created_ms),
         meta.map_or(0, |m| m.updated_ms),
@@ -99,6 +106,7 @@ fn pane_session(provider: Provider, pane: &Pane, meta: Option<&SessionMeta>) -> 
     );
     session.last_stop_at = meta.and_then(|m| m.idle_since_ms).map(ms_to_time);
     session.last_event_at = meta.map(|m| ms_to_time(m.updated_ms));
+    session.headline = meta.and_then(|m| m.topic.clone());
     session.pane = Some(pane.clone());
     session
 }
@@ -173,7 +181,8 @@ fn parse_opencode_rows(json: &[u8]) -> Vec<SessionMeta> {
             SessionMeta {
                 id: row.id,
                 cwd: PathBuf::from(row.directory),
-                title: row.title.filter(|t| !t.trim().is_empty()),
+                name: None,
+                topic: row.title.filter(|t| !t.trim().is_empty()),
                 busy,
                 created_ms: row.time_created.unwrap_or(0),
                 updated_ms: row.time_updated.unwrap_or(0),
@@ -263,7 +272,7 @@ fn parse_pi_session(text: &str, modified_ms: u64) -> Option<SessionMeta> {
     let cwd = PathBuf::from(header.get("cwd")?.as_str()?);
     let created_ms = timestamp_ms(&header).unwrap_or(0);
 
-    let mut title = None;
+    let mut name = None;
     let mut last_message: Option<Value> = None;
     for line in lines {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
@@ -271,7 +280,7 @@ fn parse_pi_session(text: &str, modified_ms: u64) -> Option<SessionMeta> {
         };
         match entry.get("type").and_then(Value::as_str) {
             Some("session_info") => {
-                title = entry
+                name = entry
                     .get("name")
                     .and_then(Value::as_str)
                     .map(str::trim)
@@ -298,7 +307,8 @@ fn parse_pi_session(text: &str, modified_ms: u64) -> Option<SessionMeta> {
     Some(SessionMeta {
         id,
         cwd,
-        title,
+        name,
+        topic: None,
         busy: Some(busy),
         created_ms,
         updated_ms: modified_ms,
@@ -328,7 +338,8 @@ mod tests {
         SessionMeta {
             id: id.to_string(),
             cwd: PathBuf::from(cwd),
-            title: Some(id.to_string()),
+            name: None,
+            topic: Some(id.to_string()),
             busy: Some(false),
             created_ms: 1,
             updated_ms,
@@ -357,10 +368,11 @@ mod tests {
         let metas = parse_opencode_rows(json);
         assert_eq!(metas.len(), 3);
         assert_eq!(metas[0].busy, Some(true));
-        assert_eq!(metas[0].title.as_deref(), Some("Fix parser"));
+        assert_eq!(metas[0].topic.as_deref(), Some("Fix parser"));
+        assert_eq!(metas[0].name, None);
         assert_eq!(metas[0].idle_since_ms, None);
         assert_eq!(metas[1].busy, Some(false));
-        assert_eq!(metas[1].title, None);
+        assert_eq!(metas[1].topic, None);
         assert_eq!(metas[1].idle_since_ms, Some(18));
         assert_eq!(metas[2].busy, None);
         assert!(parse_opencode_rows(b"not json").is_empty());
@@ -390,7 +402,8 @@ mod tests {
 
         let working =
             parse_pi_session(&format!("{header}\n{named}\n{user}\n{tool}\n"), 99).unwrap();
-        assert_eq!(working.title.as_deref(), Some("pi-worker"));
+        assert_eq!(working.name.as_deref(), Some("pi-worker"));
+        assert_eq!(working.topic, None);
         assert_eq!(working.busy, Some(true));
 
         let idle = parse_pi_session(&format!("{header}\n{user}\n{done}\n"), 99).unwrap();
@@ -414,14 +427,17 @@ mod tests {
 
         let solo = sessions.iter().find(|s| s.pid == 10).unwrap();
         assert_eq!(solo.session_id, "ses_new");
-        assert_eq!(solo.name.as_deref(), Some("ses_new"));
+        assert_eq!(solo.name.as_deref(), Some("opencode:%30"));
+        assert_eq!(solo.headline.as_deref(), Some("ses_new"));
         assert_eq!(solo.status, "idle");
         assert_eq!(solo.pane.as_ref().unwrap().pane_id, "%30");
 
         for pid in [11, 12] {
             let twin = sessions.iter().find(|s| s.pid == pid).unwrap();
             assert_eq!(twin.session_id, twin.pane.as_ref().unwrap().pane_id);
-            assert_eq!(twin.name, None);
+            let pane_id = &twin.pane.as_ref().unwrap().pane_id;
+            assert_eq!(twin.name, Some(format!("opencode:{pane_id}")));
+            assert_eq!(twin.headline, None);
             assert_eq!(twin.status, "unknown");
         }
     }

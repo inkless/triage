@@ -47,11 +47,24 @@ impl AliasKey {
     pub fn candidates_for_session(session: &Session) -> Vec<Self> {
         let exact = Self::exact_for_session(session);
         let alias = Self::for_session(session);
-        if exact == alias {
-            vec![exact]
-        } else {
-            vec![exact, alias]
+        let mut keys = vec![exact];
+        if !keys.contains(&alias) {
+            keys.push(alias);
         }
+        // opencode/pi rows fall back to the pane id as their session id until
+        // a session is matched; a rename made then must survive the match.
+        if session.provider.pane_only()
+            && let Some(pane) = &session.pane
+        {
+            let by_pane = Self {
+                provider: session.provider.label().to_string(),
+                session_id: pane.pane_id.clone(),
+            };
+            if !keys.contains(&by_pane) {
+                keys.push(by_pane);
+            }
+        }
+        keys
     }
 }
 

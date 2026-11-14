@@ -111,7 +111,8 @@ fn lists_opencode_and_pi_panes_with_session_names_and_state() {
 
     let oc = row(&rows, "%30");
     assert_eq!(oc["provider"], "oc");
-    assert_eq!(oc["name"], "Fix the parser");
+    assert_eq!(oc["name"], "opencode:%30");
+    assert_eq!(oc["headline"], "Fix the parser");
     assert_eq!(oc["cwd"], "/work/oc");
     assert_eq!(oc["session_id"], "ses_oc");
     assert_eq!(oc["agent_id"], serde_json::Value::Null);
@@ -143,7 +144,8 @@ fn panes_sharing_a_cwd_are_listed_but_not_named_after_a_guess() {
         let r = row(&rows, pane);
         assert_eq!(r["session_id"], pane);
         assert_eq!(r["state"], "Unknown");
-        assert_ne!(r["name"], "Fix the parser");
+        assert_eq!(r["name"], format!("opencode:{pane}"));
+        assert_eq!(r["headline"], serde_json::Value::Null);
     }
 }
 
@@ -158,4 +160,37 @@ fn a_missing_session_store_still_lists_the_pane() {
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(row(&rows, "%30")["cwd"], "/work/elsewhere");
     assert!(Path::new(&fx.dir).exists());
+}
+
+#[test]
+fn a_tmux_window_name_never_names_a_pane_agent() {
+    // pi wrote no `session_info` name; the window called "random" must not
+    // leak in as the agent's name.
+    let fx = Fixture::new(
+        "window",
+        r#"  echo 'pi|1.0|502|/dev/null|pi|/work/unnamed|1|%48|random'"#,
+    );
+    let rows = fx.agents();
+    assert_eq!(row(&rows, "%48")["name"], "pi:%48");
+}
+
+#[test]
+fn a_rename_names_the_row_and_survives_the_session_match() {
+    let fx = Fixture::new(
+        "rename",
+        r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'
+  echo 'pi|1.0|502|/dev/null|pi|/work/pi|1|%31|pi'"#,
+    );
+    // An alias set by session id (oc) and one set by pane id before a
+    // session was matched (pi).
+    fs::create_dir_all(fx.dir.join(".config/triage")).unwrap();
+    fs::write(
+        fx.dir.join(".config/triage/state.json"),
+        r#"{"aliases":[{"provider":"oc","session_id":"ses_oc","alias":"bazhen-oc"},
+                       {"provider":"pi","session_id":"%31","alias":"pi-scout"}]}"#,
+    )
+    .unwrap();
+    let rows = fx.agents();
+    assert_eq!(row(&rows, "%30")["name"], "bazhen-oc");
+    assert_eq!(row(&rows, "%31")["name"], "pi-scout");
 }
