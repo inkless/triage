@@ -38,7 +38,7 @@ impl Fixture {
 case "$1" in
 list-panes)
 {panes} ;;
-capture-pane) printf '\n' ;;
+capture-pane) printf '%s\n' "$CAPTURE" ;;
 load-buffer) /bin/cat "$4" >> "$HOME/pasted"; echo "$*" >> "$HOME/keys" ;;
 send-keys|paste-buffer) echo "$*" >> "$HOME/keys" ;;
 esac
@@ -50,11 +50,20 @@ esac
                 "sqlite3",
                 r#"
 case "$*" in
+*"where id ="*) printf '[{"directory":"/work/other"}]' ;;
 *session_v2*) printf '[{"id":"ses_oc","directory":"/work/oc","title":"Fix the parser","time_created":1,"time_updated":2000000000000,"time_busy":10,"time_idle":20}]' ;;
 esac
 "#,
             ),
-            ("ps", ""),
+            (
+                "ps",
+                r#"
+case "$*" in
+*tty*|*comm*) ;;
+*) echo "$PPID 777001"; echo "777001 777000"; echo "777000 1" ;;
+esac
+"#,
+            ),
             ("lsof", ""),
         ] {
             let path = dir.join(name);
@@ -73,6 +82,10 @@ esac
             .env("XDG_DATA_HOME", self.dir.join("data"))
             .env("PATH", &self.dir)
             .env_remove("PI_CODING_AGENT_DIR")
+            .env_remove("TRIAGE_TEST_PANE_HARNESS")
+            .env_remove("OPENCODE_SESSION_ID")
+            .env_remove("TMUX_PANE")
+            .env("CAPTURE", "")
             .env_remove("CODEX_THREAD_ID");
         command
     }
@@ -193,4 +206,110 @@ fn a_rename_names_the_row_and_survives_the_session_match() {
     let rows = fx.agents();
     assert_eq!(row(&rows, "%30")["name"], "bazhen-oc");
     assert_eq!(row(&rows, "%31")["name"], "pi-scout");
+}
+
+/// The caller runs in a pi pane: triage → pi harness (777001) → pane root
+/// (777000), as the fake `ps` reports.
+const PI_CALLER_AND_OC_TARGET: &str = r#"  echo 'pi|1.0|777000|/dev/null|pi|/work/pi|1|%31|pi'
+  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'"#;
+
+fn audit(fx: &Fixture) -> Vec<serde_json::Value> {
+    fs::read_to_string(fx.dir.join(".config/triage/agent-messages.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_pi_pane_sends_to_an_opencode_pane_under_its_pane_name() {
+    let fx = Fixture::new("send", PI_CALLER_AND_OC_TARGET);
+    let output = fx
+        .command(&["send", "--to", "%30", "--message", "hello oc"])
+        .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let pasted = fs::read_to_string(fx.dir.join("pasted")).unwrap();
+    assert_eq!(pasted, "[triage message from pi:%31] hello oc");
+    let keys = fs::read_to_string(fx.dir.join("keys")).unwrap();
+    assert!(keys.contains("%30"), "{keys}");
+
+    let audit = audit(&fx);
+    assert_eq!(audit.len(), 1, "{audit:?}");
+    assert_eq!(audit[0]["from"], "pi:%31");
+    assert_eq!(audit[0]["verdict"], "sent");
+    assert_eq!(audit[0]["target_id"], "%30");
+    assert_eq!(audit[0]["target_provider"], "oc");
+
+    let whoami = fx
+        .command(&["agents", "whoami", "--json"])
+        .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+        .output()
+        .unwrap();
+    assert!(whoami.status.success(), "{}", stderr(&whoami));
+    let me: serde_json::Value = serde_json::from_slice(&whoami.stdout).unwrap();
+    assert_eq!(me["pane_id"], "%31");
+    assert_eq!(me["provider"], "pi");
+}
+
+#[test]
+fn a_caller_not_under_the_harness_is_refused() {
+    let fx = Fixture::new("noharness", PI_CALLER_AND_OC_TARGET);
+    let output = fx.run(&["send", "--to", "%30", "--message", "hello"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stderr(&output).contains("not under its pi process"));
+    assert!(!fx.dir.join("pasted").exists());
+}
+
+#[test]
+fn a_visible_permission_prompt_still_blocks_a_pane_only_target() {
+    let fx = Fixture::new("prompt", PI_CALLER_AND_OC_TARGET);
+    let output = fx
+        .command(&["send", "--to", "%30", "--message", "hello"])
+        .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+        .env(
+            "CAPTURE",
+            "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel",
+        )
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(!fx.dir.join("pasted").exists());
+    let audit = audit(&fx);
+    assert_eq!(audit[0]["verdict"], "denied");
+    assert_eq!(audit[0]["from"], "pi:%31");
+}
+
+#[test]
+fn an_opencode_tool_shell_sends_as_its_pane() {
+    // The caller's process chain never reaches a pane (opencode runs tool
+    // shells under its shared server); its env names the session and pane.
+    let fx = Fixture::new(
+        "ocsend",
+        r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'
+  echo 'pi|1.0|502|/dev/null|pi|/work/pi|1|%31|pi'"#,
+    );
+    let send = |session: &str| {
+        fx.command(&["send", "--to", "%31", "--message", "hi pi"])
+            .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+            .env("OPENCODE_SESSION_ID", session)
+            .env("TMUX_PANE", "%30")
+            .output()
+            .unwrap()
+    };
+
+    let output = send("ses_oc");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let pasted = fs::read_to_string(fx.dir.join("pasted")).unwrap();
+    assert_eq!(pasted, "[triage message from opencode:%30] hi pi");
+    let sent = audit(&fx);
+    assert_eq!(sent[0]["from"], "opencode:%30");
+    assert_eq!(sent[0]["target_id"], "%31");
+
+    let output = send("ses_from_another_dir");
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stderr(&output).contains("not a session in %30's directory"));
+    assert_eq!(audit(&fx).len(), 1);
 }

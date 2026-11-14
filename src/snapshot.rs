@@ -36,7 +36,11 @@ pub fn discover_sessions_with_panes(
 
     let mut codex_sessions = codex::discover_live_sessions(&panes, &ppid_map, codex_cache);
     sessions.append(&mut codex_sessions);
-    sessions.extend(pane_agents::discover(&panes));
+    let owned_panes = sessions
+        .iter()
+        .filter_map(|s| s.pane.as_ref().map(|p| p.pane_id.clone()))
+        .collect::<HashSet<_>>();
+    sessions.extend(pane_agents::discover(&panes, &ppid_map, &owned_panes));
 
     enrich_permission_prompts(&mut sessions);
     let pending = approval::read_pending();

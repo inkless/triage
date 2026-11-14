@@ -98,6 +98,17 @@ message body is pasted through an internal tmux buffer and submitted with a
 separate Enter, so agents can use either one-line text or a file/stdin body
 without caring about the transport.
 
+opencode and pi agents can send too, under a weaker, pane-level sender
+named by provider and pane (`opencode:%30`, `pi:%31`) in the delivered text
+and the audit log. A pi caller must run under the pi process inside exactly
+one tmux pane. opencode runs tool shells under its shared `opencode serve`
+process, outside the pane, so an opencode caller is taken from the
+`OPENCODE_SESSION_ID` and `TMUX_PANE` its shell inherits, and is accepted only
+when that pane is an opencode pane, the caller runs under opencode, and the
+session belongs to the pane's directory. This names the pane, not the
+session. Sends to these agents are pasted; the gate blocks on a visible
+permission prompt but does not inspect their input box.
+
 ### Peer mail
 
 With `[send] mode = "mailbox"` (the default), `triage send` writes the message

@@ -5,7 +5,7 @@
 //! harness in one cwd cannot be told apart from outside, so both stay
 //! unnamed rather than borrowing the wrong session.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,10 +32,18 @@ struct SessionMeta {
     idle_since_ms: Option<u64>,
 }
 
-pub fn discover(panes: &HashMap<u32, Pane>) -> Vec<Session> {
+/// `skip` holds panes already owned by a Claude or Codex session: a harness
+/// one of those agents runs as a tool is not a pane agent.
+pub fn discover(
+    panes: &HashMap<u32, Pane>,
+    ppid_map: &HashMap<u32, u32>,
+    skip: &HashSet<String>,
+) -> Vec<Session> {
+    let children = children_of(ppid_map);
+    let comm = |pid: u32| crate::mailbox::proc_info(pid).ok().map(|info| info.comm);
     let mut by_provider: HashMap<Provider, Vec<&Pane>> = HashMap::new();
-    for pane in panes.values() {
-        if let Some(provider) = provider_for_command(&pane.current_command) {
+    for pane in panes.values().filter(|p| !skip.contains(&p.pane_id)) {
+        if let Some(provider) = pane_provider(pane, &children, &comm) {
             by_provider.entry(provider).or_default().push(pane);
         }
     }
@@ -49,6 +57,34 @@ pub fn discover(panes: &HashMap<u32, Pane>) -> Vec<Session> {
         out.extend(sessions_for_panes(provider, &panes, &metas));
     }
     out
+}
+
+fn children_of(ppid_map: &HashMap<u32, u32>) -> HashMap<u32, Vec<u32>> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&pid, &ppid) in ppid_map {
+        children.entry(ppid).or_default().push(pid);
+    }
+    children
+}
+
+/// The pane's foreground command names the harness when it was started from
+/// an interactive shell. Launched as `tmux new-window opencode`, the shell
+/// runs it without job control and tmux reports the shell instead, so also
+/// look at the pane's children and grandchildren.
+fn pane_provider(
+    pane: &Pane,
+    children: &HashMap<u32, Vec<u32>>,
+    comm: &dyn Fn(u32) -> Option<String>,
+) -> Option<Provider> {
+    if let Some(provider) = provider_for_command(&pane.current_command) {
+        return Some(provider);
+    }
+    let kids = children.get(&pane.pid).into_iter().flatten();
+    let grandkids = kids
+        .clone()
+        .flat_map(|kid| children.get(kid).into_iter().flatten());
+    kids.chain(grandkids)
+        .find_map(|&pid| provider_for_command(&comm(pid)?))
 }
 
 fn provider_for_command(command: &str) -> Option<Provider> {
@@ -147,6 +183,23 @@ fn opencode_metas(db: &Path) -> Vec<SessionMeta> {
         return Vec::new();
     }
     parse_opencode_rows(&out.stdout)
+}
+
+/// The directory of one opencode session, for checking a caller's
+/// `OPENCODE_SESSION_ID` against the pane it claims.
+pub fn opencode_session_dir(id: &str) -> Option<PathBuf> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let db = opencode_db_path();
+    let query = format!("select directory from session_v2 where id = '{id}'");
+    let out = Command::new("sqlite3")
+        .args(["-readonly", "-json", &db.to_string_lossy(), &query])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let rows: Vec<Value> = serde_json::from_slice(&out.stdout).ok()?;
+    rows.first()?.get("directory")?.as_str().map(PathBuf::from)
 }
 
 #[derive(Deserialize)]
@@ -354,6 +407,29 @@ mod tests {
         for other in ["fish", "node", "claude", "codex", "2.1.139", "pip"] {
             assert_eq!(provider_for_command(other), None, "{other}");
         }
+    }
+
+    #[test]
+    fn finds_a_harness_the_shell_runs_without_job_control() {
+        let children = children_of(&HashMap::from([(20, 10), (30, 20), (40, 11)]));
+        let comm = |pid: u32| {
+            let name = match pid {
+                20 => "sh",
+                30 => "opencode",
+                40 => "pi",
+                _ => "other",
+            };
+            Some(name.to_string())
+        };
+        let grandchild = pane(10, "%1", "/w", "fish");
+        assert_eq!(
+            pane_provider(&grandchild, &children, &comm),
+            Some(Provider::Opencode)
+        );
+        let child = pane(11, "%2", "/w", "fish");
+        assert_eq!(pane_provider(&child, &children, &comm), Some(Provider::Pi));
+        let plain = pane(12, "%3", "/w", "fish");
+        assert_eq!(pane_provider(&plain, &children, &comm), None);
     }
 
     #[test]
