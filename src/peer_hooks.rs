@@ -28,6 +28,8 @@ const DRAIN_TIME_LIMIT: Duration = Duration::from_secs(3);
 const MAX_PAYLOAD_BYTES: u64 = 1024 * 1024;
 const MAX_HOST_HOPS: usize = 32;
 const EXIT_WAKE: i32 = 2;
+/// pi's waiter returns unconfirmed deliveries to pending on this cadence.
+const RECONCILE_EVERY_RESCANS: u32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
@@ -37,6 +39,8 @@ enum Event {
     PostToolUse,
     /// pi's mail waiter, spawned by triage's pi extension.
     Wait,
+    /// pi's extension confirming it injected what the waiter printed.
+    Ack,
 }
 
 struct HookArgs {
@@ -93,6 +97,7 @@ fn parse_args(args: &[String]) -> io::Result<HookArgs> {
         Some("user-prompt-submit") => Event::UserPromptSubmit,
         Some("post-tool-use") => Event::PostToolUse,
         Some("wait") => Event::Wait,
+        Some("ack") => Event::Ack,
         _ => return Err(bad("unknown hook event")),
     };
     let mut wait = false;
@@ -153,7 +158,7 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
     let host = find_host(hook.provider)
         .ok_or_else(|| io::Error::other("no harness process among this hook's ancestors"))?;
     if hook.provider == Provider::Pi {
-        return run_pi(store, hook.event, host, &payload);
+        return run_pi(store, hook.event, host, &payload, stdin);
     }
     let agent = register(store, host, hook.provider, &payload.session, hook.event)?;
     let mailbox = store.mailbox(&agent)?;
@@ -175,7 +180,7 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
             DeliveredVia::ClaudePostToolUse,
         ),
         (Provider::Claude, Event::UserPromptSubmit)
-        | (Provider::Claude | Provider::Codex, Event::Wait)
+        | (Provider::Claude | Provider::Codex, Event::Wait | Event::Ack)
         | (Provider::Codex, Event::Stop)
         | (Provider::Opencode | Provider::Pi, _) => Err(io::Error::other(
             "no triage hook is installed for this event",
@@ -209,7 +214,13 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
 /// it blocks until mail arrives, prints it and exits for the extension to
 /// inject. Each pi process runs one session at a time, so the host record
 /// names its current one, and a waiter for any other session just exits.
-fn run_pi(store: &Store, event: Event, host: HostId, payload: &Payload) -> io::Result<i32> {
+fn run_pi(
+    store: &Store,
+    event: Event,
+    host: HostId,
+    payload: &Payload,
+    stdin: &str,
+) -> io::Result<i32> {
     let agent = payload.session.as_str();
     match event {
         Event::SessionStart => {
@@ -228,6 +239,16 @@ fn run_pi(store: &Store, event: Event, host: HostId, payload: &Payload) -> io::R
             }
             let mailbox = store.mailbox(agent)?;
             wait_for_mail(store, &mailbox, agent, host, payload, Provider::Pi)
+        }
+        Event::Ack => {
+            let acks: Vec<Ack> = serde_json::from_str::<Value>(stdin)?
+                .get("ack")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            commit_acked(&store.mailbox(agent)?, host, &acks)?;
+            Ok(0)
         }
         Event::Stop | Event::UserPromptSubmit | Event::PostToolUse => Err(io::Error::other(
             "no triage hook is installed for this event",
@@ -444,7 +465,12 @@ fn wait_for_mail(
         .watch(&pending_dir, RecursiveMode::NonRecursive)
         .map_err(io::Error::other)?;
 
+    let mut rescans = 0u32;
     loop {
+        if reader == Provider::Pi && rescans.is_multiple_of(RECONCILE_EVERY_RESCANS) {
+            crate::reconcile::reconcile_agent(store, agent)?;
+        }
+        rescans = rescans.wrapping_add(1);
         if mailbox::liveness(host) == Liveness::Dead
             || host_current_session(store, host).as_deref() != Some(payload.session.as_str())
             || Instant::now() >= deadline
@@ -470,6 +496,7 @@ fn wait_for_mail(
                 transcript_offset: offset,
                 printed_at_ms: None,
                 head_only: false,
+                awaiting_ack: false,
             };
             if let Some(batch) =
                 claim_batch(mailbox, &payload.session, host, reader, &claim_template)?
@@ -493,26 +520,65 @@ fn wait_for_mail(
     }
 }
 
-/// The pi extension injects whatever the waiter prints once it exits, so
-/// printed mail counts as delivered.
+/// One printed message the extension confirms injecting.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Ack {
+    id: String,
+    nonce: String,
+}
+
+/// Prints the batch for pi's extension as `{"text", "ack"}`. The claims stay
+/// inflight until the extension, having injected the text, hands `ack` back
+/// to `inbox --hook pi ack`; reconcile returns unconfirmed ones to pending.
 fn hand_to_pi(mailbox: &Mailbox, batch: &Batch) -> io::Result<i32> {
-    let written = io::stdout()
-        .lock()
-        .write_all(batch.text.as_bytes())
-        .and_then(|()| io::stdout().flush());
+    let acks: Vec<Ack> = batch
+        .claims
+        .iter()
+        .map(|(inflight, claim)| Ack {
+            id: inflight.id.clone(),
+            nonce: claim.nonce.clone(),
+        })
+        .collect();
+    let printed = mailbox::now_ms();
     for (inflight, claim) in &batch.claims {
-        if written.is_ok() {
-            let to = if claim.head_only {
-                State::Notified
-            } else {
-                State::Delivered
-            };
-            mailbox.commit(inflight, to, DeliveredVia::PiExtension, mailbox::now_ms())?;
-        } else {
+        let claim = Claim {
+            printed_at_ms: Some(printed),
+            awaiting_ack: true,
+            ..claim.clone()
+        };
+        mailbox.write_claim(inflight, &claim)?;
+    }
+    let output = serde_json::json!({ "text": batch.text, "ack": acks });
+    let written = serde_json::to_writer(io::stdout().lock(), &output)
+        .map_err(io::Error::from)
+        .and_then(|()| io::stdout().flush());
+    if written.is_err() {
+        for (inflight, _) in &batch.claims {
             mailbox.release(inflight)?;
         }
     }
     written.map(|()| 0)
+}
+
+fn commit_acked(mailbox: &Mailbox, host: HostId, acks: &[Ack]) -> io::Result<()> {
+    for inflight in mailbox.inflight() {
+        let Some(claim) = mailbox.read_claim(&inflight) else {
+            continue;
+        };
+        let acked = acks
+            .iter()
+            .any(|ack| ack.id == inflight.id && ack.nonce == claim.nonce);
+        if !acked || !claim.awaiting_ack || inflight.host != host {
+            continue;
+        }
+        let to = if claim.head_only {
+            State::Notified
+        } else {
+            State::Delivered
+        };
+        mailbox.commit(&inflight, to, DeliveredVia::PiExtension, mailbox::now_ms())?;
+    }
+    Ok(())
 }
 
 struct Batch {
@@ -614,6 +680,7 @@ fn drain(
         transcript_offset: 0,
         printed_at_ms: None,
         head_only: false,
+        awaiting_ack: false,
     };
     if started.elapsed() >= DRAIN_TIME_LIMIT {
         return Ok(0);

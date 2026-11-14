@@ -1049,6 +1049,7 @@ fn inbox_list(
             transcript_offset: 0,
             printed_at_ms: None,
             head_only: false,
+            awaiting_ack: false,
         };
         let host = identity.host.unwrap_or(HostId {
             pid: caller.pid,

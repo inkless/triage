@@ -237,6 +237,10 @@ pub struct Claim {
     /// Only the head was delivered; confirmation moves it to `notified/`.
     #[serde(default)]
     pub head_only: bool,
+    /// Printed for a reader that confirms injecting it (pi's extension);
+    /// unconfirmed, it goes back to pending.
+    #[serde(default)]
+    pub awaiting_ack: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1250,6 +1254,7 @@ mod tests {
             transcript_offset: 0,
             printed_at_ms: None,
             head_only: false,
+            awaiting_ack: false,
         }
     }
 

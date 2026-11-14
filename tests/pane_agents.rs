@@ -724,7 +724,7 @@ fn mail_to_a_pi_session_with_the_extension_waits_for_its_waiter() {
     let pi = std::process::id().to_string();
     let hosted = "019a8f3c-0000-7000-8000-0000000000e1";
     let harnesses = format!("777001,777002,{pi}");
-    let as_pi_hook = |event: &str| {
+    let as_pi_hook = |event: &str, ack: serde_json::Value| {
         let mut child = fx
             .command(&["inbox", "--hook", "pi", event, "--triage-hook=v1"])
             .env("TRIAGE_TEST_PANE_HARNESS", &pi)
@@ -732,7 +732,7 @@ fn mail_to_a_pi_session_with_the_extension_waits_for_its_waiter() {
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
-        let payload = serde_json::json!({ "session_id": hosted }).to_string();
+        let payload = serde_json::json!({ "session_id": hosted, "ack": ack }).to_string();
         child
             .stdin
             .take()
@@ -762,7 +762,11 @@ fn mail_to_a_pi_session_with_the_extension_waits_for_its_waiter() {
     fs::create_dir_all(&sessions).unwrap();
     let header = serde_json::json!({"type": "session", "id": hosted, "cwd": cwd});
     fs::write(sessions.join("hosted.jsonl"), format!("{header}\n")).unwrap();
-    assert!(as_pi_hook("session-start").status.success());
+    assert!(
+        as_pi_hook("session-start", serde_json::Value::Null)
+            .status
+            .success()
+    );
     let rows = with_pi(&["agents", "--json", "--include-self"]);
     let rows: Vec<serde_json::Value> = serde_json::from_slice(&rows.stdout).unwrap();
     assert_eq!(row(&rows, "%31")["session_id"], hosted);
@@ -786,9 +790,14 @@ fn mail_to_a_pi_session_with_the_extension_waits_for_its_waiter() {
     assert!(!fx.dir.join("pasted").exists());
     assert_eq!(mail(&fx, hosted, "pending").len(), 1);
 
-    let delivered = as_pi_hook("wait");
-    assert!(delivered.status.success());
-    assert!(String::from_utf8_lossy(&delivered.stdout).contains("\nhi\n"));
+    let printed = as_pi_hook("wait", serde_json::Value::Null);
+    assert!(printed.status.success());
+    let printed: serde_json::Value = serde_json::from_slice(&printed.stdout).unwrap();
+    assert!(
+        printed["text"].as_str().unwrap().contains("\nhi\n"),
+        "{printed}"
+    );
+    assert!(as_pi_hook("ack", printed["ack"].clone()).status.success());
     assert_eq!(mail(&fx, hosted, "delivered").len(), 1);
 }
 

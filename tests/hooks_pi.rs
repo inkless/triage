@@ -92,6 +92,21 @@ impl Env {
         self.spawn_hook(event, session).wait_with_output().unwrap()
     }
 
+    fn ack(&self, session: &str, ack: &serde_json::Value) -> Output {
+        let mut child = self
+            .command(&["inbox", "--hook", "pi", "ack", "--triage-hook=v1"])
+            .spawn()
+            .unwrap();
+        let payload = serde_json::json!({ "session_id": session, "ack": ack });
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(payload.to_string().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    }
+
     fn hooks(&self, args: &[&str]) -> Output {
         self.command(&[&["hooks"][..], args].concat())
             .output()
@@ -160,7 +175,7 @@ fn session_start_makes_the_pi_process_the_host_of_its_session() {
 }
 
 #[test]
-fn the_waiter_prints_mail_as_it_arrives_and_marks_it_delivered() {
+fn the_waiter_prints_mail_as_it_arrives_and_the_extension_confirms_it() {
     let env = Env::new("wait");
     env.pi_session(S1);
     env.hook("session-start", S1);
@@ -170,10 +185,21 @@ fn the_waiter_prints_mail_as_it_arrives_and_marks_it_delivered() {
 
     let out = finish_within(waiter, Duration::from_secs(10));
     assert_eq!(out.status.code(), Some(0));
-    let text = stdout(&out);
+    let printed: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let text = printed["text"].as_str().unwrap();
     assert!(text.starts_with("📨 Peer message from lead"), "{text}");
     assert!(text.contains("\nplease rebase\n"), "{text}");
     assert!(env.mail(S1, "pending").is_empty());
+    // Printed is not delivered: the extension may never inject it.
+    assert!(env.mail(S1, "delivered").is_empty());
+
+    // An ack for another claim settles nothing.
+    let mut wrong = printed["ack"].clone();
+    wrong[0]["nonce"] = "0000000000000000".into();
+    assert!(env.ack(S1, &wrong).status.success());
+    assert!(env.mail(S1, "delivered").is_empty());
+
+    assert!(env.ack(S1, &printed["ack"]).status.success());
     let delivered = env.mail(S1, "delivered");
     assert_eq!(delivered.len(), 1);
     assert_eq!(delivered[0]["delivered_via"], "pi-extension");

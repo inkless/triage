@@ -14,14 +14,22 @@ export default function (pi: ExtensionAPI) {
 	let retry: ReturnType<typeof setTimeout> | undefined;
 	let retryMs = MIN_RETRY_MS;
 
-	const hook = (event: string, id: string) => {
+	const hook = (event: string, id: string, extra: object = {}) => {
 		const child = spawn(TRIAGE, ["inbox", "--hook", "pi", event, HOOK_VERSION], {
 			stdio: ["pipe", "pipe", "ignore"],
 		});
 		child.on("error", () => {});
 		child.stdin?.on("error", () => {});
-		child.stdin?.end(JSON.stringify({ session_id: id }));
+		child.stdin?.end(JSON.stringify({ session_id: id, ...extra }));
 		return child;
+	};
+
+	const parse = (out: string): { text: string; ack: unknown[] } | undefined => {
+		try {
+			const batch = JSON.parse(out);
+			if (typeof batch?.text === "string" && Array.isArray(batch.ack)) return batch;
+		} catch {}
+		return undefined;
 	};
 
 	const stop = () => {
@@ -33,7 +41,9 @@ export default function (pi: ExtensionAPI) {
 	};
 
 	// The waiter blocks until mail arrives, prints it and exits; anything
-	// else (another session took over, an error) exits with no output.
+	// else (another session took over, an error) exits with no output. Mail
+	// counts as delivered only once acked here; mail dropped by a session
+	// change is never acked and triage hands it out again.
 	const wait = (id: string) => {
 		retry = undefined;
 		if (session !== id) return;
@@ -48,13 +58,14 @@ export default function (pi: ExtensionAPI) {
 		child.on("close", () => {
 			if (waiter !== child || session !== id) return;
 			waiter = undefined;
-			const text = out.trim();
-			if (text) {
+			const batch = parse(out);
+			if (batch) {
 				retryMs = MIN_RETRY_MS;
 				pi.sendMessage(
-					{ customType: "triage-mail", content: text, display: true },
+					{ customType: "triage-mail", content: batch.text, display: true },
 					{ deliverAs: "steer", triggerTurn: true },
 				);
+				hook("ack", id, { ack: batch.ack });
 				wait(id);
 				return;
 			}
