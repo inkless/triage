@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -288,39 +289,89 @@ fn opencode_db_path() -> PathBuf {
 
 const OPENCODE_COLUMNS: &str = "id, directory, title, time_created, time_updated, \
      time_busy, time_idle";
-const OPENCODE_USAGE_COLUMNS: &str = "cost, tokens_input, tokens_output, tokens_reasoning, \
-     tokens_cache_read, tokens_cache_write, model";
 
+/// Root sessions with the cost and tokens of their whole subagent tree
+/// folded in, so spend by child sessions counts toward the pane's row.
 fn opencode_query(with_usage: bool) -> String {
-    let usage = if with_usage {
-        format!(", {OPENCODE_USAGE_COLUMNS}")
-    } else {
-        String::new()
-    };
+    if !with_usage {
+        return format!(
+            "select {OPENCODE_COLUMNS} from session_v2 where parent_id is null \
+             order by time_updated desc limit 500"
+        );
+    }
+    let sums = [
+        "cost",
+        "tokens_input",
+        "tokens_output",
+        "tokens_reasoning",
+        "tokens_cache_read",
+        "tokens_cache_write",
+    ];
+    let spend = sums
+        .iter()
+        .map(|c| format!("sum(s.{c}) as {c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let totals = sums
+        .iter()
+        .map(|c| format!("u.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let roots = OPENCODE_COLUMNS
+        .split(", ")
+        .map(|c| format!("r.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
-        "select {OPENCODE_COLUMNS}{usage} from session_v2 where parent_id is null \
-         order by time_updated desc limit 500"
+        "with recursive tree(root, id) as (select id, id from session_v2 \
+         where parent_id is null union all select t.root, c.id from session_v2 c \
+         join tree t on c.parent_id = t.id), \
+         spend as (select t.root, {spend} from tree t \
+         join session_v2 s on s.id = t.id group by t.root) \
+         select {roots}, {totals}, r.model from session_v2 r \
+         join spend u on u.root = r.id where r.parent_id is null \
+         order by r.time_updated desc limit 500"
     )
 }
 
-fn run_opencode_query(db: &Path, query: &str) -> Option<Vec<u8>> {
+enum QueryError {
+    MissingColumn,
+    Failed,
+}
+
+fn run_opencode_query(db: &Path, query: &str) -> Result<Vec<u8>, QueryError> {
     let out = Command::new("sqlite3")
         .args(["-readonly", "-json", &db.to_string_lossy(), query])
         .output()
-        .ok()?;
-    out.status.success().then_some(out.stdout)
+        .map_err(|_| QueryError::Failed)?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else if String::from_utf8_lossy(&out.stderr).contains("no such column") {
+        Err(QueryError::MissingColumn)
+    } else {
+        Err(QueryError::Failed)
+    }
 }
+
+static OPENCODE_LACKS_USAGE: AtomicBool = AtomicBool::new(false);
 
 /// Best effort: a missing database, missing `sqlite3`, or a schema change
 /// leaves opencode panes listed but unnamed. A database without the usage
-/// columns is queried again without them so discovery still works.
+/// columns is queried again without them so discovery still works, and is
+/// remembered so later refreshes skip the failing query.
 fn opencode_metas(db: &Path) -> Vec<SessionMeta> {
     if !db.exists() {
         return Vec::new();
     }
-    let rows = run_opencode_query(db, &opencode_query(true))
-        .or_else(|| run_opencode_query(db, &opencode_query(false)));
-    rows.map_or_else(Vec::new, |json| parse_opencode_rows(&json))
+    if !OPENCODE_LACKS_USAGE.load(Ordering::Relaxed) {
+        match run_opencode_query(db, &opencode_query(true)) {
+            Ok(json) => return parse_opencode_rows(&json),
+            Err(QueryError::Failed) => return Vec::new(),
+            Err(QueryError::MissingColumn) => OPENCODE_LACKS_USAGE.store(true, Ordering::Relaxed),
+        }
+    }
+    run_opencode_query(db, &opencode_query(false))
+        .map_or_else(|_| Vec::new(), |json| parse_opencode_rows(&json))
 }
 
 /// The pid of the shared opencode server, which runs every opencode tool
@@ -590,8 +641,12 @@ fn add_pi_usage(total: &mut Usage, entry: &Value) {
     total.tokens_out += count("output");
     total.cache_read += cache_read;
     total.cache_write += cache_write;
-    total.context_tokens = input + cache_read + cache_write;
-    total.peak_context_tokens = total.peak_context_tokens.max(total.context_tokens);
+    // Failed requests record all-zero usage; they say nothing about context.
+    let context = input + cache_read + cache_write;
+    if context > 0 {
+        total.context_tokens = context;
+        total.peak_context_tokens = total.peak_context_tokens.max(context);
+    }
 }
 
 #[cfg(test)]
@@ -768,6 +823,43 @@ mod tests {
     }
 
     #[test]
+    fn opencode_query_rolls_subagent_spend_into_the_root_session() {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            return;
+        }
+        let db = std::env::temp_dir().join(format!("triage-oc-tree-{}.db", std::process::id()));
+        let _ = fs::remove_file(&db);
+        let setup = "create table session_v2 (id text, parent_id text, directory text,
+            title text, time_created integer, time_updated integer, time_busy integer,
+            time_idle integer, cost real, tokens_input integer, tokens_output integer,
+            tokens_reasoning integer, tokens_cache_read integer, tokens_cache_write integer,
+            model text);
+            insert into session_v2 values
+            ('root',null,'/w','t',1,9,null,null,1.0,100,10,1,1000,5,null),
+            ('kid','root','/w',null,2,8,null,null,0.5,50,5,2,500,0,null),
+            ('grandkid','kid','/w',null,3,7,null,null,0.25,25,2,0,0,1,null),
+            ('other',null,'/x','u',1,5,null,null,2.0,7,7,7,7,7,null);";
+        let made = Command::new("sqlite3")
+            .arg(&db)
+            .arg(setup)
+            .output()
+            .unwrap();
+        assert!(made.status.success());
+        let json = run_opencode_query(&db, &opencode_query(true)).ok().unwrap();
+        let _ = fs::remove_file(&db);
+        let metas = parse_opencode_rows(&json);
+        assert_eq!(metas.len(), 2);
+        let root = metas.iter().find(|m| m.id == "root").unwrap();
+        assert_eq!(root.usage.cost_usd, 1.75);
+        assert_eq!(root.usage.tokens_in, 175);
+        assert_eq!(root.usage.tokens_out, 20);
+        assert_eq!(root.usage.cache_read, 1500);
+        assert_eq!(root.usage.cache_write, 6);
+        let other = metas.iter().find(|m| m.id == "other").unwrap();
+        assert_eq!(other.usage.cost_usd, 2.0);
+    }
+
+    #[test]
     fn pi_usage_sums_assistant_messages_and_tracks_context() {
         let header = r#"{"type":"session","version":3,"id":"01a1","timestamp":"2026-10-14T18:49:13.644Z","cwd":"/w/a"}"#;
         let user =
@@ -777,8 +869,10 @@ mod tests {
         let no_usage =
             r#"{"type":"message","id":"m4","message":{"role":"assistant","stopReason":"error"}}"#;
 
+        let failed = r#"{"type":"message","id":"m5","message":{"role":"assistant","model":"model-b","stopReason":"error","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}}}"#;
+
         let meta = parse_pi_session(
-            &format!("{header}\n{user}\n{first}\n{second}\n{no_usage}\n"),
+            &format!("{header}\n{user}\n{first}\n{second}\n{no_usage}\n{failed}\n"),
             99,
         )
         .unwrap();

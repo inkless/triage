@@ -171,6 +171,27 @@ esac
 }
 
 #[test]
+fn a_locked_opencode_database_is_not_mistaken_for_an_old_schema() {
+    let fx = Fixture::new(
+        "locked",
+        r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'"#,
+    );
+    fs::write(
+        fx.dir.join("sqlite3"),
+        r#"#!/bin/sh
+echo "$*" >> "$HOME/sqlite-calls"
+echo "database is locked" >&2
+exit 5
+"#,
+    )
+    .unwrap();
+    let rows = fx.agents();
+    assert_eq!(row(&rows, "%30")["session_id"], "%30");
+    let calls = fs::read_to_string(fx.dir.join("sqlite-calls")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "{calls}");
+}
+
+#[test]
 fn panes_sharing_a_cwd_are_listed_but_not_named_after_a_guess() {
     let fx = Fixture::new(
         "twins",

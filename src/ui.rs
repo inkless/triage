@@ -1703,12 +1703,7 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &AppState, now: SystemTime) {
     let sep = || Span::styled("  ·  ", dim());
     // Compute the context window once up front so both the header model
     // annotation and the stats line use the same value.
-    let app_peak = app
-        .sessions
-        .iter()
-        .map(|s| s.peak_context_tokens)
-        .max()
-        .unwrap_or(0);
+    let app_peak = claude_peak_context(&app.sessions);
     let default_model = (s.provider == Provider::Claude)
         .then_some(app.default_model.as_deref())
         .flatten();
@@ -2012,8 +2007,20 @@ fn format_tokens(n: u64) -> String {
     }
 }
 
-/// 0 when the window is unknown: opencode and pi report none, and the Claude
-/// heuristics below would only guess.
+/// Fleet-wide Claude peak, the evidence that a sibling session runs a 1M
+/// window. Other harnesses' peaks say nothing about Claude's window.
+fn claude_peak_context(sessions: &[Session]) -> u64 {
+    sessions
+        .iter()
+        .filter(|s| s.provider == Provider::Claude)
+        .map(|s| s.peak_context_tokens)
+        .max()
+        .unwrap_or(0)
+}
+
+/// 0 when the window is unknown: opencode and pi report their own or none,
+/// and the Claude heuristics below would only guess. The global override is
+/// aimed at Claude and is ignored for them.
 fn session_context_window(
     s: &Session,
     app_peak: u64,
@@ -2021,10 +2028,7 @@ fn session_context_window(
     override_window: Option<u64>,
 ) -> u64 {
     match s.provider {
-        Provider::Opencode | Provider::Pi => override_window
-            .or(s.context_window)
-            .filter(|n| *n > 0)
-            .unwrap_or(0),
+        Provider::Opencode | Provider::Pi => s.context_window.filter(|n| *n > 0).unwrap_or(0),
         Provider::Claude | Provider::Codex => {
             context_window_for_session(s, app_peak, default_model, override_window)
         }
@@ -2506,12 +2510,42 @@ mod tests {
             let mut s = session(provider);
             s.peak_context_tokens = 300_000;
             assert_eq!(session_context_window(&s, 300_000, None, None), 0);
-            assert_eq!(session_context_window(&s, 0, None, Some(128_000)), 128_000);
+            assert_eq!(session_context_window(&s, 0, None, Some(128_000)), 0);
             s.context_window = Some(64_000);
-            assert_eq!(session_context_window(&s, 0, None, None), 64_000);
+            assert_eq!(session_context_window(&s, 0, None, Some(128_000)), 64_000);
         }
         let claude = session(Provider::Claude);
         assert_eq!(session_context_window(&claude, 0, None, None), 200_000);
+    }
+
+    #[test]
+    fn a_pi_peak_does_not_widen_claudes_window() {
+        let session = |provider, peak| {
+            let mut s = Session::new(
+                provider,
+                1,
+                "s".to_string(),
+                PathBuf::from("/w"),
+                None,
+                "idle".to_string(),
+                0,
+                0,
+                None,
+            );
+            s.peak_context_tokens = peak;
+            s
+        };
+        let sessions = [
+            session(Provider::Pi, 300_000),
+            session(Provider::Opencode, 400_000),
+            session(Provider::Claude, 180_000),
+        ];
+        let peak = claude_peak_context(&sessions);
+        assert_eq!(peak, 180_000);
+        assert_eq!(
+            session_context_window(&sessions[2], peak, None, None),
+            200_000
+        );
     }
 
     #[test]
