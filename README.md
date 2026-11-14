@@ -13,7 +13,7 @@ Codex CLI:
 - `~/.codex/state_5.sqlite` — native thread titles, agent labels, parent/child thread roots
 
 opencode and pi (pane-level only):
-- a tmux pane whose foreground command, or a child of its shell, is `opencode` or `pi`
+- a tmux pane whose foreground command, own process, or a child or grandchild of it is `opencode` or `pi`; a server or one-shot run (`opencode serve`/`run`/`web`/`acp`, `pi -p`/`--print`/`--mode rpc|json`) is not listed
 - `~/.local/share/opencode/opencode.db` (`session_v2`) and `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl` — session title and busy/idle state, used only when one pane of that harness is in the session's cwd
 
 These rows support listing, preview, jump and `triage send`; they have no cost or context rollups, mailbox, hooks, approve or interrupt.
@@ -97,6 +97,22 @@ agent's terminal may queue the submitted line until its next input slot. The
 message body is pasted through an internal tmux buffer and submitted with a
 separate Enter, so agents can use either one-line text or a file/stdin body
 without caring about the transport.
+
+opencode and pi agents can send too, under a weaker, pane-level sender
+named by provider and pane (`opencode:%30`, `pi:%31`) in the delivered text
+and the audit log. A pi caller must be, or run under, a process named `pi`
+inside exactly one tmux pane. opencode runs tool shells under its shared
+`opencode serve` process, outside the pane, so an opencode caller is taken
+from the `OPENCODE_SESSION_ID` and `TMUX_PANE` its shell inherits, and is
+accepted only when that pane is a tracked opencode pane, the caller sits in
+no tmux pane, it runs under an `opencode` process and under the server pid
+recorded in `~/.local/state/opencode/service.json`, and opencode's database
+places that `ses_…` session in the pane's directory. That proves the caller
+is a tool shell of the running opencode server working in the pane's
+directory, not which opencode pane it belongs to: with two opencode panes in
+one directory either could claim the other. This names the pane, not the
+session. Sends to these agents are pasted; the gate blocks on a visible
+permission prompt but does not inspect their input box.
 
 ### Peer mail
 

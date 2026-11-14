@@ -5,7 +5,7 @@
 //! harness in one cwd cannot be told apart from outside, so both stay
 //! unnamed rather than borrowing the wrong session.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -32,11 +32,28 @@ struct SessionMeta {
     idle_since_ms: Option<u64>,
 }
 
-pub fn discover(panes: &HashMap<u32, Pane>) -> Vec<Session> {
+/// `skip` holds panes already owned by a Claude or Codex session: a harness
+/// one of those agents runs as a tool is not a pane agent.
+pub fn discover(
+    panes: &HashMap<u32, Pane>,
+    ppid_map: &HashMap<u32, u32>,
+    skip: &HashSet<String>,
+) -> Vec<Session> {
+    let children = children_of(ppid_map);
+    let comm = |pid: u32| crate::mailbox::proc_info(pid).ok().map(|info| info.comm);
     let mut by_provider: HashMap<Provider, Vec<&Pane>> = HashMap::new();
-    for pane in panes.values() {
-        if let Some(provider) = provider_for_command(&pane.current_command) {
-            by_provider.entry(provider).or_default().push(pane);
+    let mut started = HashMap::new();
+    for pane in panes.values().filter(|p| !skip.contains(&p.pane_id)) {
+        let Some((provider, harness)) = pane_provider(pane, &children, &comm) else {
+            continue;
+        };
+        let run = harness.map(|pid| harness_run(provider, pid));
+        if run.as_ref().is_some_and(|run| !run.interactive) {
+            continue;
+        }
+        by_provider.entry(provider).or_default().push(pane);
+        if let Some(ms) = run.and_then(|run| run.started_ms) {
+            started.insert(pane.pane_id.clone(), ms);
         }
     }
     let mut out = Vec::new();
@@ -46,9 +63,89 @@ pub fn discover(panes: &HashMap<u32, Pane>) -> Vec<Session> {
             Provider::Pi => pi_metas(&pi_agent_dir(), &panes),
             Provider::Claude | Provider::Codex => continue,
         };
-        out.extend(sessions_for_panes(provider, &panes, &metas));
+        out.extend(sessions_for_panes(provider, &panes, &metas, &started));
     }
     out
+}
+
+#[derive(Debug, PartialEq)]
+struct HarnessRun {
+    started_ms: Option<u64>,
+    /// False for a server or one-shot run (`opencode serve`, `pi -p`): no
+    /// one reads its pane, so it is not listed or sent to.
+    interactive: bool,
+}
+
+/// One `ps` per harness pane: start time from elapsed time (portable across
+/// Linux and macOS, unlike the kernels' own start fields) and arguments.
+fn harness_run(provider: Provider, pid: u32) -> HarnessRun {
+    let out = Command::new("ps")
+        .args(["-o", "etime=,args=", "-p", &pid.to_string()])
+        .output()
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .unwrap_or_default();
+    parse_harness_run(provider, &out, time_to_ms(SystemTime::now()))
+}
+
+fn parse_harness_run(provider: Provider, ps_out: &str, now_ms: u64) -> HarnessRun {
+    let line = ps_out.trim();
+    let (etime, args) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let started_ms = crate::agent_comm::elapsed_seconds(etime)
+        .and_then(|elapsed| now_ms.checked_sub(elapsed * 1000));
+    let args: Vec<&str> = args.split_whitespace().skip(1).collect();
+    let interactive = match provider {
+        Provider::Opencode => !args
+            .iter()
+            .find(|a| !a.starts_with('-'))
+            .is_some_and(|sub| matches!(*sub, "serve" | "run" | "web" | "acp")),
+        Provider::Pi => !args.iter().enumerate().any(|(i, a)| {
+            matches!(*a, "-p" | "--print" | "--mode=rpc" | "--mode=json")
+                || (*a == "--mode"
+                    && args
+                        .get(i + 1)
+                        .is_some_and(|m| matches!(*m, "rpc" | "json")))
+        }),
+        Provider::Claude | Provider::Codex => true,
+    };
+    HarnessRun {
+        started_ms,
+        interactive,
+    }
+}
+
+fn children_of(ppid_map: &HashMap<u32, u32>) -> HashMap<u32, Vec<u32>> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&pid, &ppid) in ppid_map {
+        children.entry(ppid).or_default().push(pid);
+    }
+    children
+}
+
+/// The pane's foreground command names the harness when it was started from
+/// an interactive shell. Launched as `tmux new-window opencode`, the shell
+/// runs it without job control and tmux reports the shell instead, so also
+/// look at the pane's children and grandchildren. A shell that execs the
+/// harness makes it the pane's own process.
+/// Returns the harness and, when found, its process id.
+fn pane_provider(
+    pane: &Pane,
+    children: &HashMap<u32, Vec<u32>>,
+    comm: &dyn Fn(u32) -> Option<String>,
+) -> Option<(Provider, Option<u32>)> {
+    let kids = children.get(&pane.pid).into_iter().flatten();
+    let grandkids = kids
+        .clone()
+        .flat_map(|kid| children.get(kid).into_iter().flatten());
+    let harness = std::iter::once(&pane.pid)
+        .chain(kids)
+        .chain(grandkids)
+        .find_map(|&pid| Some((provider_for_command(&comm(pid)?)?, pid)));
+    match (provider_for_command(&pane.current_command), harness) {
+        (Some(provider), Some((found, pid))) if found == provider => Some((provider, Some(pid))),
+        (Some(provider), _) => Some((provider, None)),
+        (None, Some((provider, pid))) => Some((provider, Some(pid))),
+        (None, None) => None,
+    }
 }
 
 fn provider_for_command(command: &str) -> Option<Provider> {
@@ -59,7 +156,19 @@ fn provider_for_command(command: &str) -> Option<Provider> {
     }
 }
 
-fn sessions_for_panes(provider: Provider, panes: &[&Pane], metas: &[SessionMeta]) -> Vec<Session> {
+/// Slack for clock and `ps` rounding when comparing a session's last write
+/// against its harness's start.
+const START_SLACK_MS: u64 = 2_000;
+
+/// `started` maps a pane to its harness's start time. A session last written
+/// before the harness started belongs to an earlier run in the same cwd, so
+/// such a pane shows as a fresh, idle session rather than inheriting it.
+fn sessions_for_panes(
+    provider: Provider,
+    panes: &[&Pane],
+    metas: &[SessionMeta],
+    started: &HashMap<String, u64>,
+) -> Vec<Session> {
     let mut panes_per_cwd: HashMap<&Path, usize> = HashMap::new();
     for pane in panes {
         *panes_per_cwd.entry(pane.cwd.as_path()).or_default() += 1;
@@ -67,19 +176,43 @@ fn sessions_for_panes(provider: Provider, panes: &[&Pane], metas: &[SessionMeta]
     panes
         .iter()
         .map(|pane| {
-            let meta = (panes_per_cwd[pane.cwd.as_path()] == 1)
-                .then(|| latest_in(metas, &pane.cwd))
-                .flatten();
-            pane_session(provider, pane, meta)
+            if panes_per_cwd[pane.cwd.as_path()] != 1 {
+                return pane_session(provider, pane, None);
+            }
+            let since = started.get(&pane.pane_id).copied();
+            match (latest_in(metas, &pane.cwd, since), since) {
+                (Some(meta), _) => pane_session(provider, pane, Some(meta)),
+                (None, Some(_)) => pane_session(provider, pane, Some(&fresh_meta(pane))),
+                (None, None) => pane_session(provider, pane, None),
+            }
         })
         .collect()
 }
 
-fn latest_in<'a>(metas: &'a [SessionMeta], cwd: &Path) -> Option<&'a SessionMeta> {
+fn latest_in<'a>(
+    metas: &'a [SessionMeta],
+    cwd: &Path,
+    since_ms: Option<u64>,
+) -> Option<&'a SessionMeta> {
     metas
         .iter()
         .filter(|m| m.cwd == cwd)
+        .filter(|m| since_ms.is_none_or(|since| m.updated_ms + START_SLACK_MS >= since))
         .max_by_key(|m| m.updated_ms)
+}
+
+/// A harness that has not written its session yet: idle, no history.
+fn fresh_meta(pane: &Pane) -> SessionMeta {
+    SessionMeta {
+        id: pane.pane_id.clone(),
+        cwd: pane.cwd.clone(),
+        name: None,
+        topic: None,
+        busy: Some(false),
+        created_ms: 0,
+        updated_ms: 0,
+        idle_since_ms: None,
+    }
 }
 
 fn pane_session(provider: Provider, pane: &Pane, meta: Option<&SessionMeta>) -> Session {
@@ -147,6 +280,35 @@ fn opencode_metas(db: &Path) -> Vec<SessionMeta> {
         return Vec::new();
     }
     parse_opencode_rows(&out.stdout)
+}
+
+/// The pid of the shared opencode server, which runs every opencode tool
+/// shell, from the `service.json` it writes on start.
+pub fn opencode_server_pid() -> Option<u32> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home().join(".local/state"));
+    let text = fs::read_to_string(state.join("opencode/service.json")).ok()?;
+    let service: Value = serde_json::from_str(&text).ok()?;
+    service.get("pid")?.as_u64()?.try_into().ok()
+}
+
+/// The directory of one opencode session, for checking a caller's
+/// `OPENCODE_SESSION_ID` against the pane it claims.
+pub fn opencode_session_dir(id: &str) -> Option<PathBuf> {
+    if id.is_empty() || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return None;
+    }
+    let db = opencode_db_path();
+    let query = format!("select directory from session_v2 where id = '{id}'");
+    let out = Command::new("sqlite3")
+        .args(["-readonly", "-json", &db.to_string_lossy(), &query])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let rows: Vec<Value> = serde_json::from_slice(&out.stdout).ok()?;
+    rows.first()?.get("directory")?.as_str().map(PathBuf::from)
 }
 
 #[derive(Deserialize)]
@@ -357,6 +519,78 @@ mod tests {
     }
 
     #[test]
+    fn finds_a_harness_the_shell_runs_without_job_control() {
+        let children = children_of(&HashMap::from([(20, 10), (30, 20), (40, 11)]));
+        let comm = |pid: u32| {
+            let name = match pid {
+                20 => "sh",
+                30 => "opencode",
+                40 => "pi",
+                _ => "other",
+            };
+            Some(name.to_string())
+        };
+        let grandchild = pane(10, "%1", "/w", "fish");
+        assert_eq!(
+            pane_provider(&grandchild, &children, &comm),
+            Some((Provider::Opencode, Some(30)))
+        );
+        let child = pane(11, "%2", "/w", "fish");
+        assert_eq!(
+            pane_provider(&child, &children, &comm),
+            Some((Provider::Pi, Some(40)))
+        );
+        let foreground = pane(11, "%4", "/w", "pi");
+        assert_eq!(
+            pane_provider(&foreground, &children, &comm),
+            Some((Provider::Pi, Some(40)))
+        );
+        let plain = pane(12, "%3", "/w", "fish");
+        assert_eq!(pane_provider(&plain, &children, &comm), None);
+    }
+
+    #[test]
+    fn finds_a_harness_that_is_the_pane_process() {
+        let comm = |pid: u32| (pid == 13).then(|| "pi".to_string());
+        let exec = pane(13, "%5", "/w", "pi");
+        assert_eq!(
+            pane_provider(&exec, &HashMap::new(), &comm),
+            Some((Provider::Pi, Some(13)))
+        );
+    }
+
+    #[test]
+    fn server_and_one_shot_harness_runs_are_not_interactive() {
+        let interactive = |provider, out| parse_harness_run(provider, out, 100_000).interactive;
+        for out in [
+            "01:02 opencode serve --port 4096",
+            "01:02 /usr/bin/opencode run fix it",
+            "01:02 opencode --print-logs web",
+        ] {
+            assert!(!interactive(Provider::Opencode, out), "{out}");
+        }
+        for out in ["01:02 opencode", "01:02 opencode -c", "01:02 opencode /w/a"] {
+            assert!(interactive(Provider::Opencode, out), "{out}");
+        }
+        for out in [
+            "01:02 pi -p hello",
+            "01:02 pi --print hello",
+            "01:02 pi --mode rpc",
+            "01:02 pi --mode=json",
+        ] {
+            assert!(!interactive(Provider::Pi, out), "{out}");
+        }
+        for out in ["01:02 pi", "01:02 pi --mode text", "01:02 pi --continue"] {
+            assert!(interactive(Provider::Pi, out), "{out}");
+        }
+        assert_eq!(
+            parse_harness_run(Provider::Pi, "  01:02 pi\n", 100_000).started_ms,
+            Some(38_000)
+        );
+        assert!(interactive(Provider::Pi, ""));
+    }
+
+    #[test]
     fn parses_opencode_session_rows() {
         let json = br#"[
             {"id":"ses_busy","directory":"/w/a","title":"Fix parser","parent_id":null,
@@ -423,7 +657,12 @@ mod tests {
             meta("ses_new", "/w/a", 9),
             meta("ses_b", "/w/b", 9),
         ];
-        let sessions = sessions_for_panes(Provider::Opencode, &[&solo, &twin_a, &twin_b], &metas);
+        let sessions = sessions_for_panes(
+            Provider::Opencode,
+            &[&solo, &twin_a, &twin_b],
+            &metas,
+            &HashMap::new(),
+        );
 
         let solo = sessions.iter().find(|s| s.pid == 10).unwrap();
         assert_eq!(solo.session_id, "ses_new");
@@ -440,5 +679,25 @@ mod tests {
             assert_eq!(twin.headline, None);
             assert_eq!(twin.status, "unknown");
         }
+    }
+
+    #[test]
+    fn a_session_from_an_earlier_run_does_not_describe_a_new_harness() {
+        let pane = pane(10, "%48", "/w/a", "pi");
+        let metas = vec![meta("old", "/w/a", 1_000_000)];
+
+        let restarted = HashMap::from([("%48".to_string(), 2_000_000)]);
+        let fresh = &sessions_for_panes(Provider::Pi, &[&pane], &metas, &restarted)[0];
+        assert_eq!(fresh.session_id, "%48");
+        assert_eq!(fresh.status, "idle");
+        assert_eq!(fresh.headline, None);
+        assert_eq!(
+            crate::classifier::classify(fresh, SystemTime::now()),
+            crate::models::AttentionState::Fresh
+        );
+
+        let earlier = HashMap::from([("%48".to_string(), 999_000)]);
+        let current = &sessions_for_panes(Provider::Pi, &[&pane], &metas, &earlier)[0];
+        assert_eq!(current.session_id, "old");
     }
 }
