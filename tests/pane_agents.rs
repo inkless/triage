@@ -619,6 +619,10 @@ fn fake_opencode_server(
                 authorization,
                 body,
             });
+            if status == STALL {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                continue;
+            }
             write!(stream, "HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n").unwrap();
             if sent.is_err() {
                 break;
@@ -681,6 +685,35 @@ fn a_server_without_synthetic_input_gets_a_queued_prompt() {
         ]
     );
     assert_eq!(mail(&fx, "ses_oc", "delivered").len(), 1);
+}
+
+/// A `status_for` answer: read the request, then never reply.
+const STALL: u16 = 0;
+
+#[test]
+fn a_server_that_takes_the_request_but_never_answers_gets_no_paste() {
+    let fx = Fixture::new("ocstall", PI_CALLER_AND_OC_TARGET);
+    let requests = fake_opencode_server(&fx, |_| STALL);
+    let output = fx
+        .command(&["send", "--to", "%30", "--message", "maybe twice"])
+        .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+        .env("PI_SESSION_ID", PI_SESSION)
+        .env("PI_SESSION_FILE", "/unused")
+        .env("TRIAGE_TEST_HTTP_TIMEOUT_MS", "300")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("did not answer"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(requests.try_iter().count(), 1);
+    assert!(!fx.dir.join("pasted").exists());
+    let recorded = mail(&fx, "ses_oc", "delivered");
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0]["delivered_via"], "opencode-server-unconfirmed");
+    assert_eq!(audit(&fx)[0]["verdict"], "sent-unconfirmed");
 }
 
 #[test]

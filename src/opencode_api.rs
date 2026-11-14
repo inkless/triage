@@ -13,6 +13,40 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_RESPONSE_BYTES: u64 = 1024 * 1024;
 
+/// Why a message may not have reached the session.
+#[derive(Debug)]
+pub enum Failure {
+    /// The server never got it, or answered that it did not take it.
+    NotDelivered(io::Error),
+    /// The request went out but no answer came back: it may have been taken.
+    Unconfirmed(io::Error),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::NotDelivered(e) | Failure::Unconfirmed(e) => e.fmt(f),
+        }
+    }
+}
+
+impl From<io::Error> for Failure {
+    fn from(e: io::Error) -> Self {
+        Failure::NotDelivered(e)
+    }
+}
+
+fn io_timeout() -> Duration {
+    if cfg!(debug_assertions)
+        && let Some(ms) = std::env::var("TRIAGE_TEST_HTTP_TIMEOUT_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    {
+        return Duration::from_millis(ms);
+    }
+    IO_TIMEOUT
+}
+
 #[derive(Deserialize)]
 struct ServiceFile {
     url: String,
@@ -60,12 +94,12 @@ fn load_service() -> io::Result<Service> {
 /// Adds `text` to the session as a synthetic (non-user) message, queued
 /// behind any running turn, and lets the server start a turn when idle.
 /// A server that rejects synthetic input gets it as a queued prompt.
-pub fn post_message(session: &str, text: &str) -> io::Result<()> {
+pub fn post_message(session: &str, text: &str) -> Result<(), Failure> {
     if !crate::mailbox::is_opencode_session(session) {
-        return Err(io::Error::new(
+        return Err(Failure::NotDelivered(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("invalid opencode session id {session:?}"),
-        ));
+        )));
     }
     let service = load_service()?;
     let synthetic = serde_json::json!({
@@ -82,14 +116,14 @@ pub fn post_message(session: &str, text: &str) -> io::Result<()> {
         return Ok(());
     }
     if !matches!(status, 400 | 404 | 405 | 422) {
-        return Err(io::Error::other(format!("server answered {status}")));
+        return Err(io::Error::other(format!("server answered {status}")).into());
     }
     let prompt = serde_json::json!({ "text": text, "delivery": "queue" });
     let status = post(&service, &format!("/api/session/{session}/prompt"), &prompt)?;
     if is_success(status) {
         Ok(())
     } else {
-        Err(io::Error::other(format!("server answered {status}")))
+        Err(io::Error::other(format!("server answered {status}")).into())
     }
 }
 
@@ -97,7 +131,7 @@ fn is_success(status: u16) -> bool {
     (200..300).contains(&status)
 }
 
-fn post(service: &Service, path: &str, body: &serde_json::Value) -> io::Result<u16> {
+fn post(service: &Service, path: &str, body: &serde_json::Value) -> Result<u16, Failure> {
     let body = body.to_string();
     let auth = base64(format!("opencode:{}", service.password).as_bytes());
     let request = format!(
@@ -108,19 +142,22 @@ fn post(service: &Service, path: &str, body: &serde_json::Value) -> io::Result<u
         len = body.len(),
     );
     let mut stream = TcpStream::connect_timeout(&service.addr, CONNECT_TIMEOUT)?;
-    stream.set_read_timeout(Some(IO_TIMEOUT))?;
-    stream.set_write_timeout(Some(IO_TIMEOUT))?;
-    stream.write_all(request.as_bytes())?;
-    let mut response = Vec::new();
+    stream.set_read_timeout(Some(io_timeout()))?;
+    stream.set_write_timeout(Some(io_timeout()))?;
+    // A request cut off part way may still have been taken.
     stream
-        .take(MAX_RESPONSE_BYTES)
-        .read_to_end(&mut response)
-        .or_else(|e| {
-            // A server that answers and then holds the connection open still
-            // answered.
-            if response.is_empty() { Err(e) } else { Ok(0) }
-        })?;
-    parse_status(&response).ok_or_else(|| io::Error::other("server sent no HTTP status line"))
+        .write_all(request.as_bytes())
+        .map_err(Failure::Unconfirmed)?;
+    let mut response = Vec::new();
+    let read = stream.take(MAX_RESPONSE_BYTES).read_to_end(&mut response);
+    // A server that answers and then holds the connection open still
+    // answered.
+    match parse_status(&response) {
+        Some(status) => Ok(status),
+        None => Err(Failure::Unconfirmed(read.err().unwrap_or_else(|| {
+            io::Error::other("server sent no HTTP status line")
+        }))),
+    }
 }
 
 fn parse_status(response: &[u8]) -> Option<u16> {

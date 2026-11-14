@@ -823,19 +823,33 @@ fn run_send(args: &[String]) -> Result<String, CliError> {
                         "dry-run: would deliver from {sender} to {label} (agent {short}) through the opencode server"
                     ));
                 }
+                let sent = |verdict: &str| {
+                    let entry =
+                        AuditEntry::new(&sender, selector, target, verdict, None, Some(&body))
+                            .with_from_session(from_session);
+                    if let Err(e) = append_message_audit(&entry) {
+                        eprintln!("warning: failed to append agent-message audit: {e}");
+                    }
+                };
                 match deliver_through_opencode(&store, &msg) {
                     Ok(()) => {
-                        let entry = AuditEntry::sent(&sender, selector, target, &body)
-                            .with_from_session(from_session);
-                        if let Err(e) = append_message_audit(&entry) {
-                            eprintln!("warning: failed to append agent-message audit: {e}");
-                        }
+                        sent("sent");
                         return Ok(format!(
                             "delivered to {label} (agent {short}) through the opencode server id={}",
                             msg.id
                         ));
                     }
-                    Err(e) => eprintln!(
+                    Err(crate::opencode_api::Failure::Unconfirmed(e)) => {
+                        sent("sent-unconfirmed");
+                        eprintln!(
+                            "warning: the opencode server got the message but did not answer ({e}); not pasting it, so it can't arrive twice"
+                        );
+                        return Ok(format!(
+                            "sent to {label} (agent {short}) through the opencode server, unconfirmed id={}",
+                            msg.id
+                        ));
+                    }
+                    Err(crate::opencode_api::Failure::NotDelivered(e)) => eprintln!(
                         "warning: the opencode server did not take the message ({e}); pasting it instead"
                     ),
                 }
@@ -889,8 +903,12 @@ fn reconcile_quietly(store: &Store) {
 }
 
 /// Hands the message to the opencode server in the same rendering hook
-/// delivery uses, and records it delivered once the server accepted it.
-fn deliver_through_opencode(store: &Store, msg: &Message) -> io::Result<()> {
+/// delivery uses, and records it delivered once the server accepted it, or
+/// as unconfirmed when it may have.
+fn deliver_through_opencode(
+    store: &Store,
+    msg: &Message,
+) -> Result<(), crate::opencode_api::Failure> {
     let item = RenderItem {
         msg,
         nonce: None,
@@ -898,13 +916,21 @@ fn deliver_through_opencode(store: &Store, msg: &Message) -> io::Result<()> {
         reader_is_claude: false,
     };
     let (text, _) = mailbox::render_batch(&[item], usize::MAX);
-    crate::opencode_api::post_message(&msg.to.session_at_send, &text)?;
-    if let Err(e) = store.mailbox(&msg.to.agent).and_then(|mailbox| {
-        mailbox.record_delivered(msg, DeliveredVia::OpencodeServer, mailbox::now_ms())
-    }) {
-        eprintln!("warning: delivered, but failed to record the message in the mailbox: {e}");
+    let result = crate::opencode_api::post_message(&msg.to.session_at_send, &text);
+    let via = match &result {
+        Ok(()) => DeliveredVia::OpencodeServer,
+        Err(crate::opencode_api::Failure::Unconfirmed(_)) => {
+            DeliveredVia::OpencodeServerUnconfirmed
+        }
+        Err(crate::opencode_api::Failure::NotDelivered(_)) => return result,
+    };
+    if let Err(e) = store
+        .mailbox(&msg.to.agent)
+        .and_then(|mailbox| mailbox.record_delivered(msg, via, mailbox::now_ms()))
+    {
+        eprintln!("warning: failed to record the message in the mailbox: {e}");
     }
-    Ok(())
+    result
 }
 
 /// A target takes mailbox delivery only while its host process is alive and

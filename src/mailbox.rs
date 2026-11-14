@@ -202,6 +202,8 @@ pub enum DeliveredVia {
     CodexPostToolUse,
     LegacyPaste,
     OpencodeServer,
+    /// Sent to the opencode server, which never answered.
+    OpencodeServerUnconfirmed,
     PiExtension,
     Inbox,
     InboxShow,
