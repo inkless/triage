@@ -1466,6 +1466,7 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
         // needs the pane target; we capture both and let the worker pick.
         let uuid = payload.pending.as_ref().map(|a| a.uuid.clone());
         let pane_target = s.pane.as_ref().map(|p| p.target.clone());
+        let pane_id = s.pane.as_ref().map(|p| p.pane_id.clone());
         let provider = s.provider;
         let approval_mode = app.approval_mode;
         let tx = app.audit_tx.clone();
@@ -1519,9 +1520,20 @@ fn drive_autonomous(app: &mut ui::AppState, sessions: &[models::Session]) {
                 v.decision = "WAIT".to_string();
                 v.reason = format!("auditor {audited_decision} but routing failed: {e}");
             }
+            // A hook denial carries its reason in the block message. Every other
+            // denial is an Escape, which the agent reads as its user rejecting
+            // the call, so say who really denied it and why.
+            let hook_denied =
+                approval_mode == models::ApprovalMode::Hook && payload.pending.is_some();
+            let denial_notice = (v.decision == "DENY" && !hook_denied)
+                .then(|| pane_id.map(|id| (id, v.tool_name.clone(), v.reason.clone())))
+                .flatten();
             let _ = tx.send(v);
             if let Some(uuid) = uuid {
                 approval::remove_claim(&uuid);
+            }
+            if let Some((id, tool, reason)) = denial_notice {
+                let _ = agent_comm::send_auditor_denial(&id, &tool, &reason);
             }
         });
     }

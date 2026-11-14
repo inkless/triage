@@ -1209,6 +1209,50 @@ pub fn send_user_reply(selector: &str, body: &str) -> Result<String, String> {
     deliver_message(selector, "user", &body, false).map_err(|e| e.message)
 }
 
+/// What the agent is told when the auto-mode auditor denies its tool call.
+/// The denial is delivered by pressing Escape, which Claude Code records as
+/// "the user rejected this tool use ... wait for the user", so without this
+/// the agent stops for a human who never acted and nobody learns why.
+fn auditor_denial_text(tool_name: &str, reason: &str) -> String {
+    let reason = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+    // The pane-scrape path often cannot name the tool ("?").
+    let call = match tool_name {
+        "" | "?" => "tool call".to_string(),
+        name => format!("{name} call"),
+    };
+    format!(
+        "triage's auto-mode auditor, not your user, denied your {call}: {}. \
+         The \"user rejected\" message was this denial, so no human is waiting on you. \
+         Rewrite the action so it can be reviewed (plain, one step, no obfuscation), \
+         or ask your lead or user before retrying.",
+        truncate_chars(&reason, 400)
+    )
+}
+
+const DENIAL_NOTICE_ATTEMPTS: u32 = 20;
+const DENIAL_NOTICE_RETRY: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Tell the agent in `pane_id` that the auditor denied its call, through the
+/// same guarded paste as `triage send`. The agent only becomes receivable once
+/// the interrupted tool call settles, so a gate refusal is retried briefly;
+/// anything else, or a gate still closed after that (a human typing a draft),
+/// is left to the message audit log.
+pub fn send_auditor_denial(pane_id: &str, tool_name: &str, reason: &str) -> Result<String, String> {
+    let message = format_message("triage auditor", &auditor_denial_text(tool_name, reason));
+    let mut last = String::new();
+    for attempt in 0..DENIAL_NOTICE_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(DENIAL_NOTICE_RETRY);
+        }
+        match deliver_message(pane_id, "triage auditor", &message, false) {
+            Ok(done) => return Ok(done),
+            Err(e) if e.code == 3 => last = e.message,
+            Err(e) => return Err(e.message),
+        }
+    }
+    Err(last)
+}
+
 fn format_user_reply(body: &str) -> Result<String, CliError> {
     let body = validate_body(body)?;
     if body.contains('\n') {
@@ -2267,5 +2311,16 @@ mod tests {
         ] {
             assert_eq!(parse_approve_args(&args(bad)).err().unwrap().code, 2);
         }
+    }
+
+    #[test]
+    fn auditor_denial_says_it_was_not_the_user_and_carries_the_reason() {
+        let text = auditor_denial_text("Bash", "obfuscated\nshell   code");
+        assert!(text.contains("not your user"));
+        assert!(text.contains("denied your Bash call: obfuscated shell code."));
+        assert!(!text.contains('\n'));
+        assert!(auditor_denial_text("?", "r").contains("denied your tool call: r."));
+        let long = auditor_denial_text("Bash", &"x".repeat(2000));
+        assert!(long.chars().count() < 800);
     }
 }
