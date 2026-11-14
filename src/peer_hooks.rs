@@ -327,8 +327,10 @@ fn wait_for_mail(
     std::fs::DirBuilder::new()
         .recursive(true)
         .create(&pending_dir)?;
-    let mut watcher = notify::recommended_watcher(move |_| {
-        let _ = tx.send(());
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if res.as_ref().is_ok_and(crate::watcher::is_change) {
+            let _ = tx.send(());
+        }
     })
     .map_err(io::Error::other)?;
     watcher
