@@ -43,10 +43,30 @@ pub fn discover(
 ) -> Vec<Session> {
     let children = children_of(ppid_map);
     let comm = |pid: u32| crate::mailbox::proc_info(pid).ok().map(|info| info.comm);
+    let sandboxed = if panes
+        .values()
+        .any(|pane| pane_runs_container(pane, &children, &comm))
+    {
+        sandbox_agents(panes)
+    } else {
+        HashMap::new()
+    };
     let mut by_provider: HashMap<Provider, Vec<&Pane>> = HashMap::new();
+    let mut agent_dirs: HashMap<String, PathBuf> = HashMap::new();
     let mut started = HashMap::new();
     for pane in panes.values().filter(|p| !skip.contains(&p.pane_id)) {
-        let Some((provider, harness)) = pane_provider(pane, &children, &comm) else {
+        let detected = pane_provider(pane, &children, &comm)
+            .map(|(provider, harness)| (provider, harness, None))
+            .or_else(|| {
+                sandboxed.get(&pane.pane_id).map(|agent| {
+                    (
+                        agent.provider,
+                        Some(agent.pid),
+                        Some(agent.agent_dir.clone()),
+                    )
+                })
+            });
+        let Some((provider, harness, agent_dir)) = detected else {
             continue;
         };
         let run = harness.map(|pid| harness_run(provider, pid));
@@ -54,20 +74,122 @@ pub fn discover(
             continue;
         }
         by_provider.entry(provider).or_default().push(pane);
+        if let Some(dir) = agent_dir {
+            agent_dirs.insert(pane.pane_id.clone(), dir);
+        }
         if let Some(ms) = run.and_then(|run| run.started_ms) {
             started.insert(pane.pane_id.clone(), ms);
         }
     }
     let mut out = Vec::new();
     for (provider, panes) in by_provider {
-        let metas = match provider {
-            Provider::Opencode => opencode_metas(&opencode_db_path()),
-            Provider::Pi => pi_metas(&pi_agent_dir(), &panes),
-            Provider::Claude | Provider::Codex => continue,
-        };
-        out.extend(sessions_for_panes(provider, &panes, &metas, &started));
+        match provider {
+            Provider::Opencode => {
+                let metas = opencode_metas(&opencode_db_path());
+                out.extend(sessions_for_panes(provider, &panes, &metas, &started));
+            }
+            Provider::Pi => {
+                let mut by_dir: HashMap<PathBuf, Vec<&Pane>> = HashMap::new();
+                for pane in panes {
+                    let dir = agent_dirs
+                        .get(&pane.pane_id)
+                        .cloned()
+                        .unwrap_or_else(pi_agent_dir);
+                    by_dir.entry(dir).or_default().push(pane);
+                }
+                for (dir, group) in by_dir {
+                    let metas = pi_metas(&dir, &group);
+                    out.extend(sessions_for_panes(Provider::Pi, &group, &metas, &started));
+                }
+            }
+            Provider::Claude | Provider::Codex => {}
+        }
     }
     out
+}
+
+/// A harness inside a sandbox container, joined to its pane by labels the
+/// sandbox wrapper sets on the container.
+#[derive(Debug)]
+struct SandboxAgent {
+    provider: Provider,
+    pid: u32,
+    agent_dir: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct SandboxContainer {
+    #[serde(rename = "Pid")]
+    pid: u32,
+    #[serde(default, rename = "Labels")]
+    labels: HashMap<String, String>,
+}
+
+fn is_container_runtime(command: &str) -> bool {
+    matches!(command, "podman" | "docker" | "nerdctl")
+}
+
+/// The pane's foreground command is usually the runtime, but a shell that runs
+/// the wrapper without job control leaves the shell as the pane command and
+/// the runtime one level down.
+fn pane_runs_container(
+    pane: &Pane,
+    children: &HashMap<u32, Vec<u32>>,
+    comm: &dyn Fn(u32) -> Option<String>,
+) -> bool {
+    if is_container_runtime(&pane.current_command) {
+        return true;
+    }
+    let kids = children.get(&pane.pid).into_iter().flatten();
+    let grandkids = kids
+        .clone()
+        .flat_map(|kid| children.get(kid).into_iter().flatten());
+    std::iter::once(&pane.pid)
+        .chain(kids)
+        .chain(grandkids)
+        .any(|&pid| comm(pid).is_some_and(|name| is_container_runtime(&name)))
+}
+
+/// Rootless podman reparents `conmon` to init, so the container's harness is
+/// never in the pane's process tree. A sandbox that labels its container with
+/// the pane id and its state directory is the only thing that joins the two.
+fn sandbox_agents(panes: &HashMap<u32, Pane>) -> HashMap<String, SandboxAgent> {
+    let Ok(out) = Command::new("podman")
+        .args(["ps", "--filter", "label=triage.harness", "--format", "json"])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    if !out.status.success() {
+        return HashMap::new();
+    }
+    let pane_ids: HashSet<&str> = panes.values().map(|pane| pane.pane_id.as_str()).collect();
+    parse_sandbox_agents(&out.stdout, &pane_ids)
+}
+
+fn parse_sandbox_agents(json: &[u8], panes: &HashSet<&str>) -> HashMap<String, SandboxAgent> {
+    let rows: Vec<SandboxContainer> = serde_json::from_slice(json).unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|row| {
+            let pane_id = row.labels.get("triage.pane")?;
+            if !panes.contains(pane_id.as_str()) {
+                return None;
+            }
+            let provider = match row.labels.get("triage.harness").map(String::as_str) {
+                Some("pi") => Provider::Pi,
+                _ => return None,
+            };
+            let agent_dir = PathBuf::from(row.labels.get("triage.agent_dir")?);
+            Some((
+                pane_id.clone(),
+                SandboxAgent {
+                    provider,
+                    pid: row.pid,
+                    agent_dir,
+                },
+            ))
+        })
+        .collect()
 }
 
 #[derive(Debug, PartialEq)]
@@ -559,6 +681,40 @@ mod tests {
         for other in ["fish", "node", "claude", "codex", "2.1.139", "pip"] {
             assert_eq!(provider_for_command(other), None, "{other}");
         }
+    }
+
+    #[test]
+    fn a_container_runtime_is_detected_under_the_pane_shell() {
+        let children = children_of(&HashMap::from([(20, 10), (30, 20)]));
+        let comm = |pid: u32| match pid {
+            20 => Some("fish".to_string()),
+            30 => Some("podman".to_string()),
+            _ => None,
+        };
+        let shell = pane(10, "%1", "/w", "fish");
+        assert!(pane_runs_container(&shell, &children, &comm));
+        let foreground = pane(10, "%1", "/w", "podman");
+        assert!(pane_runs_container(&foreground, &HashMap::new(), &|_| None));
+        let plain = pane(11, "%2", "/w", "fish");
+        assert!(!pane_runs_container(&plain, &HashMap::new(), &|_| None));
+    }
+
+    #[test]
+    fn parses_only_labeled_containers_for_known_panes() {
+        let json = br#"[
+            {"Pid":42,"Labels":{"triage.harness":"pi","triage.pane":"%23","triage.agent_dir":"/s"}},
+            {"Pid":43,"Labels":{"triage.harness":"pi","triage.pane":"%99","triage.agent_dir":"/s"}},
+            {"Pid":44,"Labels":{"triage.harness":"claude","triage.pane":"%23","triage.agent_dir":"/s"}},
+            {"Pid":45,"Labels":{"triage.harness":"pi","triage.pane":"%23"}}
+        ]"#;
+        let panes: HashSet<&str> = ["%23"].into_iter().collect();
+        let agents = parse_sandbox_agents(json, &panes);
+        assert_eq!(agents.len(), 1);
+        let agent = &agents["%23"];
+        assert_eq!(agent.provider, Provider::Pi);
+        assert_eq!(agent.pid, 42);
+        assert_eq!(agent.agent_dir, PathBuf::from("/s"));
+        assert!(parse_sandbox_agents(b"not json", &panes).is_empty());
     }
 
     #[test]

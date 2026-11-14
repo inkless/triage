@@ -66,6 +66,14 @@ case "$*" in
 esac
 "#,
             ),
+            (
+                "podman",
+                r#"
+case "$*" in
+*ps*) printf '%s\n' '[{"Pid":777001,"Labels":{"triage.harness":"pi","triage.pane":"%23","triage.agent_dir":"'"$HOME"'/.pi/agent"}}]' ;;
+esac
+"#,
+            ),
             ("lsof", ""),
         ] {
             let path = dir.join(name);
@@ -198,6 +206,21 @@ fn a_session_name_beats_a_tmux_window_name() {
         r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|scratch-window'"#,
     );
     assert_eq!(row(&fx.agents(), "%30")["name"], "Fix the parser");
+}
+
+#[test]
+fn a_labeled_sandbox_container_lists_its_pi_session() {
+    let fx = Fixture::new(
+        "sandbox",
+        r#"  echo 'pi-sandbox|1.0|502|/dev/null|podman|/work/pi|1|%23|pi-sandbox'"#,
+    );
+    let rows = fx.agents();
+    let pi = row(&rows, "%23");
+    assert_eq!(pi["provider"], "pi");
+    assert_eq!(pi["name"], "pi-worker");
+    assert_eq!(pi["headline"], "please fix pi");
+    assert_eq!(pi["session_id"], "01a1-pi");
+    assert_eq!(pi["pane_id"], "%23");
 }
 
 #[test]
