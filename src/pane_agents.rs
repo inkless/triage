@@ -241,6 +241,18 @@ fn opencode_metas(db: &Path) -> Vec<SessionMeta> {
     parse_opencode_rows(&out.stdout)
 }
 
+/// The pid of the shared opencode server, which runs every opencode tool
+/// shell, from the `service.json` it writes on start.
+pub fn opencode_server_pid() -> Option<u32> {
+    let state = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home().join(".local/state"));
+    let text = fs::read_to_string(state.join("opencode/service.json")).ok()?;
+    let service: Value = serde_json::from_str(&text).ok()?;
+    service.get("pid")?.as_u64()?.try_into().ok()
+}
+
 /// The directory of one opencode session, for checking a caller's
 /// `OPENCODE_SESSION_ID` against the pane it claims.
 pub fn opencode_session_dir(id: &str) -> Option<PathBuf> {

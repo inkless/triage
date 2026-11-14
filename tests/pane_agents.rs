@@ -50,6 +50,7 @@ esac
                 "sqlite3",
                 r#"
 case "$*" in
+*"where id = 'ses_oc'"*) printf '[{"directory":"/work/oc"}]' ;;
 *"where id ="*) printf '[{"directory":"/work/other"}]' ;;
 *session_v2*) printf '[{"id":"ses_oc","directory":"/work/oc","title":"Fix the parser","time_created":1,"time_updated":2000000000000,"time_busy":10,"time_idle":20}]' ;;
 esac
@@ -303,6 +304,14 @@ fn an_opencode_tool_shell_sends_as_its_pane() {
         r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'
   echo 'pi|1.0|502|/dev/null|pi|/work/pi|1|%31|pi'"#,
     );
+    // The fake `ps` puts 777001 between the caller and init; it stands in for
+    // both the opencode process and the server named in service.json.
+    fs::create_dir_all(fx.dir.join("state/opencode")).unwrap();
+    fs::write(
+        fx.dir.join("state/opencode/service.json"),
+        r#"{"url":"http://127.0.0.1:4096","pid":777001,"password":"x"}"#,
+    )
+    .unwrap();
     let send = |session: &str| {
         fx.command(&["send", "--to", "%31", "--message", "hi pi"])
             .env("TRIAGE_TEST_PANE_HARNESS", "777001")
@@ -324,4 +333,42 @@ fn an_opencode_tool_shell_sends_as_its_pane() {
     assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
     assert!(stderr(&output).contains("not a session in %30's directory"));
     assert_eq!(audit(&fx).len(), 1);
+
+    fs::remove_file(fx.dir.join("state/opencode/service.json")).unwrap();
+    let output = send("ses_oc");
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stderr(&output).contains("not under the opencode server"));
+    assert_eq!(audit(&fx).len(), 1);
+}
+
+#[test]
+fn opencode_env_from_inside_another_pane_is_refused() {
+    // The caller's chain reaches pane %32's root (777000): a process there
+    // renamed `opencode` cannot speak for %30.
+    let fx = Fixture::new(
+        "ocforge",
+        r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'
+  echo 'pi|1.0|502|/dev/null|pi|/work/pi|1|%31|pi'
+  echo 'sh|1.0|777000|/dev/null|fish|/work/sh|1|%32|fish'"#,
+    );
+    fs::create_dir_all(fx.dir.join("state/opencode")).unwrap();
+    fs::write(
+        fx.dir.join("state/opencode/service.json"),
+        r#"{"pid":777001}"#,
+    )
+    .unwrap();
+    let output = fx
+        .command(&["send", "--to", "%31", "--message", "hi pi"])
+        .env("TRIAGE_TEST_PANE_HARNESS", "777001")
+        .env("OPENCODE_SESSION_ID", "ses_oc")
+        .env("TMUX_PANE", "%30")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("sits in a tmux pane"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!fx.dir.join("pasted").exists());
 }

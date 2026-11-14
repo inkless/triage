@@ -1724,6 +1724,7 @@ struct PaneProbe<'a> {
     /// `(OPENCODE_SESSION_ID, TMUX_PANE)` from the caller's environment.
     opencode_env: Option<(String, String)>,
     opencode_session_dir: &'a dyn Fn(&str) -> Option<PathBuf>,
+    opencode_server_pid: Option<u32>,
 }
 
 fn resolve_caller<'a>(
@@ -1733,17 +1734,21 @@ fn resolve_caller<'a>(
     codex_thread: Option<&str>,
 ) -> Result<&'a Session, CliError> {
     let pane_roots = std::cell::OnceCell::new();
+    let opencode_env = std::env::var("OPENCODE_SESSION_ID")
+        .ok()
+        .zip(std::env::var("TMUX_PANE").ok())
+        .filter(|(session, pane)| !session.is_empty() && !pane.is_empty());
     let probe = PaneProbe {
+        opencode_server_pid: opencode_env
+            .as_ref()
+            .and_then(|_| crate::pane_agents::opencode_server_pid()),
+        opencode_env,
         is_pane_root: &|pid| {
             pane_roots
                 .get_or_init(|| tmux::list_panes().into_keys().collect::<HashSet<u32>>())
                 .contains(&pid)
         },
         is_harness: &is_pane_harness,
-        opencode_env: std::env::var("OPENCODE_SESSION_ID")
-            .ok()
-            .zip(std::env::var("TMUX_PANE").ok())
-            .filter(|(session, pane)| !session.is_empty() && !pane.is_empty()),
         opencode_session_dir: &crate::pane_agents::opencode_session_dir,
     };
     resolve_caller_with(sessions, pid, parents, codex_thread, &probe)
@@ -1812,10 +1817,12 @@ fn check_pane_only_caller(
 /// opencode runs tool shells under its shared `opencode serve` process, not
 /// inside the pane, so no process walk reaches the pane. It does hand each
 /// shell `OPENCODE_SESSION_ID` and the client's `TMUX_PANE`. Accept that pair
-/// only when the pane is a tracked opencode pane, the caller runs under an
-/// opencode process, and the session belongs to the pane's directory. Like
-/// the process-walk path this is pane-grade identity: the environment is
-/// the caller's own claim, checked for consistency, not proven.
+/// only when the pane is a tracked opencode pane; the caller sits in no tmux
+/// pane and descends from an opencode process and from the server whose pid
+/// opencode records in its `service.json`; and opencode's database places the
+/// session in the pane's directory. The pane claim itself is not proven: a
+/// tool shell of that server can name any opencode pane in its session's
+/// directory. Like the process-walk path, this is pane-grade identity.
 fn resolve_opencode_caller<'a>(
     sessions: &'a [Session],
     walked: &[u32],
@@ -1832,6 +1839,11 @@ fn resolve_opencode_caller<'a>(
             "TMUX_PANE {pane_id} is not a tracked opencode pane"
         )));
     };
+    if walked.iter().any(|&pid| (probe.is_pane_root)(pid)) {
+        return Err(CliError::denied(
+            "calling process sits in a tmux pane, but opencode tool shells run outside panes",
+        ));
+    }
     if !walked
         .iter()
         .any(|&pid| (probe.is_harness)(pid, Provider::Opencode))
@@ -1840,11 +1852,18 @@ fn resolve_opencode_caller<'a>(
             "calling process is not under an opencode process",
         ));
     }
-    let dir = if &session.session_id == session_id {
-        Some(session.cwd.clone())
-    } else {
-        (probe.opencode_session_dir)(session_id)
-    };
+    if !probe
+        .opencode_server_pid
+        .is_some_and(|server| walked.contains(&server))
+    {
+        return Err(CliError::denied(
+            "calling process is not under the opencode server named in opencode's service.json",
+        ));
+    }
+    let dir = session_id
+        .starts_with("ses_")
+        .then(|| (probe.opencode_session_dir)(session_id))
+        .flatten();
     if dir.as_deref() != Some(session.cwd.as_path()) {
         return Err(CliError::denied(format!(
             "OPENCODE_SESSION_ID {session_id} is not a session in {pane_id}'s directory"
@@ -2142,6 +2161,7 @@ mod tests {
             is_harness: &|pid, _| pid == harness,
             opencode_env: None,
             opencode_session_dir: &|_| None,
+            opencode_server_pid: None,
         };
         resolve_caller_with(sessions, 400, parents, None, &probe)
             .map(sender_label)
@@ -2183,21 +2203,39 @@ mod tests {
         }
     }
 
-    fn resolve_opencode_env(
-        sessions: &[Session],
-        env: (&str, &str),
+    /// A tool shell under the shared opencode server, not in any pane:
+    /// triage(400) → bash(350) → opencode-pty(300) → server(250) → init.
+    struct OpencodeCall<'a> {
+        session: &'a str,
+        pane: &'a str,
         harness: u32,
-        other_session_dir: &str,
-    ) -> Result<String, String> {
-        // A tool shell under the shared opencode server, not in any pane:
-        // triage(400) → bash(350) → opencode-pty(300) → server(250) → init.
+        server: Option<u32>,
+        pane_roots: &'a [u32],
+        session_dir: &'a str,
+    }
+
+    impl Default for OpencodeCall<'_> {
+        fn default() -> Self {
+            Self {
+                session: "ses_x",
+                pane: "%30",
+                harness: 300,
+                server: Some(250),
+                pane_roots: &[],
+                session_dir: "/tmp/project",
+            }
+        }
+    }
+
+    fn resolve_opencode_env(sessions: &[Session], call: OpencodeCall) -> Result<String, String> {
         let parents = HashMap::from([(400, 350), (350, 300), (300, 250), (250, 1)]);
-        let dir = PathBuf::from(other_session_dir);
+        let dir = PathBuf::from(call.session_dir);
         let probe = PaneProbe {
-            is_pane_root: &|_| false,
-            is_harness: &|pid, provider| provider == Provider::Opencode && pid == harness,
-            opencode_env: Some((env.0.to_string(), env.1.to_string())),
+            is_pane_root: &|pid| call.pane_roots.contains(&pid),
+            is_harness: &|pid, provider| provider == Provider::Opencode && pid == call.harness,
+            opencode_env: Some((call.session.to_string(), call.pane.to_string())),
             opencode_session_dir: &|_| Some(dir.clone()),
+            opencode_server_pid: call.server,
         };
         resolve_caller_with(sessions, 400, &parents, None, &probe)
             .map(sender_label)
@@ -2208,12 +2246,16 @@ mod tests {
     fn opencode_caller_is_found_from_its_session_and_pane_env() {
         let sessions = [pane_only_session(Provider::Opencode, 200)];
         assert_eq!(
-            resolve_opencode_env(&sessions, ("ses_x", "%30"), 300, "/elsewhere").as_deref(),
+            resolve_opencode_env(&sessions, OpencodeCall::default()).as_deref(),
             Ok("opencode:%30")
         );
         // A second session in the pane's directory is still this pane.
+        let other = OpencodeCall {
+            session: "ses_y",
+            ..Default::default()
+        };
         assert_eq!(
-            resolve_opencode_env(&sessions, ("ses_y", "%30"), 300, "/tmp/project").as_deref(),
+            resolve_opencode_env(&sessions, other).as_deref(),
             Ok("opencode:%30")
         );
     }
@@ -2221,32 +2263,99 @@ mod tests {
     #[test]
     fn opencode_env_is_refused_when_it_does_not_add_up() {
         let sessions = [pane_only_session(Provider::Opencode, 200)];
-        for (env, harness, dir, want) in [
+        for (call, want) in [
             (
-                ("ses_x", "%99"),
-                300,
-                "/tmp/project",
+                OpencodeCall {
+                    pane: "%99",
+                    ..Default::default()
+                },
                 "not a tracked opencode pane",
             ),
             (
-                ("ses_x", "%30"),
-                999,
-                "/tmp/project",
+                OpencodeCall {
+                    harness: 999,
+                    ..Default::default()
+                },
                 "not under an opencode process",
             ),
             (
-                ("ses_y", "%30"),
-                300,
-                "/elsewhere",
+                OpencodeCall {
+                    session: "ses_y",
+                    session_dir: "/elsewhere",
+                    ..Default::default()
+                },
                 "not a session in %30's directory",
             ),
         ] {
-            let err = resolve_opencode_env(&sessions, env, harness, dir).unwrap_err();
+            let err = resolve_opencode_env(&sessions, call).unwrap_err();
             assert!(err.contains(want), "{err}");
         }
         let mut pi = pane_only_session(Provider::Pi, 200);
         pi.session_id = "ses_x".into();
-        assert!(resolve_opencode_env(&[pi], ("ses_x", "%30"), 300, "/tmp/project").is_err());
+        assert!(resolve_opencode_env(&[pi], OpencodeCall::default()).is_err());
+    }
+
+    #[test]
+    fn opencode_env_from_inside_a_pane_is_refused() {
+        // A renamed `opencode` binary in some other pane claiming %30.
+        let sessions = [pane_only_session(Provider::Opencode, 200)];
+        let call = OpencodeCall {
+            pane_roots: &[350],
+            ..Default::default()
+        };
+        let err = resolve_opencode_env(&sessions, call).unwrap_err();
+        assert!(err.contains("sits in a tmux pane"), "{err}");
+    }
+
+    #[test]
+    fn opencode_env_requires_the_recorded_opencode_server() {
+        let sessions = [pane_only_session(Provider::Opencode, 200)];
+        for server in [None, Some(999)] {
+            let call = OpencodeCall {
+                server,
+                ..Default::default()
+            };
+            let err = resolve_opencode_env(&sessions, call).unwrap_err();
+            assert!(err.contains("not under the opencode server"), "{err}");
+        }
+    }
+
+    #[test]
+    fn opencode_session_id_is_always_checked_against_the_database() {
+        // The pane's own session id earns no shortcut past the database.
+        let sessions = [pane_only_session(Provider::Opencode, 200)];
+        let call = OpencodeCall {
+            session_dir: "/elsewhere",
+            ..Default::default()
+        };
+        let err = resolve_opencode_env(&sessions, call).unwrap_err();
+        assert!(err.contains("not a session in %30's directory"), "{err}");
+
+        // An unnamed pane's placeholder id is the pane id, not a session.
+        let mut unnamed = pane_only_session(Provider::Opencode, 200);
+        unnamed.session_id = "%30".into();
+        let call = OpencodeCall {
+            session: "%30",
+            ..Default::default()
+        };
+        let err = resolve_opencode_env(&[unnamed], call).unwrap_err();
+        assert!(err.contains("not a session in %30's directory"), "{err}");
+    }
+
+    #[test]
+    fn a_claude_caller_with_opencode_env_stays_claude() {
+        // Claude (300) launched from an opencode tool shell inherits its env.
+        let mut claude = session(AttentionState::Working);
+        claude.pid = 300;
+        let sessions = [claude, pane_only_session(Provider::Opencode, 200)];
+        let call = OpencodeCall {
+            harness: 250,
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_opencode_env(&sessions, call).as_deref(),
+            Ok("target (%42)")
+        );
     }
 
     #[test]
