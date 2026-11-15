@@ -12,12 +12,18 @@ pub struct FsWatcher {
     _watcher: RecommendedWatcher,
 }
 
+/// On Linux, inotify reports opening and closing a file or directory, so a
+/// reader that wakes on every event wakes itself each time it looks.
+pub fn is_change(event: &notify::Event) -> bool {
+    !matches!(event.kind, notify::EventKind::Access(_))
+}
+
 impl FsWatcher {
     pub fn spawn() -> notify::Result<Self> {
         let (tx, rx): (Sender<()>, Receiver<()>) = mpsc::channel();
         let mut watcher: RecommendedWatcher =
             notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
-                if res.is_ok() {
+                if res.as_ref().is_ok_and(is_change) {
                     let _ = tx.send(());
                 }
             })?;
@@ -46,5 +52,24 @@ impl FsWatcher {
             got = true;
         }
         got
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_change;
+    use notify::event::{AccessKind, AccessMode, CreateKind, EventKind, ModifyKind};
+
+    #[test]
+    fn opening_or_reading_is_not_a_change() {
+        let event = |kind| notify::Event::new(kind);
+        assert!(!is_change(&event(EventKind::Access(AccessKind::Open(
+            AccessMode::Any
+        )))));
+        assert!(!is_change(&event(EventKind::Access(AccessKind::Close(
+            AccessMode::Read
+        )))));
+        assert!(is_change(&event(EventKind::Create(CreateKind::File))));
+        assert!(is_change(&event(EventKind::Modify(ModifyKind::Any))));
     }
 }
