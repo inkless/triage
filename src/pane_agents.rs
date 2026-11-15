@@ -10,6 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
@@ -32,6 +33,21 @@ struct SessionMeta {
     created_ms: u64,
     updated_ms: u64,
     idle_since_ms: Option<u64>,
+    usage: Usage,
+}
+
+/// Cumulative spend and token counts a harness reports for a session.
+/// `context_tokens` is the latest prompt size, when the store records it.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Usage {
+    cost_usd: f64,
+    tokens_in: u64,
+    tokens_out: u64,
+    cache_write: u64,
+    cache_read: u64,
+    context_tokens: u64,
+    peak_context_tokens: u64,
+    model: Option<String>,
 }
 
 /// `skip` holds panes already owned by a Claude or Codex session: a harness
@@ -336,6 +352,7 @@ fn fresh_meta(pane: &Pane) -> SessionMeta {
         created_ms: 0,
         updated_ms: 0,
         idle_since_ms: None,
+        usage: Usage::default(),
     }
 }
 
@@ -365,6 +382,16 @@ fn pane_session(provider: Provider, pane: &Pane, meta: Option<&SessionMeta>) -> 
     session.last_stop_at = meta.and_then(|m| m.idle_since_ms).map(ms_to_time);
     session.last_event_at = meta.map(|m| ms_to_time(m.updated_ms));
     session.last_prompt = meta.and_then(|m| m.last_prompt.clone());
+    if let Some(usage) = meta.map(|m| &m.usage) {
+        session.total_cost_usd = usage.cost_usd;
+        session.total_tokens_in = usage.tokens_in;
+        session.total_tokens_out = usage.tokens_out;
+        session.total_tokens_cache_write = usage.cache_write;
+        session.total_tokens_cache_read = usage.cache_read;
+        session.latest_context_tokens = usage.context_tokens;
+        session.peak_context_tokens = usage.peak_context_tokens;
+        session.latest_model = usage.model.clone();
+    }
     session.pane = Some(pane.clone());
     session
 }
@@ -394,22 +421,91 @@ const OPENCODE_QUERY: &str = "select s.id, s.directory, s.title, s.time_created,
      from session_v2 s where s.parent_id is null \
      order by s.time_updated desc limit 500";
 
+const OPENCODE_COLUMNS: &str = "id, directory, title, time_created, time_updated, \
+     time_busy, time_idle";
+
+/// Root sessions with the cost and tokens of their whole subagent tree
+/// folded in, so spend by child sessions counts toward the pane's row.
+fn opencode_query(with_usage: bool) -> String {
+    if !with_usage {
+        return OPENCODE_QUERY.to_string();
+    }
+    let sums = [
+        "cost",
+        "tokens_input",
+        "tokens_output",
+        "tokens_reasoning",
+        "tokens_cache_read",
+        "tokens_cache_write",
+    ];
+    let spend = sums
+        .iter()
+        .map(|c| format!("sum(s.{c}) as {c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let totals = sums
+        .iter()
+        .map(|c| format!("u.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let roots = OPENCODE_COLUMNS
+        .split(", ")
+        .map(|c| format!("r.{c}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "with recursive tree(root, id) as (select id, id from session_v2 \
+         where parent_id is null union all select t.root, c.id from session_v2 c \
+         join tree t on c.parent_id = t.id), \
+         spend as (select t.root, {spend} from tree t \
+         join session_v2 s on s.id = t.id group by t.root) \
+         select {roots}, {totals}, r.model, \
+         (select substr(json_extract(m.data, '$.text'), 1, 300) \
+            from session_message m where m.session_id = r.id and m.type = 'user' \
+            order by m.seq desc limit 1) as last_user_text from session_v2 r \
+         join spend u on u.root = r.id where r.parent_id is null \
+         order by r.time_updated desc limit 500"
+    )
+}
+
+enum QueryError {
+    MissingColumn,
+    Failed,
+}
+
+fn run_opencode_query(db: &Path, query: &str) -> Result<Vec<u8>, QueryError> {
+    let out = Command::new("sqlite3")
+        .args(["-readonly", "-json", &db.to_string_lossy(), query])
+        .output()
+        .map_err(|_| QueryError::Failed)?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else if String::from_utf8_lossy(&out.stderr).contains("no such column") {
+        Err(QueryError::MissingColumn)
+    } else {
+        Err(QueryError::Failed)
+    }
+}
+
+static OPENCODE_LACKS_USAGE: AtomicBool = AtomicBool::new(false);
+
 /// Best effort: a missing database, missing `sqlite3`, or a schema change
-/// leaves opencode panes listed but unnamed.
+/// leaves opencode panes listed but unnamed. A database without the usage
+/// columns is queried again without them so discovery still works, and is
+/// remembered so later refreshes skip the failing query.
 fn opencode_metas(db: &Path) -> Vec<SessionMeta> {
     if !db.exists() {
         return Vec::new();
     }
-    let Ok(out) = Command::new("sqlite3")
-        .args(["-readonly", "-json", &db.to_string_lossy(), OPENCODE_QUERY])
-        .output()
-    else {
-        return Vec::new();
-    };
-    if !out.status.success() {
-        return Vec::new();
+    if !OPENCODE_LACKS_USAGE.load(Ordering::Relaxed) {
+        match run_opencode_query(db, &opencode_query(true)) {
+            Ok(json) => return parse_opencode_rows(&json),
+            Err(QueryError::Failed) => return Vec::new(),
+            Err(QueryError::MissingColumn) => OPENCODE_LACKS_USAGE.store(true, Ordering::Relaxed),
+        }
     }
-    parse_opencode_rows(&out.stdout)
+    run_opencode_query(db, &opencode_query(false))
+        .map_or_else(|_| Vec::new(), |json| parse_opencode_rows(&json))
 }
 
 /// The pid of the shared opencode server, which runs every opencode tool
@@ -457,6 +553,34 @@ struct OpencodeRow {
     time_idle: Option<u64>,
     #[serde(default)]
     last_user_text: Option<String>,
+    #[serde(default)]
+    cost: Option<f64>,
+    #[serde(default)]
+    tokens_input: Option<u64>,
+    #[serde(default)]
+    tokens_output: Option<u64>,
+    #[serde(default)]
+    tokens_reasoning: Option<u64>,
+    #[serde(default)]
+    tokens_cache_read: Option<u64>,
+    #[serde(default)]
+    tokens_cache_write: Option<u64>,
+    #[serde(default)]
+    model: Option<Value>,
+}
+
+/// The `model` column holds JSON such as `{"id":"…","providerID":"…"}`; a
+/// plain string is taken as the model name itself.
+fn opencode_model(value: &Value) -> Option<String> {
+    let name = match value {
+        Value::String(text) => match serde_json::from_str::<Value>(text) {
+            Ok(Value::Object(obj)) => obj.get("id")?.as_str()?.to_string(),
+            _ => text.clone(),
+        },
+        Value::Object(obj) => obj.get("id")?.as_str()?.to_string(),
+        _ => return None,
+    };
+    Some(name).filter(|n| !n.trim().is_empty())
 }
 
 fn parse_opencode_rows(json: &[u8]) -> Vec<SessionMeta> {
@@ -487,6 +611,17 @@ fn parse_opencode_rows(json: &[u8]) -> Vec<SessionMeta> {
                 created_ms: row.time_created.unwrap_or(0),
                 updated_ms: row.time_updated.unwrap_or(0),
                 idle_since_ms,
+                usage: Usage {
+                    cost_usd: row.cost.unwrap_or(0.0),
+                    tokens_in: row.tokens_input.unwrap_or(0),
+                    // opencode reports reasoning apart from output.
+                    tokens_out: row.tokens_output.unwrap_or(0) + row.tokens_reasoning.unwrap_or(0),
+                    cache_write: row.tokens_cache_write.unwrap_or(0),
+                    cache_read: row.tokens_cache_read.unwrap_or(0),
+                    context_tokens: 0,
+                    peak_context_tokens: 0,
+                    model: row.model.as_ref().and_then(opencode_model),
+                },
             }
         })
         .collect()
@@ -575,6 +710,7 @@ fn parse_pi_session(text: &str, modified_ms: u64) -> Option<SessionMeta> {
     let mut name = None;
     let mut last_prompt = None;
     let mut last_message: Option<Value> = None;
+    let mut usage = Usage::default();
     for line in lines {
         let Ok(entry) = serde_json::from_str::<Value>(line) else {
             continue;
@@ -592,6 +728,7 @@ fn parse_pi_session(text: &str, modified_ms: u64) -> Option<SessionMeta> {
                 if let Some(prompt) = pi_user_text(&entry) {
                     last_prompt = Some(prompt);
                 }
+                add_pi_usage(&mut usage, &entry);
                 last_message = Some(entry);
             }
             _ => {}
@@ -619,6 +756,7 @@ fn parse_pi_session(text: &str, modified_ms: u64) -> Option<SessionMeta> {
         created_ms,
         updated_ms: modified_ms,
         idle_since_ms,
+        usage,
     })
 }
 
@@ -641,6 +779,41 @@ fn pi_user_text(entry: &Value) -> Option<String> {
     };
     let text = text.trim();
     (!text.is_empty()).then(|| text.chars().take(300).collect())
+}
+
+/// Fold one assistant message's usage into the session totals. pi counts
+/// reasoning tokens inside `output`.
+fn add_pi_usage(total: &mut Usage, entry: &Value) {
+    let Some(message) = entry.get("message") else {
+        return;
+    };
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return;
+    }
+    if let Some(model) = message.get("model").and_then(Value::as_str) {
+        total.model = Some(model.to_string());
+    }
+    let Some(usage) = message.get("usage") else {
+        return;
+    };
+    let count = |key: &str| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let (input, cache_read, cache_write) =
+        (count("input"), count("cacheRead"), count("cacheWrite"));
+    total.cost_usd += usage
+        .get("cost")
+        .and_then(|c| c.get("total"))
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    total.tokens_in += input;
+    total.tokens_out += count("output");
+    total.cache_read += cache_read;
+    total.cache_write += cache_write;
+    // Failed requests record all-zero usage; they say nothing about context.
+    let context = input + cache_read + cache_write;
+    if context > 0 {
+        total.context_tokens = context;
+        total.peak_context_tokens = total.peak_context_tokens.max(context);
+    }
 }
 
 #[cfg(test)]
@@ -671,6 +844,7 @@ mod tests {
             created_ms: 1,
             updated_ms,
             idle_since_ms: Some(updated_ms),
+            usage: Usage::default(),
         }
     }
 
@@ -814,6 +988,150 @@ mod tests {
         assert_eq!(metas[1].idle_since_ms, Some(18));
         assert_eq!(metas[2].busy, None);
         assert!(parse_opencode_rows(b"not json").is_empty());
+    }
+
+    #[test]
+    fn parses_opencode_usage_columns() {
+        let json = br#"[
+            {"id":"a","directory":"/w/a","cost":0.25,"tokens_input":1000,
+             "tokens_output":200,"tokens_reasoning":300,"tokens_cache_read":5000,
+             "tokens_cache_write":40,
+             "model":"{\"id\":\"deepseek-flash\",\"providerID\":\"deepseek\",\"variant\":\"high\"}"},
+            {"id":"b","directory":"/w/b","model":{"id":"gpt-x"}},
+            {"id":"c","directory":"/w/c","model":"plain-name"},
+            {"id":"d","directory":"/w/d","model":null}
+        ]"#;
+        let metas = parse_opencode_rows(json);
+        assert_eq!(
+            metas[0].usage,
+            Usage {
+                cost_usd: 0.25,
+                tokens_in: 1000,
+                tokens_out: 500,
+                cache_write: 40,
+                cache_read: 5000,
+                context_tokens: 0,
+                peak_context_tokens: 0,
+                model: Some("deepseek-flash".to_string()),
+            }
+        );
+        assert_eq!(metas[1].usage.model.as_deref(), Some("gpt-x"));
+        assert_eq!(metas[2].usage.model.as_deref(), Some("plain-name"));
+        assert_eq!(metas[3].usage, Usage::default());
+    }
+
+    #[test]
+    fn the_fallback_opencode_query_omits_the_usage_columns() {
+        assert!(opencode_query(true).contains("tokens_cache_read"));
+        assert!(opencode_query(true).contains("time_idle"));
+        assert!(!opencode_query(false).contains("tokens_input"));
+        assert!(opencode_query(false).contains("time_idle"));
+    }
+
+    #[test]
+    fn opencode_query_rolls_subagent_spend_into_the_root_session() {
+        if Command::new("sqlite3").arg("--version").output().is_err() {
+            return;
+        }
+        let db = std::env::temp_dir().join(format!("triage-oc-tree-{}.db", std::process::id()));
+        let _ = fs::remove_file(&db);
+        let setup = "create table session_v2 (id text, parent_id text, directory text,
+            title text, time_created integer, time_updated integer, time_busy integer,
+            time_idle integer, cost real, tokens_input integer, tokens_output integer,
+            tokens_reasoning integer, tokens_cache_read integer, tokens_cache_write integer,
+            model text);
+            create table session_message (session_id text, type text, seq integer, data text);
+            insert into session_message values ('root','user',1,'{\"text\":\"latest prompt\"}');
+            insert into session_v2 values
+            ('root',null,'/w','t',1,9,null,null,1.0,100,10,1,1000,5,null),
+            ('kid','root','/w',null,2,8,null,null,0.5,50,5,2,500,0,null),
+            ('grandkid','kid','/w',null,3,7,null,null,0.25,25,2,0,0,1,null),
+            ('other',null,'/x','u',1,5,null,null,2.0,7,7,7,7,7,null);";
+        let made = Command::new("sqlite3")
+            .arg(&db)
+            .arg(setup)
+            .output()
+            .unwrap();
+        assert!(made.status.success());
+        let json = run_opencode_query(&db, &opencode_query(true)).ok().unwrap();
+        let _ = fs::remove_file(&db);
+        let metas = parse_opencode_rows(&json);
+        assert_eq!(metas.len(), 2);
+        let root = metas.iter().find(|m| m.id == "root").unwrap();
+        assert_eq!(root.usage.cost_usd, 1.75);
+        assert_eq!(root.usage.tokens_in, 175);
+        assert_eq!(root.usage.tokens_out, 20);
+        assert_eq!(root.usage.cache_read, 1500);
+        assert_eq!(root.usage.cache_write, 6);
+        assert_eq!(root.name.as_deref(), Some("t"));
+        assert_eq!(root.last_prompt.as_deref(), Some("latest prompt"));
+        let other = metas.iter().find(|m| m.id == "other").unwrap();
+        assert_eq!(other.usage.cost_usd, 2.0);
+    }
+
+    #[test]
+    fn pi_usage_sums_assistant_messages_and_tracks_context() {
+        let header = r#"{"type":"session","version":3,"id":"01a1","timestamp":"2026-10-14T18:49:13.644Z","cwd":"/w/a"}"#;
+        let user =
+            r#"{"type":"message","id":"m1","message":{"role":"user","usage":{"input":999999}}}"#;
+        let first = r#"{"type":"message","id":"m2","message":{"role":"assistant","model":"model-a","stopReason":"toolUse","usage":{"input":100,"output":20,"cacheRead":4000,"cacheWrite":50,"reasoning":5,"totalTokens":4170,"cost":{"total":0.5}}}}"#;
+        let second = r#"{"type":"message","id":"m3","message":{"role":"assistant","model":"model-b","stopReason":"stop","usage":{"input":10,"output":3,"cacheRead":900,"cacheWrite":0,"cost":{"total":0.25}}}}"#;
+        let no_usage =
+            r#"{"type":"message","id":"m4","message":{"role":"assistant","stopReason":"error"}}"#;
+
+        let failed = r#"{"type":"message","id":"m5","message":{"role":"assistant","model":"model-b","stopReason":"error","usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"cost":{"total":0}}}}"#;
+
+        let meta = parse_pi_session(
+            &format!("{header}\n{user}\n{first}\n{second}\n{no_usage}\n{failed}\n"),
+            99,
+        )
+        .unwrap();
+        assert_eq!(
+            meta.usage,
+            Usage {
+                cost_usd: 0.75,
+                tokens_in: 110,
+                tokens_out: 23,
+                cache_write: 50,
+                cache_read: 4900,
+                context_tokens: 910,
+                peak_context_tokens: 4150,
+                model: Some("model-b".to_string()),
+            }
+        );
+
+        let bare = parse_pi_session(&format!("{header}\n{user}\n"), 99).unwrap();
+        assert_eq!(bare.usage, Usage::default());
+    }
+
+    #[test]
+    fn a_pane_session_carries_the_matched_sessions_usage() {
+        let pane = pane(10, "%30", "/w/a", "opencode");
+        let mut matched = meta("ses", "/w/a", 9);
+        matched.usage = Usage {
+            cost_usd: 1.5,
+            tokens_in: 10,
+            tokens_out: 20,
+            cache_write: 30,
+            cache_read: 40,
+            context_tokens: 50,
+            peak_context_tokens: 60,
+            model: Some("m".to_string()),
+        };
+        let session = pane_session(Provider::Opencode, &pane, Some(&matched));
+        assert_eq!(session.total_cost_usd, 1.5);
+        assert_eq!(session.total_tokens_in, 10);
+        assert_eq!(session.total_tokens_out, 20);
+        assert_eq!(session.total_tokens_cache_write, 30);
+        assert_eq!(session.total_tokens_cache_read, 40);
+        assert_eq!(session.latest_context_tokens, 50);
+        assert_eq!(session.peak_context_tokens, 60);
+        assert_eq!(session.latest_model.as_deref(), Some("m"));
+        assert_eq!(session.context_window, None);
+
+        let unmatched = pane_session(Provider::Opencode, &pane, None);
+        assert_eq!(unmatched.total_cost_usd, 0.0);
+        assert_eq!(unmatched.latest_model, None);
     }
 
     #[test]
