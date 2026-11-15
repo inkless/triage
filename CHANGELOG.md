@@ -1,5 +1,29 @@
 # Changelog
 
+## [0.8.0](https://github.com/inkless/triage/compare/v0.7.0...v0.8.0) (2026-11-15)
+
+
+### Features
+
+* **agents:** discover sandboxed harnesses by container label ([#38](https://github.com/inkless/triage/issues/38)) ([1ca2dfd](https://github.com/inkless/triage/commit/1ca2dfdbd36237d46bd7b66a0a1db86fba94ed16))
+* **agents:** list opencode and pi panes ([#31](https://github.com/inkless/triage/issues/31)) ([d65b4df](https://github.com/inkless/triage/commit/d65b4dfdba561c11fd94a504d4ca5c09a8b3c344))
+* **agents:** show cost and tokens for opencode and pi rows ([#34](https://github.com/inkless/triage/issues/34)) ([5d52320](https://github.com/inkless/triage/commit/5d52320ee3a8e44d8927129b44a1ee5f227f339a))
+* **approve:** approve, deny and interrupt opencode sessions through their server ([#36](https://github.com/inkless/triage/issues/36)) ([4c8fa01](https://github.com/inkless/triage/commit/4c8fa01e7c4ed59c4484c9ab8eebf8b03718a6e1))
+* **mail:** session identity and out-of-band mail for opencode and pi ([#35](https://github.com/inkless/triage/issues/35)) ([89d2cf7](https://github.com/inkless/triage/commit/89d2cf71eafef520e5008737fb9c8ff82e86c82e))
+* **send:** send from opencode and pi panes under a pane-derived sender ([#32](https://github.com/inkless/triage/issues/32)) ([d65b4df](https://github.com/inkless/triage/commit/d65b4dfdba561c11fd94a504d4ca5c09a8b3c344))
+
+
+### Bug Fixes
+
+* **agents:** name pane-only rows from session or tmux window ([#37](https://github.com/inkless/triage/issues/37)) ([9eb5c53](https://github.com/inkless/triage/commit/9eb5c53e22df79330ce1231eaf476d7d20bc72df))
+* **auto:** accept a session name in the prompt's bottom border ([8d1382f](https://github.com/inkless/triage/commit/8d1382f1383b1d09f4bd093273f5b49b5b8f0b51))
+* **auto:** explain auditor denials to agents ([e657203](https://github.com/inkless/triage/commit/e6572032d27ee8261df3a4b26207dc3c17be3a8d))
+* **auto:** never auto-approve plans or free-text questions, and report unreadable prompts ([b0990d4](https://github.com/inkless/triage/commit/b0990d42c78b8f9efb903cb4f07c0e9781a8856f))
+* **codex:** pair daemon threads with their pane by pane title ([dafd3b5](https://github.com/inkless/triage/commit/dafd3b5975be8a2130973d5c821813f08643782f))
+* **hooks:** stop Linux mail waiters from waking themselves ([#30](https://github.com/inkless/triage/issues/30)) ([3ef43a2](https://github.com/inkless/triage/commit/3ef43a237fcebc75d104fd585ec00a63209f1ca3))
+* **transport:** reap detached nudge helpers ([#39](https://github.com/inkless/triage/issues/39)) ([c573ec8](https://github.com/inkless/triage/commit/c573ec8c94ae99ce0e8690f65fcb33d39d1dc2e5))
+* **tui:** keep key input responsive while sessions refresh ([#33](https://github.com/inkless/triage/issues/33)) ([f4c6acc](https://github.com/inkless/triage/commit/f4c6acc22c38c78bdae405b5e5e6c08bfacb0c0f))
+
 ## [0.7.0](https://github.com/inkless/triage/compare/v0.6.2...v0.7.0) (2026-10-27)
 
 
