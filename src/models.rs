@@ -31,9 +31,9 @@ impl Provider {
         }
     }
 
-    /// Harnesses triage tracks only through their tmux pane: listing, preview,
-    /// jump and pasted `triage send`. Their identity is the pane, not a
-    /// session, and they get no mailbox, hooks, approve or interrupt.
+    /// Harnesses triage discovers through their tmux pane rather than a
+    /// session record. They get no approve or interrupt, and a caller is
+    /// identified by its session only when its own environment names one.
     pub fn pane_only(self) -> bool {
         match self {
             Provider::Claude | Provider::Codex => false,
@@ -175,6 +175,8 @@ pub struct Session {
     /// These enrich the headline/detail and hook-mode `a`/`d` flow, but they
     /// are only actionable when Claude itself reports `status == "waiting"`.
     pub pending_approvals: Vec<PendingApproval>,
+    /// When the harness process in an opencode or pi pane started, if known.
+    pub harness_started_ms: Option<u64>,
 }
 
 impl Session {
@@ -235,6 +237,7 @@ impl Session {
             watched: false,
             pinned: false,
             pending_approvals: Vec::new(),
+            harness_started_ms: None,
         }
     }
 }

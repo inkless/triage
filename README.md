@@ -12,11 +12,12 @@ Codex CLI:
 - `~/.codex/sessions/**/rollout-*.jsonl` — prompts, messages, tool calls, token counts
 - `~/.codex/state_5.sqlite` — native thread titles, agent labels, parent/child thread roots
 
-opencode and pi (pane-level only):
+opencode and pi (found by tmux pane):
 - a tmux pane whose foreground command, own process, or a child or grandchild of it is `opencode` or `pi`; a server or one-shot run (`opencode serve`/`run`/`web`/`acp`, `pi -p`/`--print`/`--mode rpc|json`) is not listed
 - `~/.local/share/opencode/opencode.db` (`session_v2`) and `~/.pi/agent/sessions/<encoded-cwd>/*.jsonl` — session title and busy/idle state, used only when one pane of that harness is in the session's cwd
+- for pi with triage's extension installed, the session the extension registered for the pi process in the pane
 
-These rows support listing, preview, jump and `triage send`; they have no cost or context rollups, mailbox, hooks, approve or interrupt.
+These rows support listing, preview, jump, `triage send` and peer mail; they have no cost or context rollups, approve or interrupt.
 
 Shared:
 - `tmux list-panes -a` — joined via process-ancestor walk from the agent PID
@@ -98,21 +99,30 @@ message body is pasted through an internal tmux buffer and submitted with a
 separate Enter, so agents can use either one-line text or a file/stdin body
 without caring about the transport.
 
-opencode and pi agents can send too, under a weaker, pane-level sender
-named by provider and pane (`opencode:%30`, `pi:%31`) in the delivered text
-and the audit log. A pi caller must be, or run under, a process named `pi`
-inside exactly one tmux pane. opencode runs tool shells under its shared
+opencode and pi agents can send too. They are named by provider and pane
+(`opencode:%30`, `pi:%31`) in the delivered text and the audit log, and are
+identified by session only when nothing else could be that session. A pi
+caller must be, or run under, a process named `pi` inside exactly one tmux
+pane. When its shell carries `PI_SESSION_ID`, that id must name a pi session
+file for the pane's directory and must not be a session another live pi
+process holds (otherwise the send is refused). The caller then speaks as that
+session if it is the one triage's pi extension registered for the caller's own
+pi process (any other id is refused), or, with no registration, if this is the
+only pi pane in the directory. opencode runs tool shells under its shared
 `opencode serve` process, outside the pane, so an opencode caller is taken
 from the `OPENCODE_SESSION_ID` and `TMUX_PANE` its shell inherits, and is
-accepted only when that pane is a tracked opencode pane, the caller sits in
-no tmux pane, it runs under an `opencode` process and under the server pid
+accepted only when that pane is a tracked opencode pane, the caller sits in no
+tmux pane, it runs under an `opencode` process and under the server pid
 recorded in `~/.local/state/opencode/service.json`, and opencode's database
-places that `ses_…` session in the pane's directory. That proves the caller
-is a tool shell of the running opencode server working in the pane's
-directory, not which opencode pane it belongs to: with two opencode panes in
-one directory either could claim the other. This names the pane, not the
-session. Sends to these agents are pasted; the gate blocks on a visible
-permission prompt but does not inspect their input box.
+places that `ses_…` session in the pane's directory. That proves the caller is
+a tool shell of the running opencode server working in the pane's directory,
+not which pane or session it belongs to, so it speaks as the session only when
+that is the one top-level session in the directory written to since the
+pane's opencode started. Every other caller is identified by its pane alone:
+the audit log records a session-grade caller's session as `from_session`; a
+pane-grade caller has none and cannot use `triage inbox`. Pasted sends to
+these agents pass a gate that blocks on a visible permission prompt but does
+not inspect their input box.
 
 ### Peer mail
 
@@ -126,8 +136,19 @@ the pane, so peer messages never show up as user prompts:
 - **Codex** sessions get the mail as hidden context on their next prompt. An
   idle Codex session is woken by a single queued line,
   `📨 triage: N peer message(s) from …`, sent once per burst.
-- Targets without triage's hooks (started before `triage hooks install`, or
-  not installed) get the message pasted as before, labelled as peer mail.
+- **opencode** sessions get the mail from the local opencode server (the
+  loopback URL and password in `~/.local/state/opencode/service.json`) as a
+  queued, non-user message, which starts a turn when the session is idle. No
+  plugin is needed.
+- **pi** sessions get it from triage's pi extension, which
+  `triage hooks install` writes to `~/.pi/agent/extensions/triage-mail.ts`
+  (`--pi` for that alone). It keeps a waiter running for the session and
+  injects mail as it arrives: steered into a running turn, or starting one
+  when idle. pi loads extensions at startup, so run `/reload` in sessions
+  that were already open.
+- Targets without a channel (no triage hooks or extension, an opencode server
+  that is down, a pane matched to no session) get the message pasted as
+  before, labelled as peer mail, and still recorded in their mailbox.
 
 The delivered text names the sender and ends with a reply command,
 `triage send --to <agent> --message "…"`. `--to` accepts a pane id, pane
@@ -258,7 +279,7 @@ bind-key -n M-p run-shell "triage --jump-to-self --zoom"
 Peer mail (see [Peer mail](#peer-mail)) needs triage's messaging hooks:
 
 ```bash
-triage hooks install           # Claude (~/.claude/settings.json) and Codex (~/.codex/hooks.json)
+triage hooks install           # Claude (~/.claude/settings.json), Codex (~/.codex/hooks.json), pi (~/.pi/agent/extensions/triage-mail.ts)
 triage hooks install --midturn # also deliver between tool calls, not just at turn boundaries
 triage hooks status            # entries, and which live sessions are hook-capable
 triage hooks uninstall
@@ -268,7 +289,9 @@ Agents read hooks at startup, so restart running sessions afterwards; until
 then they keep receiving pasted messages. Codex asks you to trust new hooks the
 first time they run. Install is idempotent, leaves other tools' hooks alone,
 keeps five timestamped backups, and refuses to edit a settings file whose shape
-it doesn't recognize.
+it doesn't recognize. The pi extension is a file triage owns; an existing
+`triage-mail.ts` it did not write is never replaced or removed. opencode needs
+nothing installed.
 
 Install the PreToolUse hook so Claude manual `a`/`d` and auto-mode verdicts route through Claude's clean approval channel instead of tmux send-keys:
 

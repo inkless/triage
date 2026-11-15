@@ -11,6 +11,7 @@ mod mailbox;
 mod messages;
 mod models;
 mod notify_os;
+mod opencode_api;
 mod pane_agents;
 mod peer_hooks;
 mod persist;

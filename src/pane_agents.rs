@@ -8,6 +8,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +59,7 @@ pub fn discover(
     skip: &HashSet<String>,
 ) -> Vec<Session> {
     let children = children_of(ppid_map);
+    let store = crate::mailbox::Store::open_default();
     let comm = |pid: u32| crate::mailbox::proc_info(pid).ok().map(|info| info.comm);
     let sandboxed = if panes
         .values()
@@ -70,7 +72,14 @@ pub fn discover(
     let mut by_provider: HashMap<Provider, Vec<&Pane>> = HashMap::new();
     let mut agent_dirs: HashMap<String, PathBuf> = HashMap::new();
     let mut started = HashMap::new();
+    let mut hosted = HashMap::new();
     for pane in panes.values().filter(|p| !skip.contains(&p.pane_id)) {
+        let comm = |pid: u32| {
+            if crate::peer_hooks::is_test_pane_harness(pid) {
+                return Some(pane.current_command.clone());
+            }
+            crate::mailbox::proc_info(pid).ok().map(|info| info.comm)
+        };
         let detected = pane_provider(pane, &children, &comm)
             .map(|(provider, harness)| (provider, harness, None))
             .or_else(|| {
@@ -96,6 +105,11 @@ pub fn discover(
         if let Some(ms) = run.and_then(|run| run.started_ms) {
             started.insert(pane.pane_id.clone(), ms);
         }
+        if provider == Provider::Pi
+            && let Some(session) = harness.and_then(|pid| hosted_pi_session(&store, pid))
+        {
+            hosted.insert(pane.pane_id.clone(), session);
+        }
     }
     let mut out = Vec::new();
     for (provider, panes) in by_provider {
@@ -115,13 +129,49 @@ pub fn discover(
                 }
                 for (dir, group) in by_dir {
                     let metas = pi_metas(&dir, &group);
-                    out.extend(sessions_for_panes(Provider::Pi, &group, &metas, &started));
+                    let mut sessions = sessions_for_panes(Provider::Pi, &group, &metas, &started);
+                    for (session, pane) in sessions.iter_mut().zip(&group) {
+                        if let Some(id) = hosted.get(&pane.pane_id)
+                            && &session.session_id != id
+                        {
+                            let meta = hosted_pi_meta(&dir, pane, id);
+                            *session = pane_session(provider, pane, Some(&meta));
+                        }
+                    }
+                    out.extend(sessions);
                 }
             }
             Provider::Claude | Provider::Codex => {}
         }
     }
     out
+}
+
+/// The session triage's pi extension registered for this pi process, which
+/// outranks any guess from the session files in its directory.
+fn hosted_pi_session(store: &crate::mailbox::Store, pid: u32) -> Option<String> {
+    let host = crate::mailbox::HostId {
+        pid,
+        start: crate::mailbox::proc_info(pid).ok()?.start,
+    };
+    store
+        .read_host(host)
+        .filter(|record| record.provider == Provider::Pi)
+        .map(|record| record.current_session)
+}
+
+fn hosted_pi_meta(agent_dir: &Path, pane: &Pane, id: &str) -> SessionMeta {
+    pi_session_file(agent_dir, &pane.cwd, id)
+        .and_then(|path| {
+            let text = fs::read_to_string(&path).ok()?;
+            let modified = fs::metadata(&path).and_then(|m| m.modified()).ok()?;
+            parse_pi_session(&text, time_to_ms(modified))
+        })
+        .filter(|meta| meta.id == id)
+        .unwrap_or_else(|| SessionMeta {
+            id: id.to_string(),
+            ..fresh_meta(pane)
+        })
 }
 
 /// A harness inside a sandbox container, joined to its pane by labels the
@@ -316,15 +366,18 @@ fn sessions_for_panes(
     panes
         .iter()
         .map(|pane| {
-            if panes_per_cwd[pane.cwd.as_path()] != 1 {
-                return pane_session(provider, pane, None);
-            }
             let since = started.get(&pane.pane_id).copied();
-            match (latest_in(metas, &pane.cwd, since), since) {
-                (Some(meta), _) => pane_session(provider, pane, Some(meta)),
-                (None, Some(_)) => pane_session(provider, pane, Some(&fresh_meta(pane))),
-                (None, None) => pane_session(provider, pane, None),
-            }
+            let mut session = if panes_per_cwd[pane.cwd.as_path()] != 1 {
+                pane_session(provider, pane, None)
+            } else {
+                match (latest_in(metas, &pane.cwd, since), since) {
+                    (Some(meta), _) => pane_session(provider, pane, Some(meta)),
+                    (None, Some(_)) => pane_session(provider, pane, Some(&fresh_meta(pane))),
+                    (None, None) => pane_session(provider, pane, None),
+                }
+            };
+            session.harness_started_ms = since;
+            session
         })
         .collect()
 }
@@ -537,6 +590,34 @@ pub fn opencode_session_dir(id: &str) -> Option<PathBuf> {
     rows.first()?.get("directory")?.as_str().map(PathBuf::from)
 }
 
+/// Top-level opencode sessions in `dir` written to since `since_ms`; `None`
+/// when the database can't be read.
+pub fn opencode_sessions_since(dir: &Path, since_ms: u64) -> Option<Vec<String>> {
+    let db = opencode_db_path();
+    let since = since_ms.saturating_sub(START_SLACK_MS);
+    let query = format!(
+        "select id, directory, time_updated from session_v2 \
+         where parent_id is null and time_updated >= {since}"
+    );
+    let out = Command::new("sqlite3")
+        .args(["-readonly", "-json", &db.to_string_lossy(), &query])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if text.trim().is_empty() {
+        return Some(Vec::new());
+    }
+    let rows: Vec<OpencodeRow> = serde_json::from_str(&text).ok()?;
+    Some(
+        rows.into_iter()
+            .filter(|row| Path::new(&row.directory) == dir)
+            .filter(|row| row.time_updated.is_some_and(|t| t >= since))
+            .map(|row| row.id)
+            .collect(),
+    )
+}
+
 #[derive(Deserialize)]
 struct OpencodeRow {
     id: String,
@@ -627,7 +708,7 @@ fn parse_opencode_rows(json: &[u8]) -> Vec<SessionMeta> {
         .collect()
 }
 
-fn pi_agent_dir() -> PathBuf {
+pub(crate) fn pi_agent_dir() -> PathBuf {
     std::env::var_os("PI_CODING_AGENT_DIR")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -664,6 +745,35 @@ fn pi_metas(agent_dir: &Path, panes: &[&Pane]) -> Vec<SessionMeta> {
             parse_pi_session(&text, time_to_ms(modified))
         })
         .collect()
+}
+
+/// Whether pi recorded a session `id` for `cwd`: a session file there whose
+/// header carries that id.
+pub fn pi_session_in_cwd(cwd: &Path, id: &str) -> bool {
+    pi_session_file(&pi_agent_dir(), cwd, id).is_some()
+}
+
+pub(crate) fn pi_session_file(agent_dir: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
+    let dir = agent_dir.join("sessions").join(pi_session_dir_name(cwd));
+    fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        .find(|p| pi_header_id(p).as_deref() == Some(id))
+}
+
+fn pi_header_id(path: &Path) -> Option<String> {
+    let mut first = String::new();
+    BufReader::new(fs::File::open(path).ok()?)
+        .take(64 * 1024)
+        .read_line(&mut first)
+        .ok()?;
+    let header: Value = serde_json::from_str(&first).ok()?;
+    if header.get("type").and_then(Value::as_str) != Some("session") {
+        return None;
+    }
+    header.get("id")?.as_str().map(str::to_string)
 }
 
 fn latest_jsonl(dir: &Path) -> Option<PathBuf> {

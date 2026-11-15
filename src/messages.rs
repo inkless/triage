@@ -206,8 +206,9 @@ fn run(args: &[String]) -> Result<(), (i32, String)> {
     let mut json = false;
     let mut follow = false;
     let mut i = 0;
-    let valid =
-        |s: &str| mailbox::is_uuid(s) || (s.len() == 8 && s.bytes().all(|b| b.is_ascii_hexdigit()));
+    let valid = |s: &str| {
+        mailbox::is_agent_id(s) || (s.len() == 8 && s.bytes().all(|b| b.is_ascii_alphanumeric()))
+    };
     while i < args.len() {
         match args[i].as_str() {
             "--json" => json = true,

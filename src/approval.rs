@@ -532,12 +532,14 @@ enum Action {
 struct Selection {
     claude: bool,
     codex: bool,
+    pi: bool,
     approval: bool,
     midturn: bool,
 }
 
-const HOOKS_USAGE: &str = "usage: triage hooks install|uninstall|status [--claude] [--codex] [--approval] [--midturn] [--dry-run]\n\
-  With no hook flags: the Claude and Codex peer-messaging hooks.\n\
+const HOOKS_USAGE: &str = "usage: triage hooks install|uninstall|status [--claude] [--codex] [--pi] [--approval] [--midturn] [--dry-run]\n\
+  With no hook flags: the Claude, Codex and pi peer-messaging hooks.\n\
+  --pi         the pi extension that delivers mail into pi sessions\n\
   --approval   the PreToolUse approval hook (same as --install-hooks)\n\
   --midturn    also deliver mail between tool calls (PostToolUse drain)";
 
@@ -553,6 +555,7 @@ pub fn cli_hooks(args: &[String]) -> i32 {
             "status" if action.is_none() => action = Some(Action::Status),
             "--claude" => selection.claude = true,
             "--codex" => selection.codex = true,
+            "--pi" => selection.pi = true,
             "--approval" => selection.approval = true,
             "--midturn" => selection.midturn = true,
             "--dry-run" => dry_run = true,
@@ -570,9 +573,10 @@ pub fn cli_hooks(args: &[String]) -> i32 {
         eprintln!("{HOOKS_USAGE}");
         return 2;
     };
-    if !selection.claude && !selection.codex && !selection.approval {
+    if !selection.claude && !selection.codex && !selection.pi && !selection.approval {
         selection.claude = true;
         selection.codex = true;
+        selection.pi = true;
     }
     if selection.midturn && (action != Action::Install || !(selection.claude || selection.codex)) {
         eprintln!("--midturn only applies to installing the messaging hooks\n{HOOKS_USAGE}");
@@ -602,15 +606,17 @@ fn run_hooks_action(action: Action, selection: Selection, dry_run: bool) -> io::
     let script = hook_install_path()
         .ok_or_else(|| io::Error::other("HOME is unset; cannot locate install path"))?;
     let script_str = script.display().to_string();
-    let triage = if (selection.claude || selection.codex) && action != Action::Uninstall {
-        let (path, warning) = triage_command_path();
-        if let Some(warning) = warning {
-            eprintln!("warning: {warning}");
-        }
-        path
-    } else {
-        String::new()
-    };
+    let triage_binary =
+        if (selection.claude || selection.codex || selection.pi) && action != Action::Uninstall {
+            let (path, warning) = triage_binary_path();
+            if let Some(warning) = warning {
+                eprintln!("warning: {warning}");
+            }
+            path
+        } else {
+            String::new()
+        };
+    let triage = shell_word(&triage_binary);
 
     let mut targets = Vec::new();
     if selection.approval || selection.claude {
@@ -646,7 +652,10 @@ fn run_hooks_action(action: Action, selection: Selection, dry_run: bool) -> io::
     for target in &targets {
         run_target(action, target, dry_run)?;
     }
-    if action == Action::Status && (selection.claude || selection.codex) {
+    if selection.pi {
+        run_pi_extension(action, &triage_binary, dry_run)?;
+    }
+    if action == Action::Status && (selection.claude || selection.codex || selection.pi) {
         print_waiters();
     }
 
@@ -1045,8 +1054,8 @@ fn split_command(command: &str) -> (String, &str) {
 
 /// The first `triage` on PATH that is this binary, kept in its PATH form
 /// (e.g. `/opt/homebrew/bin/triage`) so upgrades that swap the target keep
-/// working; otherwise this binary's own path.
-fn triage_command_path() -> (String, Option<String>) {
+/// working; otherwise this binary's own path. Not shell-quoted.
+fn triage_binary_path() -> (String, Option<String>) {
     let exe = std::env::current_exe().ok();
     let exe_canonical = exe.as_ref().and_then(|e| e.canonicalize().ok());
     let on_path = std::env::var_os("PATH").and_then(|path| {
@@ -1058,9 +1067,9 @@ fn triage_command_path() -> (String, Option<String>) {
             })
     });
     match (on_path, exe) {
-        (Some(path), _) => (shell_word(&path.display().to_string()), None),
+        (Some(path), _) => (path.display().to_string(), None),
         (None, Some(exe)) => (
-            shell_word(&exe.display().to_string()),
+            exe.display().to_string(),
             Some(format!(
                 "this triage binary is not the `triage` on PATH; hooks will run {}",
                 exe.display()
@@ -1136,11 +1145,11 @@ fn print_waiters() {
             record.provider,
             store.try_lock(crate::mailbox::LockKind::Waiter, &agent),
         ) {
-            (Provider::Claude, Ok(None)) => "waiter live",
-            (Provider::Claude, Ok(Some(_))) => "no waiter",
-            (Provider::Claude, Err(_)) => "waiter unknown",
+            (Provider::Claude | Provider::Pi, Ok(None)) => "waiter live",
+            (Provider::Claude | Provider::Pi, Ok(Some(_))) => "no waiter",
+            (Provider::Claude | Provider::Pi, Err(_)) => "waiter unknown",
             (Provider::Codex, _) => "sync hooks",
-            (Provider::Opencode | Provider::Pi, _) => "no hooks",
+            (Provider::Opencode, _) => "no hooks",
         };
         println!(
             "pid {:<7} {:<6} agent {} session {}  {waiter}",
@@ -1150,6 +1159,80 @@ fn print_waiters() {
             crate::mailbox::short_id(&record.current_session),
         );
     }
+}
+
+const PI_EXTENSION: &str = include_str!("../scripts/hooks/triage-mail.pi.ts");
+const PI_EXTENSION_MARKER: &str = "Written by `triage hooks install --pi`";
+const PI_EXTENSION_LABEL: &str = "pi mail extension";
+
+fn pi_extension_source(triage: &str) -> String {
+    let literal = serde_json::to_string(triage).expect("a string always serializes");
+    PI_EXTENSION.replace("__TRIAGE__", &literal)
+}
+
+/// pi auto-loads every extension in its `extensions/` directory, so the
+/// pi target is one file triage owns there rather than a settings entry.
+fn run_pi_extension(action: Action, triage: &str, dry_run: bool) -> io::Result<()> {
+    let agent_dir = crate::pane_agents::pi_agent_dir();
+    if !agent_dir.is_dir() {
+        println!("pi: {} not found; skipping", agent_dir.display());
+        return Ok(());
+    }
+    let path = agent_dir.join("extensions/triage-mail.ts");
+    let existing = fs::read_to_string(&path).ok();
+    let ours = existing
+        .as_deref()
+        .is_none_or(|text| text.contains(PI_EXTENSION_MARKER));
+    let desired = pi_extension_source(triage);
+    match action {
+        Action::Status => {
+            let state = match &existing {
+                None => "missing",
+                Some(text) if *text == desired => "installed",
+                Some(_) if ours => "stale (differs from this triage's extension)",
+                Some(_) => "not triage's (left alone)",
+            };
+            println!("pi ({}):", path.display());
+            println!("{PI_EXTENSION_LABEL:<44} {state}");
+        }
+        Action::Install => {
+            if !ours {
+                return Err(io::Error::other(format!(
+                    "{} exists and was not written by triage; not replacing it",
+                    path.display()
+                )));
+            }
+            if existing.as_deref() == Some(desired.as_str()) {
+                println!("pi: {} already up to date (no changes)", path.display());
+            } else if dry_run {
+                println!("DRY RUN — would write {}", path.display());
+            } else {
+                let dir = path.parent().expect("joined above");
+                fs::create_dir_all(dir)?;
+                let temp = dir.join(".triage-mail.ts.tmp");
+                fs::write(&temp, &desired)?;
+                fs::rename(&temp, &path)?;
+                println!("Wrote {}", path.display());
+                println!(
+                    "  pi loads extensions at startup: sessions started before now keep pasted delivery until /reload or restart."
+                );
+            }
+        }
+        Action::Uninstall => match existing {
+            None => println!("pi: {} not installed", path.display()),
+            Some(_) if !ours => println!(
+                "pi: {} was not written by triage; leaving it",
+                path.display()
+            ),
+            Some(_) if dry_run => println!("DRY RUN — would remove {}", path.display()),
+            Some(_) => {
+                fs::remove_file(&path)?;
+                println!("Removed {}", path.display());
+                clear_host_records(Provider::Pi)?;
+            }
+        },
+    }
+    Ok(())
 }
 
 /// A host record is what makes a target hook-capable; without the hooks it

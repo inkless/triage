@@ -18,6 +18,8 @@ const STALE_TMP_MS: u64 = 60_000;
 const UNSIGNED_CLAIM_MS: u64 = 60_000;
 const IDLE_WAITERLESS_CLAIM_MS: u64 = 30_000;
 const DEAD_HOST_BOUNCE_MS: u64 = 30_000;
+/// How long pi's extension has to confirm it injected printed mail.
+pub const ACK_GRACE_MS: u64 = 60_000;
 
 /// What the transcript after a claim says about it. Built only when the scan
 /// completed; an incomplete scan must never be read as "not delivered".
@@ -64,6 +66,15 @@ pub fn verdict(view: &ClaimView) -> Verdict {
             (false, _) => Verdict::Keep,
             (true, true) => Verdict::Release,
             (true, false) => Verdict::Revert,
+        };
+    }
+    if claim.awaiting_ack {
+        let printed = claim.printed_at_ms.unwrap_or(0);
+        return if view.host == Liveness::Dead || view.now_ms.saturating_sub(printed) > ACK_GRACE_MS
+        {
+            Verdict::Revert
+        } else {
+            Verdict::Keep
         };
     }
     let Some(facts) = view.facts else {
@@ -239,10 +250,10 @@ pub fn reconcile_all(store: &Store) -> io::Result<()> {
 
 fn dead_marker(store: &Store, host: HostId, record: &crate::mailbox::HostRecord) -> PathBuf {
     let suffix = match record.provider {
-        crate::models::Provider::Claude => String::new(),
-        crate::models::Provider::Codex
-        | crate::models::Provider::Opencode
-        | crate::models::Provider::Pi => format!("@{}", record.current_session),
+        crate::models::Provider::Claude | crate::models::Provider::Pi => String::new(),
+        crate::models::Provider::Codex | crate::models::Provider::Opencode => {
+            format!("@{}", record.current_session)
+        }
     };
     store
         .root()
@@ -358,6 +369,7 @@ mod tests {
             transcript_offset: 0,
             printed_at_ms: printed,
             head_only: false,
+            awaiting_ack: false,
         }
     }
 
@@ -397,6 +409,28 @@ mod tests {
         };
         assert_eq!(verdict(&dead(&waiter)), Verdict::Release);
         assert_eq!(verdict(&dead(&drain)), Verdict::Revert);
+    }
+
+    #[test]
+    fn printed_mail_nobody_confirmed_returns_to_pending_after_the_grace() {
+        let unconfirmed = |printed| Claim {
+            awaiting_ack: true,
+            ..claim("", Some(printed))
+        };
+        let gone = |c| ClaimView {
+            claimer: Liveness::Dead,
+            facts: None,
+            ..view(Some(c))
+        };
+        let fresh = unconfirmed(NOW - 5_000);
+        assert_eq!(verdict(&gone(&fresh)), Verdict::Keep);
+        let stale = unconfirmed(NOW - ACK_GRACE_MS - 1);
+        assert_eq!(verdict(&gone(&stale)), Verdict::Revert);
+        let host_gone = ClaimView {
+            host: Liveness::Dead,
+            ..gone(&fresh)
+        };
+        assert_eq!(verdict(&host_gone), Verdict::Revert);
     }
 
     #[test]

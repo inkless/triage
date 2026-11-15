@@ -116,6 +116,19 @@ pub fn is_uuid(s: &str) -> bool {
         })
 }
 
+/// opencode names sessions `ses_` plus an alphanumeric id. Kept as the agent
+/// id rather than mapped to a UUID so the mailbox, audit and opencode agree.
+pub fn is_opencode_session(s: &str) -> bool {
+    s.strip_prefix("ses_").is_some_and(|rest| {
+        (1..=64).contains(&rest.len()) && rest.bytes().all(|b| b.is_ascii_alphanumeric())
+    })
+}
+
+/// Agent and session ids that may name a mailbox or appear in a file name.
+pub fn is_agent_id(s: &str) -> bool {
+    is_uuid(s) || is_opencode_session(s)
+}
+
 pub fn is_nonce(s: &str) -> bool {
     s.len() == 16 && s.bytes().all(is_lower_hex)
 }
@@ -134,6 +147,14 @@ fn invalid(what: &str, value: &str) -> io::Error {
 
 fn check_uuid(what: &str, value: &str) -> io::Result<()> {
     if is_uuid(value) {
+        Ok(())
+    } else {
+        Err(invalid(what, value))
+    }
+}
+
+fn check_agent_id(what: &str, value: &str) -> io::Result<()> {
+    if is_agent_id(value) {
         Ok(())
     } else {
         Err(invalid(what, value))
@@ -180,6 +201,10 @@ pub enum DeliveredVia {
     CodexUserPromptSubmit,
     CodexPostToolUse,
     LegacyPaste,
+    OpencodeServer,
+    /// Sent to the opencode server, which never answered.
+    OpencodeServerUnconfirmed,
+    PiExtension,
     Inbox,
     InboxShow,
 }
@@ -187,10 +212,10 @@ pub enum DeliveredVia {
 impl Message {
     fn validate(&self) -> io::Result<()> {
         check_uuid("message id", &self.id)?;
-        check_uuid("sender agent", &self.from.agent)?;
-        check_uuid("sender session", &self.from.session)?;
-        check_uuid("recipient agent", &self.to.agent)?;
-        check_uuid("recipient session", &self.to.session_at_send)?;
+        check_agent_id("sender agent", &self.from.agent)?;
+        check_agent_id("sender session", &self.from.session)?;
+        check_agent_id("recipient agent", &self.to.agent)?;
+        check_agent_id("recipient session", &self.to.session_at_send)?;
         if let Some(bounced) = &self.bounce_of {
             check_uuid("bounced message id", bounced)?;
         }
@@ -214,6 +239,10 @@ pub struct Claim {
     /// Only the head was delivered; confirmation moves it to `notified/`.
     #[serde(default)]
     pub head_only: bool,
+    /// Printed for a reader that confirms injecting it (pi's extension);
+    /// unconfirmed, it goes back to pending.
+    #[serde(default)]
+    pub awaiting_ack: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -292,7 +321,7 @@ impl Inflight {
         let mut parts = stem.split('@');
         let (id, session, pid, start) =
             (parts.next()?, parts.next()?, parts.next()?, parts.next()?);
-        if parts.next().is_some() || !is_uuid(id) || !is_uuid(session) {
+        if parts.next().is_some() || !is_uuid(id) || !is_agent_id(session) {
             return None;
         }
         Some(Self {
@@ -353,7 +382,7 @@ impl Store {
     }
 
     pub fn mailbox(&self, agent: &str) -> io::Result<Mailbox> {
-        check_uuid("agent id", agent)?;
+        check_agent_id("agent id", agent)?;
         Ok(Mailbox {
             dir: self.root.join("mail").join(agent),
         })
@@ -410,10 +439,12 @@ impl Store {
         }
     }
 
+    /// A Claude or pi process runs one session at a time, so its record is
+    /// keyed by the process; a Codex process runs several threads at once.
     fn host_key(host: HostId, provider: Provider, session: &str) -> String {
         match provider {
-            Provider::Claude => host.key(),
-            Provider::Codex | Provider::Opencode | Provider::Pi => {
+            Provider::Claude | Provider::Pi => host.key(),
+            Provider::Codex | Provider::Opencode => {
                 format!("{}@{session}", host.key())
             }
         }
@@ -484,7 +515,7 @@ impl Store {
     pub fn agents(&self) -> Vec<String> {
         list_names(&self.root.join("mail"))
             .into_iter()
-            .filter(|name| is_uuid(name))
+            .filter(|name| is_agent_id(name))
             .collect()
     }
 
@@ -638,6 +669,14 @@ impl Mailbox {
         self.publish(State::Pasted, &msg)
     }
 
+    /// For a channel that confirms delivery synchronously.
+    pub fn record_delivered(&self, msg: &Message, via: DeliveredVia, now: u64) -> io::Result<()> {
+        let mut msg = msg.clone();
+        msg.delivered_at_ms = Some(now);
+        msg.delivered_via = Some(via);
+        self.publish(State::Delivered, &msg)
+    }
+
     /// Message ids in `state`, oldest first. Not meaningful for `Inflight`.
     pub fn ids(&self, state: State) -> Vec<String> {
         let mut ids: Vec<String> = list_names(&self.state_dir(state))
@@ -691,7 +730,7 @@ impl Mailbox {
         claim: &Claim,
     ) -> io::Result<Option<Inflight>> {
         check_uuid("message id", id)?;
-        check_uuid("session id", session)?;
+        check_agent_id("session id", session)?;
         ensure_dir(&self.state_dir(State::Inflight))?;
         let inflight = Inflight {
             id: id.to_string(),
@@ -1217,6 +1256,7 @@ mod tests {
             transcript_offset: 0,
             printed_at_ms: None,
             head_only: false,
+            awaiting_ack: false,
         }
     }
 
@@ -1248,6 +1288,14 @@ mod tests {
         }
         assert!(is_uuid(ALICE));
         assert!(Store::at("/nonexistent").mailbox("../../etc").is_err());
+        for bad in [
+            "ses_", "ses_../x", "ses_a/b", "ses_a@b", "ses_a.b", "sess_a", "ses_a\n",
+        ] {
+            assert!(!is_agent_id(bad), "{bad:?}");
+            assert!(Store::at("/nonexistent").mailbox(bad).is_err(), "{bad:?}");
+        }
+        assert!(is_agent_id("ses_1a2Bc3"));
+        assert!(!is_agent_id(&format!("ses_{}", "a".repeat(65))));
     }
 
     #[test]

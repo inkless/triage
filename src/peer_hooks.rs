@@ -1,6 +1,7 @@
 //! Hook entrypoints (`triage inbox --hook …`) that deliver mailbox mail into a
 //! running agent. They run inside the agent's hook machinery: never load
-//! config, never spawn subprocesses, never write to stderr except the Claude
+//! config, never spawn subprocesses (but `lsof` for a pi process's directory
+//! outside Linux and macOS), never write to stderr except the Claude
 //! waiter's delivery, and always exit 0 on error (logging to `hook.log`).
 
 use std::io::{self, Read, Write};
@@ -27,6 +28,8 @@ const DRAIN_TIME_LIMIT: Duration = Duration::from_secs(3);
 const MAX_PAYLOAD_BYTES: u64 = 1024 * 1024;
 const MAX_HOST_HOPS: usize = 32;
 const EXIT_WAKE: i32 = 2;
+/// pi's waiter returns unconfirmed deliveries to pending on this cadence.
+const RECONCILE_EVERY_RESCANS: u32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Event {
@@ -34,6 +37,10 @@ enum Event {
     Stop,
     UserPromptSubmit,
     PostToolUse,
+    /// pi's mail waiter, spawned by triage's pi extension.
+    Wait,
+    /// pi's extension confirming it injected what the waiter printed.
+    Ack,
 }
 
 struct HookArgs {
@@ -47,7 +54,7 @@ struct Payload {
     transcript_path: Option<PathBuf>,
 }
 
-/// `triage inbox --hook <claude|codex> <event> [--wait] --triage-hook=v1`.
+/// `triage inbox --hook <claude|codex|pi> <event> [--wait] --triage-hook=v1`.
 /// Returns the process exit code.
 pub fn cli(args: &[String]) -> i32 {
     // Triage's own one-shot `claude -p --name triage-auditor` audit call
@@ -81,13 +88,16 @@ fn parse_args(args: &[String]) -> io::Result<HookArgs> {
     let provider = match args.first().map(String::as_str) {
         Some("claude") => Provider::Claude,
         Some("codex") => Provider::Codex,
-        _ => return Err(bad("expected claude or codex")),
+        Some("pi") => Provider::Pi,
+        _ => return Err(bad("expected claude, codex or pi")),
     };
     let event = match args.get(1).map(String::as_str) {
         Some("session-start") => Event::SessionStart,
         Some("stop") => Event::Stop,
         Some("user-prompt-submit") => Event::UserPromptSubmit,
         Some("post-tool-use") => Event::PostToolUse,
+        Some("wait") => Event::Wait,
+        Some("ack") => Event::Ack,
         _ => return Err(bad("unknown hook event")),
     };
     let mut wait = false;
@@ -147,6 +157,9 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
     let payload = parse_payload(stdin, hook.provider)?;
     let host = find_host(hook.provider)
         .ok_or_else(|| io::Error::other("no harness process among this hook's ancestors"))?;
+    if hook.provider == Provider::Pi {
+        return run_pi(store, hook.event, host, &payload, stdin);
+    }
     let agent = register(store, host, hook.provider, &payload.session, hook.event)?;
     let mailbox = store.mailbox(&agent)?;
     match (hook.provider, hook.event) {
@@ -155,7 +168,7 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
             if !hook.wait {
                 return Ok(0);
             }
-            wait_for_mail(store, &mailbox, &agent, host, &payload)
+            wait_for_mail(store, &mailbox, &agent, host, &payload, Provider::Claude)
         }
         (Provider::Claude, Event::PostToolUse) => drain(
             store,
@@ -167,6 +180,7 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
             DeliveredVia::ClaudePostToolUse,
         ),
         (Provider::Claude, Event::UserPromptSubmit)
+        | (Provider::Claude | Provider::Codex, Event::Wait | Event::Ack)
         | (Provider::Codex, Event::Stop)
         | (Provider::Opencode | Provider::Pi, _) => Err(io::Error::other(
             "no triage hook is installed for this event",
@@ -195,8 +209,136 @@ fn run(store: &Store, hook: &HookArgs, stdin: &str) -> io::Result<i32> {
     }
 }
 
+/// pi's extension starts `session-start` when a session begins, which makes
+/// the pi process the host of that session, then keeps one `wait` running:
+/// it blocks until mail arrives, prints it and exits for the extension to
+/// inject. Each pi process runs one session at a time, so the host record
+/// names its current one, and a waiter for any other session just exits.
+fn run_pi(
+    store: &Store,
+    event: Event,
+    host: HostId,
+    payload: &Payload,
+    stdin: &str,
+) -> io::Result<i32> {
+    let agent = payload.session.as_str();
+    match event {
+        Event::SessionStart => {
+            if register_pi(store, host, agent)? {
+                crate::reconcile::reconcile_agent(store, agent)?;
+            }
+            Ok(0)
+        }
+        Event::Wait => {
+            let hosting = match host_current_session(store, host) {
+                Some(current) => current == agent,
+                None => register_pi(store, host, agent)?,
+            };
+            if !hosting {
+                return Ok(0);
+            }
+            let mailbox = store.mailbox(agent)?;
+            wait_for_mail(store, &mailbox, agent, host, payload, Provider::Pi)
+        }
+        Event::Ack => {
+            let acks: Vec<Ack> = serde_json::from_str::<Value>(stdin)?
+                .get("ack")
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()?
+                .unwrap_or_default();
+            commit_acked(&store.mailbox(agent)?, host, &acks)?;
+            Ok(0)
+        }
+        Event::Stop | Event::UserPromptSubmit | Event::PostToolUse => Err(io::Error::other(
+            "no triage hook is installed for this event",
+        )),
+    }
+}
+
+/// Anything the pi process runs can call these hooks with any id, so the
+/// session must be one pi recorded for the process's directory and that no
+/// other live pi process holds. pi writes a new session's file only once it
+/// has a message, so until then the process hosts nothing: its old record is
+/// dropped, and the extension's waiter registers the session when it can.
+/// A waiter never displaces a session the process already hosts.
+fn register_pi(store: &Store, host: HostId, session: &str) -> io::Result<bool> {
+    let known = process_cwd(host.pid).is_some_and(|cwd| {
+        crate::pane_agents::pi_session_file(&crate::pane_agents::pi_agent_dir(), &cwd, session)
+            .is_some()
+    });
+    let held_elsewhere = store.hosts().into_iter().any(|(other, record)| {
+        other != host
+            && record.provider == Provider::Pi
+            && record.current_session == session
+            && mailbox::liveness(other) == Liveness::Alive
+    });
+    if !known || held_elsewhere {
+        if let Some(record) = store.read_host(host).filter(|r| r.provider == Provider::Pi) {
+            store.remove_host_record(host, &record)?;
+        }
+        return Ok(false);
+    }
+    store.write_host(
+        host,
+        &HostRecord {
+            v: 1,
+            provider: Provider::Pi,
+            hook_version: HOOK_VERSION.to_string(),
+            current_session: session.to_string(),
+            updated_at_ms: mailbox::now_ms(),
+        },
+    )?;
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+/// From the kernel, not `lsof`: a hook may run with any PATH.
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_vnodepathinfo>() as libc::c_int;
+    let filled = unsafe {
+        libc::proc_pidinfo(
+            pid as libc::c_int,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+            size,
+        )
+    };
+    if filled != size {
+        return None;
+    }
+    let path: Vec<u8> = info
+        .pvi_cdir
+        .vip_path
+        .as_flattened()
+        .iter()
+        .take_while(|&&c| c != 0)
+        .map(|&c| c as u8)
+        .collect();
+    (!path.is_empty()).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&path)))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn process_cwd(pid: u32) -> Option<PathBuf> {
+    let out = std::process::Command::new("lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+}
+
 /// The nearest ancestor that is the harness process: for Claude a pid with a
-/// `~/.claude/sessions/<pid>.json` record, for Codex a process named `codex`.
+/// `~/.claude/sessions/<pid>.json` record, for Codex a process named `codex`., for pi a process named `pi`.
 fn find_host(provider: Provider) -> Option<HostId> {
     let sessions_dir = crate::discovery::sessions_dir();
     let mut pid = std::os::unix::process::parent_id();
@@ -208,7 +350,8 @@ fn find_host(provider: Provider) -> Option<HostId> {
         let is_host = match provider {
             Provider::Claude => sessions_dir.join(format!("{pid}.json")).exists(),
             Provider::Codex => info.comm == "codex" || is_test_codex_host(pid),
-            Provider::Opencode | Provider::Pi => false,
+            Provider::Pi => info.comm == "pi" || is_test_pane_harness(pid),
+            Provider::Opencode => false,
         };
         if is_host {
             return Some(HostId {
@@ -226,6 +369,14 @@ fn find_host(provider: Provider) -> Option<HostId> {
 fn is_test_codex_host(pid: u32) -> bool {
     cfg!(debug_assertions)
         && std::env::var("TRIAGE_TEST_CODEX_HOST").is_ok_and(|v| v == pid.to_string())
+}
+
+/// Integration tests can't run a real opencode or pi either; debug builds let
+/// them name pids (comma-separated) that stand in for harness processes.
+pub(crate) fn is_test_pane_harness(pid: u32) -> bool {
+    cfg!(debug_assertions)
+        && std::env::var("TRIAGE_TEST_PANE_HARNESS")
+            .is_ok_and(|v| v.split(',').any(|p| p == pid.to_string()))
 }
 
 /// Links the session into its agent's lineage and records the host's current
@@ -300,8 +451,11 @@ fn wait_for_mail(
     agent: &str,
     host: HostId,
     payload: &Payload,
+    reader: Provider,
 ) -> io::Result<i32> {
-    block_sigterm();
+    if reader == Provider::Claude {
+        block_sigterm();
+    }
     let started = Instant::now();
     let deadline = started + Duration::from_secs(WAITER_TIMEOUT_SECS) - WAITER_DEADLINE_MARGIN;
     let _lock = loop {
@@ -340,7 +494,12 @@ fn wait_for_mail(
         .watch(&pending_dir, RecursiveMode::NonRecursive)
         .map_err(io::Error::other)?;
 
+    let mut rescans = 0u32;
     loop {
+        if reader == Provider::Pi && rescans.is_multiple_of(RECONCILE_EVERY_RESCANS) {
+            crate::reconcile::reconcile_agent(store, agent)?;
+        }
+        rescans = rescans.wrapping_add(1);
         if mailbox::liveness(host) == Liveness::Dead
             || host_current_session(store, host).as_deref() != Some(payload.session.as_str())
             || Instant::now() >= deadline
@@ -366,14 +525,14 @@ fn wait_for_mail(
                 transcript_offset: offset,
                 printed_at_ms: None,
                 head_only: false,
+                awaiting_ack: false,
             };
-            if let Some(batch) = claim_batch(
-                mailbox,
-                &payload.session,
-                host,
-                Provider::Claude,
-                &claim_template,
-            )? {
+            if let Some(batch) =
+                claim_batch(mailbox, &payload.session, host, reader, &claim_template)?
+            {
+                if reader == Provider::Pi {
+                    return hand_to_pi(mailbox, &batch);
+                }
                 let mut stderr = io::stderr().lock();
                 stderr.write_all(batch.text.as_bytes())?;
                 stderr.flush()?;
@@ -388,6 +547,67 @@ fn wait_for_mail(
         }
         let _ = rx.recv_timeout(RESCAN_INTERVAL);
     }
+}
+
+/// One printed message the extension confirms injecting.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Ack {
+    id: String,
+    nonce: String,
+}
+
+/// Prints the batch for pi's extension as `{"text", "ack"}`. The claims stay
+/// inflight until the extension, having injected the text, hands `ack` back
+/// to `inbox --hook pi ack`; reconcile returns unconfirmed ones to pending.
+fn hand_to_pi(mailbox: &Mailbox, batch: &Batch) -> io::Result<i32> {
+    let acks: Vec<Ack> = batch
+        .claims
+        .iter()
+        .map(|(inflight, claim)| Ack {
+            id: inflight.id.clone(),
+            nonce: claim.nonce.clone(),
+        })
+        .collect();
+    let printed = mailbox::now_ms();
+    for (inflight, claim) in &batch.claims {
+        let claim = Claim {
+            printed_at_ms: Some(printed),
+            awaiting_ack: true,
+            ..claim.clone()
+        };
+        mailbox.write_claim(inflight, &claim)?;
+    }
+    let output = serde_json::json!({ "text": batch.text, "ack": acks });
+    let written = serde_json::to_writer(io::stdout().lock(), &output)
+        .map_err(io::Error::from)
+        .and_then(|()| io::stdout().flush());
+    if written.is_err() {
+        for (inflight, _) in &batch.claims {
+            mailbox.release(inflight)?;
+        }
+    }
+    written.map(|()| 0)
+}
+
+fn commit_acked(mailbox: &Mailbox, host: HostId, acks: &[Ack]) -> io::Result<()> {
+    for inflight in mailbox.inflight() {
+        let Some(claim) = mailbox.read_claim(&inflight) else {
+            continue;
+        };
+        let acked = acks
+            .iter()
+            .any(|ack| ack.id == inflight.id && ack.nonce == claim.nonce);
+        if !acked || !claim.awaiting_ack || inflight.host != host {
+            continue;
+        }
+        let to = if claim.head_only {
+            State::Notified
+        } else {
+            State::Delivered
+        };
+        mailbox.commit(&inflight, to, DeliveredVia::PiExtension, mailbox::now_ms())?;
+    }
+    Ok(())
 }
 
 struct Batch {
@@ -489,6 +709,7 @@ fn drain(
         transcript_offset: 0,
         printed_at_ms: None,
         head_only: false,
+        awaiting_ack: false,
     };
     if started.elapsed() >= DRAIN_TIME_LIMIT {
         return Ok(0);
