@@ -32,7 +32,7 @@ impl Fixture {
                 "\n",
                 r#"{"type":"session_info","id":"i1","timestamp":"2026-10-14T18:49:14Z","name":"pi-worker"}"#,
                 "\n",
-                r#"{"type":"message","id":"m1","timestamp":"2026-10-14T18:49:15Z","message":{"role":"user"}}"#,
+                r#"{"type":"message","id":"m1","timestamp":"2026-10-14T18:49:15Z","message":{"role":"user","content":[{"type":"text","text":"please fix pi"}]}}"#,
                 "\n",
             ),
         )
@@ -57,7 +57,7 @@ case "$*" in
 *"where id = 'ses_oc'"*|*"where id = 'ses_twin'"*) printf '[{"directory":"/work/oc"}]' ;;
 *"time_updated >="*) printf '[{"id":"ses_oc","directory":"/work/oc","time_updated":2000000000000}%s]' "$EXTRA_OC_ROWS" ;;
 *"where id ="*) printf '[{"directory":"/work/other"}]' ;;
-*session_v2*) printf '[{"id":"ses_oc","directory":"/work/oc","title":"Fix the parser","time_created":1,"time_updated":2000000000000,"time_busy":%s,"time_idle":20}]' "${OC_BUSY_AT:-10}" ;;
+*session_v2*) printf '[{"id":"ses_oc","directory":"/work/oc","title":"Fix the parser","time_created":1,"time_updated":2000000000000,"time_busy":%s,"time_idle":20,"last_user_text":"please fix the parser"}]' "${OC_BUSY_AT:-10}" ;;
 esac
 "#,
             ),
@@ -68,6 +68,14 @@ case "$*" in
 *etime*) [ -n "$HARNESS_ARGS" ] && echo "  00:05 $HARNESS_ARGS" ;;
 *tty*|*comm*) ;;
 *) echo "$PPID 777001"; echo "777001 777000"; echo "777000 1"; if [ -n "$EXTRA_PS" ]; then echo "$EXTRA_PS"; fi ;;
+esac
+"#,
+            ),
+            (
+                "podman",
+                r#"
+case "$*" in
+*ps*) printf '%s\n' '[{"Pid":777001,"Labels":{"triage.harness":"pi","triage.pane":"%23","triage.agent_dir":"'"$HOME"'/.pi/agent"}}]' ;;
 esac
 "#,
             ),
@@ -135,8 +143,8 @@ fn lists_opencode_and_pi_panes_with_session_names_and_state() {
 
     let oc = row(&rows, "%30");
     assert_eq!(oc["provider"], "oc");
-    assert_eq!(oc["name"], "opencode:%30");
-    assert_eq!(oc["headline"], "Fix the parser");
+    assert_eq!(oc["name"], "Fix the parser");
+    assert_eq!(oc["headline"], "please fix the parser");
     assert_eq!(oc["cwd"], "/work/oc");
     assert_eq!(oc["session_id"], "ses_oc");
     assert_eq!(oc["agent_id"], "ses_oc");
@@ -145,6 +153,7 @@ fn lists_opencode_and_pi_panes_with_session_names_and_state() {
     let pi = row(&rows, "%31");
     assert_eq!(pi["provider"], "pi");
     assert_eq!(pi["name"], "pi-worker");
+    assert_eq!(pi["headline"], "please fix pi");
     assert_eq!(pi["cwd"], "/work/pi");
     assert_eq!(pi["session_id"], PI_SESSION);
     assert_eq!(pi["state"], "Working");
@@ -153,6 +162,50 @@ fn lists_opencode_and_pi_panes_with_session_names_and_state() {
     let only_pi: Vec<serde_json::Value> = serde_json::from_slice(&only_pi.stdout).unwrap();
     assert_eq!(only_pi.len(), 1);
     assert_eq!(only_pi[0]["pane_id"], "%31");
+}
+
+#[test]
+fn an_opencode_database_without_usage_columns_still_names_the_pane() {
+    let fx = Fixture::new(
+        "oldschema",
+        r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'"#,
+    );
+    let sqlite3 = fx.dir.join("sqlite3");
+    fs::write(
+        &sqlite3,
+        r#"#!/bin/sh
+case "$*" in
+*tokens_cache_read*) echo "no such column: tokens_cache_read" >&2; exit 1 ;;
+*session_v2*) printf '[{"id":"ses_oc","directory":"/work/oc","title":"Fix the parser","time_created":1,"time_updated":2000000000000,"time_busy":10,"time_idle":20}]' ;;
+esac
+"#,
+    )
+    .unwrap();
+    let rows = fx.agents();
+    let oc = row(&rows, "%30");
+    assert_eq!(oc["session_id"], "ses_oc");
+    assert_eq!(oc["name"], "Fix the parser");
+}
+
+#[test]
+fn a_locked_opencode_database_is_not_mistaken_for_an_old_schema() {
+    let fx = Fixture::new(
+        "locked",
+        r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'"#,
+    );
+    fs::write(
+        fx.dir.join("sqlite3"),
+        r#"#!/bin/sh
+echo "$*" >> "$HOME/sqlite-calls"
+echo "database is locked" >&2
+exit 5
+"#,
+    )
+    .unwrap();
+    let rows = fx.agents();
+    assert_eq!(row(&rows, "%30")["session_id"], "%30");
+    let calls = fs::read_to_string(fx.dir.join("sqlite-calls")).unwrap();
+    assert_eq!(calls.lines().count(), 1, "{calls}");
 }
 
 #[test]
@@ -187,15 +240,39 @@ fn a_missing_session_store_still_lists_the_pane() {
 }
 
 #[test]
-fn a_tmux_window_name_never_names_a_pane_agent() {
-    // pi wrote no `session_info` name; the window called "random" must not
-    // leak in as the agent's name.
+fn a_tmux_window_name_names_an_otherwise_unnamed_pane_agent() {
+    // pi wrote no `session_info` name, so the user-set window name is the best
+    // available identity for the row.
     let fx = Fixture::new(
         "window",
         r#"  echo 'pi|1.0|502|/dev/null|pi|/work/unnamed|1|%48|random'"#,
     );
     let rows = fx.agents();
-    assert_eq!(row(&rows, "%48")["name"], "pi:%48");
+    assert_eq!(row(&rows, "%48")["name"], "random");
+}
+
+#[test]
+fn a_session_name_beats_a_tmux_window_name() {
+    let fx = Fixture::new(
+        "sessionname",
+        r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|scratch-window'"#,
+    );
+    assert_eq!(row(&fx.agents(), "%30")["name"], "Fix the parser");
+}
+
+#[test]
+fn a_labeled_sandbox_container_lists_its_pi_session() {
+    let fx = Fixture::new(
+        "sandbox",
+        r#"  echo 'pi-sandbox|1.0|502|/dev/null|podman|/work/pi|1|%23|pi-sandbox'"#,
+    );
+    let rows = fx.agents();
+    let pi = row(&rows, "%23");
+    assert_eq!(pi["provider"], "pi");
+    assert_eq!(pi["name"], "pi-worker");
+    assert_eq!(pi["headline"], "please fix pi");
+    assert_eq!(pi["session_id"], PI_SESSION);
+    assert_eq!(pi["pane_id"], "%23");
 }
 
 #[test]

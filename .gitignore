@@ -30,6 +30,7 @@ scripts/triage-notify/triage-notify.app/
 # AI agent local config — per-machine, never committed
 .claude/*.local.*
 .claude/settings.local.json
+.claude/worktrees/
 .codex/*.local.*
 .cursor/*.local.*
 .aider.local.*
