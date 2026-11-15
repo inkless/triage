@@ -271,7 +271,7 @@ fn a_labeled_sandbox_container_lists_its_pi_session() {
     assert_eq!(pi["provider"], "pi");
     assert_eq!(pi["name"], "pi-worker");
     assert_eq!(pi["headline"], "please fix pi");
-    assert_eq!(pi["session_id"], "01a1-pi");
+    assert_eq!(pi["session_id"], PI_SESSION);
     assert_eq!(pi["pane_id"], "%23");
 }
 
