@@ -14,7 +14,6 @@ use crate::classifier::idle_age;
 use crate::config::Config;
 use crate::models::{ApprovalMode, AttentionState, Provider, Session, session_display_label};
 use crate::persist::{self, AliasKey, MuteKey};
-use crate::transcript::DigestCache;
 
 /// Cached live capture of one tmux pane for the preview rail (TRI-138).
 /// `raw` is the `-e` ANSI capture; `text` is its parsed ratatui form. We keep
@@ -52,8 +51,8 @@ pub struct AppState {
     /// compact table; Bottom = below the full-width table.
     pub preview_pos: PreviewPos,
     pub status_msg: Option<String>,
-    pub digest_cache: DigestCache,
-    pub codex_cache: crate::codex::CodexDigestCache,
+    /// Seconds the running discovery has gone past its stall threshold.
+    pub discovery_stalled_secs: Option<u64>,
     /// Triage-local row aliases keyed by provider + alias session id. For
     /// Codex this is the root thread id so aliases follow spawned child
     /// threads without following unrelated pane reuse.
@@ -199,6 +198,19 @@ pub struct AppState {
     pub spawn_picker_selected: usize,
 }
 
+#[derive(PartialEq, Eq)]
+enum RowIdentity {
+    Pane(String),
+    Pid(u32),
+}
+
+fn row_identity(s: &Session) -> RowIdentity {
+    match &s.pane {
+        Some(p) => RowIdentity::Pane(p.pane_id.clone()),
+        None => RowIdentity::Pid(s.pid),
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         let mut state = TableState::default();
@@ -216,8 +228,7 @@ impl AppState {
             preview: None,
             preview_pos: PreviewPos::default(),
             status_msg: None,
-            digest_cache: DigestCache::new(),
-            codex_cache: crate::codex::CodexDigestCache::new(),
+            discovery_stalled_secs: None,
             aliases,
             muted,
             pinned,
@@ -664,6 +675,22 @@ impl AppState {
         let cur = self.selected.selected().unwrap_or(0) as i32;
         let next = (cur + delta).rem_euclid(len as i32) as usize;
         self.selected.select(Some(next));
+    }
+
+    /// Swaps in a fresh discovery, keeping the cursor on the same row (by
+    /// pane, else pid) even if rows were added, removed or re-sorted.
+    pub fn replace_sessions(&mut self, sessions: Vec<Session>) {
+        let selected = self.selected_session().map(row_identity);
+        self.sessions = sessions;
+        if let Some(selected) = selected
+            && let Some(i) = self
+                .visible()
+                .iter()
+                .position(|s| row_identity(s) == selected)
+        {
+            self.selected.select(Some(i));
+        }
+        self.clamp_selection();
     }
 
     pub fn clamp_selection(&mut self) {
@@ -2407,6 +2434,69 @@ mod tests {
 
     use super::*;
 
+    fn row(pid: u32, pane_id: Option<&str>) -> Session {
+        let mut session = Session::new(
+            Provider::Claude,
+            pid,
+            format!("sid-{pid}"),
+            PathBuf::from("/repo"),
+            None,
+            "idle".into(),
+            0,
+            0,
+            None,
+        );
+        session.pane = pane_id.map(|id| Pane {
+            target: format!("main:{pid}.0"),
+            tmux_session: "main".into(),
+            window_name: "w".into(),
+            pane_id: id.into(),
+            pid,
+            tty: String::new(),
+            current_command: "claude".into(),
+            cwd: PathBuf::from("/repo"),
+            active: false,
+        });
+        session
+    }
+
+    #[test]
+    fn a_stalled_refresh_is_shown_unless_a_status_message_is_up() {
+        let mut app = AppState::new();
+        app.status_msg = None;
+        assert_eq!(footer_message(&app), None);
+        app.discovery_stalled_secs = Some(7);
+        assert_eq!(
+            footer_message(&app).as_deref(),
+            Some("  refresh stalled 7s")
+        );
+        app.status_msg = Some("approved".into());
+        assert_eq!(footer_message(&app).as_deref(), Some("approved"));
+    }
+
+    #[test]
+    fn new_sessions_keep_the_cursor_on_the_same_row() {
+        let mut app = AppState::new();
+        app.filter.clear();
+        app.sessions = vec![row(1, Some("%1")), row(2, Some("%2")), row(3, None)];
+        app.selected.select(Some(1));
+
+        app.replace_sessions(vec![
+            row(4, Some("%4")),
+            row(3, None),
+            row(1, Some("%1")),
+            row(20, Some("%2")),
+        ]);
+        assert_eq!(app.selected.selected(), Some(3));
+
+        app.selected.select(Some(1));
+        app.replace_sessions(vec![row(1, Some("%1")), row(3, None)]);
+        assert_eq!(app.selected.selected(), Some(1));
+
+        app.replace_sessions(vec![row(1, Some("%1"))]);
+        assert_eq!(app.selected.selected(), Some(0));
+    }
+
     #[test]
     fn quiet_codex_row_renders_progress_age() {
         let now = SystemTime::now();
@@ -3171,11 +3261,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         );
         return;
     }
-    let line = if let Some(msg) = &app.status_msg {
-        Line::from(Span::styled(
-            msg.clone(),
-            Style::default().fg(Color::Yellow),
-        ))
+    let line = if let Some(msg) = footer_message(app) {
+        Line::from(Span::styled(msg, Style::default().fg(Color::Yellow)))
     } else {
         let hint = match LayoutMode::from_width(area.width) {
             LayoutMode::Narrow => " ⏎ r a/d / ? q".to_string(),
@@ -3187,6 +3274,13 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &AppState) {
         Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray)))
     };
     f.render_widget(Paragraph::new(line), area);
+}
+
+fn footer_message(app: &AppState) -> Option<String> {
+    app.status_msg.clone().or_else(|| {
+        app.discovery_stalled_secs
+            .map(|secs| format!("  refresh stalled {secs}s"))
+    })
 }
 
 /// Case-insensitive substring match against everything a user might want
