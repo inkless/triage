@@ -2,8 +2,9 @@
 //! opencode and pi. A pane whose foreground command is the harness becomes a
 //! row; the harness's own session store adds a name and busy/idle state when
 //! exactly one such pane sits in the session's cwd. Two panes of the same
-//! harness in one cwd cannot be told apart from outside, so both stay
-//! unnamed rather than borrowing the wrong session.
+//! harness in one cwd cannot be told apart from outside, so neither borrows a
+//! session name. Unnamed panes fall back to a user-set tmux window name, then
+//! to `provider:pane_id`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -22,11 +23,12 @@ use crate::models::{Pane, Provider, Session};
 struct SessionMeta {
     id: String,
     cwd: PathBuf,
-    /// A name the user gave the session (pi's `/name`); opencode has none.
+    /// The session's own name: pi's `/name`, opencode's renameable title.
     name: Option<String>,
-    /// An auto-generated topic (opencode's title). Shown as a detail, never
-    /// as the row's name: it describes the first prompt, not the agent.
-    topic: Option<String>,
+    /// The latest thing the user asked for. Shown as the row's headline:
+    /// opencode's title is the session's name, so repeating it there would
+    /// carry no new information.
+    last_prompt: Option<String>,
     busy: Option<bool>,
     created_ms: u64,
     updated_ms: u64,
@@ -57,10 +59,30 @@ pub fn discover(
 ) -> Vec<Session> {
     let children = children_of(ppid_map);
     let comm = |pid: u32| crate::mailbox::proc_info(pid).ok().map(|info| info.comm);
+    let sandboxed = if panes
+        .values()
+        .any(|pane| pane_runs_container(pane, &children, &comm))
+    {
+        sandbox_agents(panes)
+    } else {
+        HashMap::new()
+    };
     let mut by_provider: HashMap<Provider, Vec<&Pane>> = HashMap::new();
+    let mut agent_dirs: HashMap<String, PathBuf> = HashMap::new();
     let mut started = HashMap::new();
     for pane in panes.values().filter(|p| !skip.contains(&p.pane_id)) {
-        let Some((provider, harness)) = pane_provider(pane, &children, &comm) else {
+        let detected = pane_provider(pane, &children, &comm)
+            .map(|(provider, harness)| (provider, harness, None))
+            .or_else(|| {
+                sandboxed.get(&pane.pane_id).map(|agent| {
+                    (
+                        agent.provider,
+                        Some(agent.pid),
+                        Some(agent.agent_dir.clone()),
+                    )
+                })
+            });
+        let Some((provider, harness, agent_dir)) = detected else {
             continue;
         };
         let run = harness.map(|pid| harness_run(provider, pid));
@@ -68,20 +90,122 @@ pub fn discover(
             continue;
         }
         by_provider.entry(provider).or_default().push(pane);
+        if let Some(dir) = agent_dir {
+            agent_dirs.insert(pane.pane_id.clone(), dir);
+        }
         if let Some(ms) = run.and_then(|run| run.started_ms) {
             started.insert(pane.pane_id.clone(), ms);
         }
     }
     let mut out = Vec::new();
     for (provider, panes) in by_provider {
-        let metas = match provider {
-            Provider::Opencode => opencode_metas(&opencode_db_path()),
-            Provider::Pi => pi_metas(&pi_agent_dir(), &panes),
-            Provider::Claude | Provider::Codex => continue,
-        };
-        out.extend(sessions_for_panes(provider, &panes, &metas, &started));
+        match provider {
+            Provider::Opencode => {
+                let metas = opencode_metas(&opencode_db_path());
+                out.extend(sessions_for_panes(provider, &panes, &metas, &started));
+            }
+            Provider::Pi => {
+                let mut by_dir: HashMap<PathBuf, Vec<&Pane>> = HashMap::new();
+                for pane in panes {
+                    let dir = agent_dirs
+                        .get(&pane.pane_id)
+                        .cloned()
+                        .unwrap_or_else(pi_agent_dir);
+                    by_dir.entry(dir).or_default().push(pane);
+                }
+                for (dir, group) in by_dir {
+                    let metas = pi_metas(&dir, &group);
+                    out.extend(sessions_for_panes(Provider::Pi, &group, &metas, &started));
+                }
+            }
+            Provider::Claude | Provider::Codex => {}
+        }
     }
     out
+}
+
+/// A harness inside a sandbox container, joined to its pane by labels the
+/// sandbox wrapper sets on the container.
+#[derive(Debug)]
+struct SandboxAgent {
+    provider: Provider,
+    pid: u32,
+    agent_dir: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+struct SandboxContainer {
+    #[serde(rename = "Pid")]
+    pid: u32,
+    #[serde(default, rename = "Labels")]
+    labels: HashMap<String, String>,
+}
+
+fn is_container_runtime(command: &str) -> bool {
+    matches!(command, "podman" | "docker" | "nerdctl")
+}
+
+/// The pane's foreground command is usually the runtime, but a shell that runs
+/// the wrapper without job control leaves the shell as the pane command and
+/// the runtime one level down.
+fn pane_runs_container(
+    pane: &Pane,
+    children: &HashMap<u32, Vec<u32>>,
+    comm: &dyn Fn(u32) -> Option<String>,
+) -> bool {
+    if is_container_runtime(&pane.current_command) {
+        return true;
+    }
+    let kids = children.get(&pane.pid).into_iter().flatten();
+    let grandkids = kids
+        .clone()
+        .flat_map(|kid| children.get(kid).into_iter().flatten());
+    std::iter::once(&pane.pid)
+        .chain(kids)
+        .chain(grandkids)
+        .any(|&pid| comm(pid).is_some_and(|name| is_container_runtime(&name)))
+}
+
+/// Rootless podman reparents `conmon` to init, so the container's harness is
+/// never in the pane's process tree. A sandbox that labels its container with
+/// the pane id and its state directory is the only thing that joins the two.
+fn sandbox_agents(panes: &HashMap<u32, Pane>) -> HashMap<String, SandboxAgent> {
+    let Ok(out) = Command::new("podman")
+        .args(["ps", "--filter", "label=triage.harness", "--format", "json"])
+        .output()
+    else {
+        return HashMap::new();
+    };
+    if !out.status.success() {
+        return HashMap::new();
+    }
+    let pane_ids: HashSet<&str> = panes.values().map(|pane| pane.pane_id.as_str()).collect();
+    parse_sandbox_agents(&out.stdout, &pane_ids)
+}
+
+fn parse_sandbox_agents(json: &[u8], panes: &HashSet<&str>) -> HashMap<String, SandboxAgent> {
+    let rows: Vec<SandboxContainer> = serde_json::from_slice(json).unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|row| {
+            let pane_id = row.labels.get("triage.pane")?;
+            if !panes.contains(pane_id.as_str()) {
+                return None;
+            }
+            let provider = match row.labels.get("triage.harness").map(String::as_str) {
+                Some("pi") => Provider::Pi,
+                _ => return None,
+            };
+            let agent_dir = PathBuf::from(row.labels.get("triage.agent_dir")?);
+            Some((
+                pane_id.clone(),
+                SandboxAgent {
+                    provider,
+                    pid: row.pid,
+                    agent_dir,
+                },
+            ))
+        })
+        .collect()
 }
 
 #[derive(Debug, PartialEq)]
@@ -223,7 +347,7 @@ fn fresh_meta(pane: &Pane) -> SessionMeta {
         id: pane.pane_id.clone(),
         cwd: pane.cwd.clone(),
         name: None,
-        topic: None,
+        last_prompt: None,
         busy: Some(false),
         created_ms: 0,
         updated_ms: 0,
@@ -247,6 +371,7 @@ fn pane_session(provider: Provider, pane: &Pane, meta: Option<&SessionMeta>) -> 
         pane.cwd.clone(),
         Some(
             meta.and_then(|m| m.name.clone())
+                .or_else(|| crate::models::useful_window_name(pane))
                 .unwrap_or_else(|| format!("{}:{}", provider.name(), pane.pane_id)),
         ),
         status.to_string(),
@@ -256,7 +381,7 @@ fn pane_session(provider: Provider, pane: &Pane, meta: Option<&SessionMeta>) -> 
     );
     session.last_stop_at = meta.and_then(|m| m.idle_since_ms).map(ms_to_time);
     session.last_event_at = meta.map(|m| ms_to_time(m.updated_ms));
-    session.headline = meta.and_then(|m| m.topic.clone());
+    session.last_prompt = meta.and_then(|m| m.last_prompt.clone());
     if let Some(usage) = meta.map(|m| &m.usage) {
         session.total_cost_usd = usage.cost_usd;
         session.total_tokens_in = usage.tokens_in;
@@ -287,6 +412,15 @@ fn opencode_db_path() -> PathBuf {
     data.join("opencode/opencode.db")
 }
 
+const OPENCODE_QUERY: &str = "select s.id, s.directory, s.title, s.time_created, \
+     s.time_updated, s.time_busy, s.time_idle, \
+     (select substr(json_extract(m.data, '$.text'), 1, 300) \
+        from session_message m \
+       where m.session_id = s.id and m.type = 'user' \
+       order by m.seq desc limit 1) as last_user_text \
+     from session_v2 s where s.parent_id is null \
+     order by s.time_updated desc limit 500";
+
 const OPENCODE_COLUMNS: &str = "id, directory, title, time_created, time_updated, \
      time_busy, time_idle";
 
@@ -294,10 +428,7 @@ const OPENCODE_COLUMNS: &str = "id, directory, title, time_created, time_updated
 /// folded in, so spend by child sessions counts toward the pane's row.
 fn opencode_query(with_usage: bool) -> String {
     if !with_usage {
-        return format!(
-            "select {OPENCODE_COLUMNS} from session_v2 where parent_id is null \
-             order by time_updated desc limit 500"
-        );
+        return OPENCODE_QUERY.to_string();
     }
     let sums = [
         "cost",
@@ -328,7 +459,10 @@ fn opencode_query(with_usage: bool) -> String {
          join tree t on c.parent_id = t.id), \
          spend as (select t.root, {spend} from tree t \
          join session_v2 s on s.id = t.id group by t.root) \
-         select {roots}, {totals}, r.model from session_v2 r \
+         select {roots}, {totals}, r.model, \
+         (select substr(json_extract(m.data, '$.text'), 1, 300) \
+            from session_message m where m.session_id = r.id and m.type = 'user' \
+            order by m.seq desc limit 1) as last_user_text from session_v2 r \
          join spend u on u.root = r.id where r.parent_id is null \
          order by r.time_updated desc limit 500"
     )
@@ -418,6 +552,8 @@ struct OpencodeRow {
     #[serde(default)]
     time_idle: Option<u64>,
     #[serde(default)]
+    last_user_text: Option<String>,
+    #[serde(default)]
     cost: Option<f64>,
     #[serde(default)]
     tokens_input: Option<u64>,
@@ -463,8 +599,14 @@ fn parse_opencode_rows(json: &[u8]) -> Vec<SessionMeta> {
             SessionMeta {
                 id: row.id,
                 cwd: PathBuf::from(row.directory),
-                name: None,
-                topic: row.title.filter(|t| !t.trim().is_empty()),
+                name: row
+                    .title
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty()),
+                last_prompt: row
+                    .last_user_text
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty()),
                 busy,
                 created_ms: row.time_created.unwrap_or(0),
                 updated_ms: row.time_updated.unwrap_or(0),
@@ -566,6 +708,7 @@ fn parse_pi_session(text: &str, modified_ms: u64) -> Option<SessionMeta> {
     let created_ms = timestamp_ms(&header).unwrap_or(0);
 
     let mut name = None;
+    let mut last_prompt = None;
     let mut last_message: Option<Value> = None;
     let mut usage = Usage::default();
     for line in lines {
@@ -582,6 +725,9 @@ fn parse_pi_session(text: &str, modified_ms: u64) -> Option<SessionMeta> {
                     .map(str::to_string);
             }
             Some("message") => {
+                if let Some(prompt) = pi_user_text(&entry) {
+                    last_prompt = Some(prompt);
+                }
                 add_pi_usage(&mut usage, &entry);
                 last_message = Some(entry);
             }
@@ -605,13 +751,34 @@ fn parse_pi_session(text: &str, modified_ms: u64) -> Option<SessionMeta> {
         id,
         cwd,
         name,
-        topic: None,
+        last_prompt,
         busy: Some(busy),
         created_ms,
         updated_ms: modified_ms,
         idle_since_ms,
         usage,
     })
+}
+
+/// The text of a pi user message. Content is either a string or an array of
+/// typed parts; only `text` parts carry the prompt. Capped so a pasted file
+/// cannot ride into every redraw.
+fn pi_user_text(entry: &Value) -> Option<String> {
+    let message = entry.get("message")?;
+    if message.get("role")?.as_str()? != "user" {
+        return None;
+    }
+    let text = match message.get("content")? {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join(" "),
+        _ => return None,
+    };
+    let text = text.trim();
+    (!text.is_empty()).then(|| text.chars().take(300).collect())
 }
 
 /// Fold one assistant message's usage into the session totals. pi counts
@@ -672,7 +839,7 @@ mod tests {
             id: id.to_string(),
             cwd: PathBuf::from(cwd),
             name: None,
-            topic: Some(id.to_string()),
+            last_prompt: Some(id.to_string()),
             busy: Some(false),
             created_ms: 1,
             updated_ms,
@@ -688,6 +855,40 @@ mod tests {
         for other in ["fish", "node", "claude", "codex", "2.1.139", "pip"] {
             assert_eq!(provider_for_command(other), None, "{other}");
         }
+    }
+
+    #[test]
+    fn a_container_runtime_is_detected_under_the_pane_shell() {
+        let children = children_of(&HashMap::from([(20, 10), (30, 20)]));
+        let comm = |pid: u32| match pid {
+            20 => Some("fish".to_string()),
+            30 => Some("podman".to_string()),
+            _ => None,
+        };
+        let shell = pane(10, "%1", "/w", "fish");
+        assert!(pane_runs_container(&shell, &children, &comm));
+        let foreground = pane(10, "%1", "/w", "podman");
+        assert!(pane_runs_container(&foreground, &HashMap::new(), &|_| None));
+        let plain = pane(11, "%2", "/w", "fish");
+        assert!(!pane_runs_container(&plain, &HashMap::new(), &|_| None));
+    }
+
+    #[test]
+    fn parses_only_labeled_containers_for_known_panes() {
+        let json = br#"[
+            {"Pid":42,"Labels":{"triage.harness":"pi","triage.pane":"%23","triage.agent_dir":"/s"}},
+            {"Pid":43,"Labels":{"triage.harness":"pi","triage.pane":"%99","triage.agent_dir":"/s"}},
+            {"Pid":44,"Labels":{"triage.harness":"claude","triage.pane":"%23","triage.agent_dir":"/s"}},
+            {"Pid":45,"Labels":{"triage.harness":"pi","triage.pane":"%23"}}
+        ]"#;
+        let panes: HashSet<&str> = ["%23"].into_iter().collect();
+        let agents = parse_sandbox_agents(json, &panes);
+        assert_eq!(agents.len(), 1);
+        let agent = &agents["%23"];
+        assert_eq!(agent.provider, Provider::Pi);
+        assert_eq!(agent.pid, 42);
+        assert_eq!(agent.agent_dir, PathBuf::from("/s"));
+        assert!(parse_sandbox_agents(b"not json", &panes).is_empty());
     }
 
     #[test]
@@ -766,7 +967,8 @@ mod tests {
     fn parses_opencode_session_rows() {
         let json = br#"[
             {"id":"ses_busy","directory":"/w/a","title":"Fix parser","parent_id":null,
-             "time_created":10,"time_updated":50,"time_busy":40,"time_idle":30},
+             "time_created":10,"time_updated":50,"time_busy":40,"time_idle":30,
+             "last_user_text":"please fix the parser"},
             {"id":"ses_idle","directory":"/w/b","title":"  ","time_created":5,
              "time_updated":20,"time_busy":12,"time_idle":18},
             {"id":"ses_new","directory":"/w/c","time_created":1,"time_updated":1}
@@ -774,11 +976,15 @@ mod tests {
         let metas = parse_opencode_rows(json);
         assert_eq!(metas.len(), 3);
         assert_eq!(metas[0].busy, Some(true));
-        assert_eq!(metas[0].topic.as_deref(), Some("Fix parser"));
-        assert_eq!(metas[0].name, None);
+        assert_eq!(metas[0].name.as_deref(), Some("Fix parser"));
+        assert_eq!(
+            metas[0].last_prompt.as_deref(),
+            Some("please fix the parser")
+        );
         assert_eq!(metas[0].idle_since_ms, None);
         assert_eq!(metas[1].busy, Some(false));
-        assert_eq!(metas[1].topic, None);
+        assert_eq!(metas[1].name, None);
+        assert_eq!(metas[1].last_prompt, None);
         assert_eq!(metas[1].idle_since_ms, Some(18));
         assert_eq!(metas[2].busy, None);
         assert!(parse_opencode_rows(b"not json").is_empty());
@@ -834,6 +1040,8 @@ mod tests {
             time_idle integer, cost real, tokens_input integer, tokens_output integer,
             tokens_reasoning integer, tokens_cache_read integer, tokens_cache_write integer,
             model text);
+            create table session_message (session_id text, type text, seq integer, data text);
+            insert into session_message values ('root','user',1,'{\"text\":\"latest prompt\"}');
             insert into session_v2 values
             ('root',null,'/w','t',1,9,null,null,1.0,100,10,1,1000,5,null),
             ('kid','root','/w',null,2,8,null,null,0.5,50,5,2,500,0,null),
@@ -855,6 +1063,8 @@ mod tests {
         assert_eq!(root.usage.tokens_out, 20);
         assert_eq!(root.usage.cache_read, 1500);
         assert_eq!(root.usage.cache_write, 6);
+        assert_eq!(root.name.as_deref(), Some("t"));
+        assert_eq!(root.last_prompt.as_deref(), Some("latest prompt"));
         let other = metas.iter().find(|m| m.id == "other").unwrap();
         assert_eq!(other.usage.cost_usd, 2.0);
     }
@@ -936,7 +1146,7 @@ mod tests {
     fn parses_pi_session_name_and_state() {
         let header = r#"{"type":"session","version":3,"id":"01a1","timestamp":"2026-10-14T18:49:13.644Z","cwd":"/w/a"}"#;
         let named = r#"{"type":"session_info","id":"i1","timestamp":"2026-10-14T18:49:14Z","name":"pi-worker"}"#;
-        let user = r#"{"type":"message","id":"m1","timestamp":"2026-10-14T18:49:15Z","message":{"role":"user"}}"#;
+        let user = r#"{"type":"message","id":"m1","timestamp":"2026-10-14T18:49:15Z","message":{"role":"user","content":[{"type":"text","text":"fix the parser"}]}}"#;
         let tool = r#"{"type":"message","id":"m2","timestamp":"2026-10-14T18:49:16Z","message":{"role":"assistant","stopReason":"toolUse"}}"#;
         let done = r#"{"type":"message","id":"m3","timestamp":"2026-10-14T18:49:17Z","message":{"role":"assistant","stopReason":"stop"}}"#;
 
@@ -949,7 +1159,7 @@ mod tests {
         let working =
             parse_pi_session(&format!("{header}\n{named}\n{user}\n{tool}\n"), 99).unwrap();
         assert_eq!(working.name.as_deref(), Some("pi-worker"));
-        assert_eq!(working.topic, None);
+        assert_eq!(working.last_prompt.as_deref(), Some("fix the parser"));
         assert_eq!(working.busy, Some(true));
 
         let idle = parse_pi_session(&format!("{header}\n{user}\n{done}\n"), 99).unwrap();
@@ -979,7 +1189,8 @@ mod tests {
         let solo = sessions.iter().find(|s| s.pid == 10).unwrap();
         assert_eq!(solo.session_id, "ses_new");
         assert_eq!(solo.name.as_deref(), Some("opencode:%30"));
-        assert_eq!(solo.headline.as_deref(), Some("ses_new"));
+        assert_eq!(solo.headline, None);
+        assert_eq!(solo.last_prompt.as_deref(), Some("ses_new"));
         assert_eq!(solo.status, "idle");
         assert_eq!(solo.pane.as_ref().unwrap().pane_id, "%30");
 
@@ -989,8 +1200,30 @@ mod tests {
             let pane_id = &twin.pane.as_ref().unwrap().pane_id;
             assert_eq!(twin.name, Some(format!("opencode:{pane_id}")));
             assert_eq!(twin.headline, None);
+            assert_eq!(twin.last_prompt, None);
             assert_eq!(twin.status, "unknown");
         }
+    }
+
+    #[test]
+    fn a_pane_is_named_by_its_session_then_its_window() {
+        let mut named = pane(10, "%10", "/w/a", "opencode");
+        named.window_name = "scratch".to_string();
+        let mut with_name = meta("ses_a", "/w/a", 9);
+        with_name.name = Some("triage-dev".to_string());
+        let sessions =
+            sessions_for_panes(Provider::Opencode, &[&named], &[with_name], &HashMap::new());
+        assert_eq!(sessions[0].name.as_deref(), Some("triage-dev"));
+
+        let mut windowed = pane(11, "%11", "/w/b", "opencode");
+        windowed.window_name = "scratch".to_string();
+        let sessions = sessions_for_panes(Provider::Opencode, &[&windowed], &[], &HashMap::new());
+        assert_eq!(sessions[0].name.as_deref(), Some("scratch"));
+
+        let mut auto_named = pane(12, "%12", "/w/c", "opencode");
+        auto_named.window_name = "opencode".to_string();
+        let sessions = sessions_for_panes(Provider::Opencode, &[&auto_named], &[], &HashMap::new());
+        assert_eq!(sessions[0].name.as_deref(), Some("opencode:%12"));
     }
 
     #[test]
