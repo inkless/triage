@@ -104,8 +104,18 @@ pub fn nudge_helper(store: &Store, agent: &str) -> io::Result<()> {
             Ok(())
         });
     }
-    command.spawn()?;
+    reap(command.spawn()?);
     Ok(())
+}
+
+/// A spawned helper is still this process's child after `setsid`; wait on it
+/// off-thread or it stays a zombie for the life of the TUI. Do not switch
+/// `SIGCHLD` to `SIG_IGN` process-wide: the `.output()` / `.status()` call
+/// sites need the default disposition.
+fn reap(mut child: std::process::Child) {
+    std::thread::spawn(move || {
+        let _ = child.wait();
+    });
 }
 
 /// `triage inbox --helper <agent>`: exits 0 in every case, logging errors.
@@ -216,4 +226,33 @@ fn current_host(store: &Store, agent: &str) -> Option<(HostId, HostRecord)> {
         .filter(|(_, record)| store.agent_for(record.provider, &record.current_session) == agent)
         .filter(|(host, _)| mailbox::liveness(*host) == Liveness::Alive)
         .max_by_key(|(_, record)| record.updated_at_ms)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn zombie(pid: u32) -> bool {
+        let out = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).contains('Z')
+    }
+
+    #[test]
+    fn a_reaped_helper_does_not_linger_as_a_zombie() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "exit 0"]);
+        let child = command.spawn().unwrap();
+        let pid = child.id();
+        reap(child);
+        for _ in 0..100 {
+            if !zombie(pid) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("helper {pid} is still a zombie");
+    }
 }
