@@ -69,8 +69,9 @@ pub fn retain_dashboard_sessions(sessions: &mut Vec<Session>) {
 }
 
 fn prefer_tmux_window_names(sessions: &mut [Session]) {
-    // opencode/pi rows are named by the user or by provider and pane, never
-    // by whatever the tmux window happens to be called.
+    // Pane-only rows already applied the window-name fallback in discovery,
+    // after their harness session's own name. Re-applying it here would
+    // overwrite that name with whatever the window happens to be called.
     for session in sessions.iter_mut().filter(|s| !s.provider.pane_only()) {
         let Some(window_name) = session.pane.as_ref().and_then(useful_window_name) else {
             continue;
