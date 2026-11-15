@@ -10,6 +10,7 @@ use serde::Serialize;
 use crate::config::{Config, SendMode};
 use crate::mailbox::{self, Claim, DeliveredVia, HostId, Message, RenderItem, State, Store};
 use crate::models::{AttentionState, Provider, Session, session_display_label};
+use crate::opencode_api::Failure;
 use crate::persist::{self, AliasKey};
 use crate::{classifier, codex, snapshot, tmux, transcript};
 
@@ -75,6 +76,11 @@ fn run_interrupt(args: &[String]) -> Result<String, CliError> {
     };
     let sessions = load_snapshot()?;
     let initial = resolve_target(&sessions, &selector)?;
+    match initial.provider {
+        Provider::Opencode => return interrupt_opencode(initial, &selector, dry_run),
+        Provider::Pi => return Err(CliError::denied(PI_CANNOT_INTERRUPT)),
+        Provider::Claude | Provider::Codex => {}
+    }
     interrupt_eligibility(initial, SystemTime::now()).map_err(CliError::denied)?;
     let stamp = transcript_stamp(initial)?;
     let pane_id = target_id(initial);
@@ -125,6 +131,126 @@ fn run_interrupt(args: &[String]) -> Result<String, CliError> {
     ))
 }
 
+const PI_CANNOT_INTERRUPT: &str = "interrupt is not supported for pi: its session file records only finished messages, so a stalled turn cannot be told from a long model reply or tool run";
+
+/// opencode is interrupted through its server, so nothing reaches the pane;
+/// the turn must still be provably quiet, read twice with no change.
+fn interrupt_opencode(target: &Session, selector: &str, dry_run: bool) -> Result<String, CliError> {
+    if !mailbox::is_opencode_session(&target.session_id) {
+        return Err(CliError::denied(
+            "target is not matched to an opencode session",
+        ));
+    }
+    let server = crate::opencode_api::Server::load()
+        .map_err(|e| CliError::runtime(format!("opencode server unavailable: {e}")))?;
+    let read = || {
+        server.turn(&target.session_id).map_err(|e| {
+            CliError::runtime(format!(
+                "cannot read the session from the opencode server: {e}"
+            ))
+        })
+    };
+    let first = read()?;
+    opencode_interrupt_eligibility(&first, unix_ms()).map_err(CliError::denied)?;
+    std::thread::sleep(interrupt_settle());
+    if read()? != first {
+        return Err(CliError::denied(
+            "target session changed during interrupt checks; retry after inspecting progress",
+        ));
+    }
+    let pane_id = target_id(target);
+    if dry_run {
+        return Ok(format!(
+            "dry-run: would interrupt {pane_id} ({}) through the opencode server",
+            target_label(target)
+        ));
+    }
+    let interrupted = match server.interrupt(&target.session_id) {
+        Ok(interrupted) => interrupted,
+        Err(Failure::NotDelivered(error)) => {
+            return Err(CliError::delivery(format!("interrupt failed: {error}")));
+        }
+        Err(Failure::Unconfirmed(error)) => {
+            if let Err(e) = append_message_audit(&AuditEntry::new(
+                "interrupt",
+                selector,
+                target,
+                "interrupt-unconfirmed",
+                Some(&error.to_string()),
+                None,
+            )) {
+                eprintln!("warning: failed to append interrupt audit: {e}");
+            }
+            return Err(CliError::delivery(format!(
+                "interrupt reached the opencode server but got no answer ({error}); the turn may have stopped, so it was not retried: check {pane_id}"
+            )));
+        }
+    };
+    if !interrupted {
+        return Ok(format!(
+            "the opencode server had no running turn to interrupt for {pane_id}"
+        ));
+    }
+    if let Err(error) = append_message_audit(&AuditEntry::new(
+        "interrupt",
+        selector,
+        target,
+        "interrupted",
+        None,
+        None,
+    )) {
+        eprintln!("warning: failed to append interrupt audit: {error}");
+    }
+    Ok(format!(
+        "interrupted {pane_id} through the opencode server; queued input stays parked"
+    ))
+}
+
+/// Long enough for a streaming reply or a tool to show it is still moving.
+fn interrupt_settle() -> std::time::Duration {
+    if cfg!(debug_assertions)
+        && let Some(ms) = std::env::var("TRIAGE_TEST_INTERRUPT_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    std::time::Duration::from_secs(3)
+}
+
+fn opencode_interrupt_eligibility(
+    turn: &crate::opencode_api::Turn,
+    now_ms: u64,
+) -> Result<(), &'static str> {
+    let quiet_ms = now_ms.saturating_sub(turn.progress_ms);
+    if !turn.busy || quiet_ms < classifier::NO_PROGRESS_THRESHOLD.as_millis() as u64 {
+        return Err(
+            "requires an active opencode turn with no observable progress for at least 15 minutes",
+        );
+    }
+    if turn.pending_permissions > 0 {
+        return Err("target is waiting on a permission prompt; approve or deny it instead");
+    }
+    if turn.pending_forms > 0 {
+        return Err("target is waiting on a question for the user");
+    }
+    if turn.running_tool.is_some() {
+        return Err(
+            "target has an unfinished tool call; quiet tools are not proof of a stalled turn",
+        );
+    }
+    if !turn.whole_turn_seen {
+        return Err("the turn is too long to inspect from its newest messages");
+    }
+    Ok(())
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
 fn parse_interrupt_args(args: &[String]) -> Result<(Option<String>, bool), CliError> {
     if args
         .iter()
@@ -168,12 +294,13 @@ pub fn cli_approve(args: &[String]) -> i32 {
     }
 }
 
-const APPROVE_USAGE: &str = "usage: triage approve --to TARGET [--deny] [--dry-run]\n       TARGET: pane id, pane target, name, agent id or its last 8 characters";
+const APPROVE_USAGE: &str = "usage: triage approve --to TARGET [--deny] [--dry-run] [--request ID]\n       TARGET: pane id, pane target, name, agent id or its last 8 characters\n       ID: the opencode permission request to answer when several are pending";
 
 struct ApproveArgs {
     selector: String,
     deny: bool,
     dry_run: bool,
+    request: Option<String>,
 }
 
 fn parse_approve_args(args: &[String]) -> Result<Option<ApproveArgs>, CliError> {
@@ -186,11 +313,20 @@ fn parse_approve_args(args: &[String]) -> Result<Option<ApproveArgs>, CliError> 
     let mut selector = None;
     let mut deny = false;
     let mut dry_run = false;
+    let mut request = None;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--to" if selector.is_none() => {
                 selector = Some(
+                    args.next()
+                        .filter(|value| !value.starts_with('-'))
+                        .ok_or_else(|| CliError::usage(APPROVE_USAGE))?
+                        .clone(),
+                );
+            }
+            "--request" if request.is_none() => {
+                request = Some(
                     args.next()
                         .filter(|value| !value.starts_with('-'))
                         .ok_or_else(|| CliError::usage(APPROVE_USAGE))?
@@ -207,6 +343,7 @@ fn parse_approve_args(args: &[String]) -> Result<Option<ApproveArgs>, CliError> 
         selector,
         deny,
         dry_run,
+        request,
     }))
 }
 
@@ -226,8 +363,16 @@ fn run_approve(args: &[String]) -> Result<String, CliError> {
     }
 
     let verb = if args.deny { "deny" } else { "approve" };
-    let prompt = match inspect_permission_prompt(target, args.deny) {
-        Ok(prompt) => prompt,
+    let inspected = match (target.provider, &args.request) {
+        (Provider::Opencode, request) => {
+            opencode_pending_request(&target.session_id, request.as_deref())
+                .map(|request| (request.summary(), Some(request)))
+        }
+        (_, Some(_)) => Err("--request names an opencode permission request".to_string()),
+        _ => inspect_permission_prompt(target, args.deny).map(|prompt| (prompt, None)),
+    };
+    let (prompt, request) = match inspected {
+        Ok(inspected) => inspected,
         Err(reason) => {
             let verdict = format!("{verb}-refused");
             let entry = AuditEntry::new(
@@ -252,10 +397,34 @@ fn run_approve(args: &[String]) -> Result<String, CliError> {
             "dry-run: would {verb} {pane_id} ({label}): {headline}"
         ));
     }
-    let key = if args.deny { "Escape" } else { "Enter" };
-    tmux::send_keys(&pane_id, &[key])
-        .map_err(|error| CliError::delivery(format!("{verb} failed: {error}")))?;
     let verdict = if args.deny { "denied" } else { "approved" };
+    match &request {
+        Some(request) => match reply_opencode(&target.session_id, request, !args.deny) {
+            Ok(()) => Ok(()),
+            Err(Failure::Unconfirmed(error)) => {
+                let entry = AuditEntry::new(
+                    &sender,
+                    &args.selector,
+                    target,
+                    &format!("{verdict}-unconfirmed"),
+                    Some(&error.to_string()),
+                    Some(&prompt),
+                );
+                if let Err(error) = append_message_audit(&entry) {
+                    eprintln!("warning: failed to append approve audit: {error}");
+                }
+                return Err(CliError::delivery(format!(
+                    "{verb} reached the opencode server but got no answer ({error}); it may have taken effect, so it was not retried: check {pane_id}"
+                )));
+            }
+            Err(Failure::NotDelivered(error)) => Err(error.to_string()),
+        },
+        None => {
+            let key = if args.deny { "Escape" } else { "Enter" };
+            tmux::send_keys(&pane_id, &[key]).map_err(|error| error.to_string())
+        }
+    }
+    .map_err(|error| CliError::delivery(format!("{verb} failed: {error}")))?;
     let entry = AuditEntry::new(
         &sender,
         &args.selector,
@@ -270,10 +439,186 @@ fn run_approve(args: &[String]) -> Result<String, CliError> {
     Ok(format!("{verdict} {pane_id} ({label}): {headline}"))
 }
 
+const PI_HAS_NO_PROMPTS: &str = "pi has no tool-permission prompts to approve or deny";
+
+/// The pending opencode permission request `request` names, or the only one
+/// when it names none. opencode answers by request id, so the choice has to
+/// be unambiguous.
+pub fn opencode_pending_request(
+    session: &str,
+    request: Option<&str>,
+) -> Result<crate::opencode_api::Permission, String> {
+    if !mailbox::is_opencode_session(session) {
+        return Err("target is not matched to an opencode session".to_string());
+    }
+    let pending = crate::opencode_api::Server::load()
+        .and_then(|server| server.pending_permissions(session))
+        .map_err(|e| format!("cannot read pending permissions from the opencode server: {e}"))?;
+    pick_permission(pending, request)
+}
+
+fn pick_permission(
+    pending: Vec<crate::opencode_api::Permission>,
+    request: Option<&str>,
+) -> Result<crate::opencode_api::Permission, String> {
+    if let Some(id) = request {
+        return pending
+            .into_iter()
+            .find(|p| p.id == id)
+            .ok_or_else(|| format!("no pending permission request {id}"));
+    }
+    match <[_; 1]>::try_from(pending) {
+        Ok([one]) => Ok(one),
+        Err(pending) if pending.is_empty() => Err("no pending permission request".to_string()),
+        Err(pending) => Err(format!(
+            "{} permission requests are pending; name one with --request: {}",
+            pending.len(),
+            pending
+                .iter()
+                .map(|p| format!("{} ({})", p.id, p.summary()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn reply_opencode(
+    session: &str,
+    request: &crate::opencode_api::Permission,
+    approve: bool,
+) -> Result<(), Failure> {
+    crate::opencode_api::Server::load()?.reply_permission(session, &request.id, approve)
+}
+
+/// Answers the one request discovery saw pending on a Blocked opencode row,
+/// and only while that same request is still pending: a newer request is
+/// never answered in its place. Writes the outcome to the message audit.
+pub fn decide_seen_opencode_permission(
+    target: &Session,
+    approve: bool,
+    timeout: std::time::Duration,
+    sender: &str,
+) -> Result<String, String> {
+    if target.state != AttentionState::Blocked {
+        return Err("opencode session not blocked".to_string());
+    }
+    let seen = match target.opencode_permissions.as_slice() {
+        [one] => one,
+        [] => return Err("no pending permission request seen".to_string()),
+        _ => {
+            return Err(
+                "several permission requests are pending; answer one with triage approve --request"
+                    .to_string(),
+            );
+        }
+    };
+    let server = crate::opencode_api::Server::load()
+        .map_err(|e| format!("opencode server unavailable: {e}"))?
+        .with_timeout(timeout);
+    let result = decide_opencode_with(&server, &target.session_id, seen, approve);
+    if let Some((verdict, reason)) = audited_verdict(approve, &result) {
+        let entry = AuditEntry::new(
+            sender,
+            &target_id(target),
+            target,
+            &verdict,
+            reason.as_deref(),
+            Some(&seen.summary()),
+        );
+        if let Err(error) = append_message_audit(&entry) {
+            eprintln!("warning: failed to append approve audit: {error}");
+        }
+    }
+    match result {
+        Ok(()) => Ok(seen.summary()),
+        Err(Failure::Unconfirmed(e)) => Err(format!(
+            "the opencode server got the reply but did not answer ({e}); it may have taken effect, so it was not retried"
+        )),
+        Err(Failure::NotDelivered(e)) => Err(match e.kind() {
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock => {
+                "opencode server slow, not sent".to_string()
+            }
+            _ => format!("not sent: {e}"),
+        }),
+    }
+}
+
+/// Replies to `seen` only if the server still lists it as pending.
+fn decide_opencode_with(
+    server: &crate::opencode_api::Server,
+    session: &str,
+    seen: &crate::opencode_api::Permission,
+    approve: bool,
+) -> Result<(), Failure> {
+    let pending = server.pending_permissions(session)?;
+    if !pending.iter().any(|p| p.id == seen.id) {
+        return Err(Failure::NotDelivered(io::Error::other(format!(
+            "the request shown ({}) is no longer pending",
+            seen.summary()
+        ))));
+    }
+    server.reply_permission(session, &seen.id, approve)
+}
+
+/// The audit verdict for a reply that may have reached the server.
+fn audited_verdict(
+    approve: bool,
+    result: &Result<(), Failure>,
+) -> Option<(String, Option<String>)> {
+    let verdict = if approve { "approved" } else { "denied" };
+    match result {
+        Ok(()) => Some((verdict.to_string(), None)),
+        Err(Failure::Unconfirmed(e)) => {
+            Some((format!("{verdict}-unconfirmed"), Some(e.to_string())))
+        }
+        Err(Failure::NotDelivered(_)) => None,
+    }
+}
+
+/// Auditor input for a pending opencode request: the tool call's full input
+/// and the user's latest prompt. Only a shell command is fully described by
+/// the request itself; anything else waits for a person when its input
+/// cannot be read whole.
+pub fn opencode_audit_input(
+    session: &str,
+    seen: &crate::opencode_api::Permission,
+) -> Result<(String, Option<String>), String> {
+    let server = crate::opencode_api::Server::load()
+        .map_err(|e| format!("opencode server unavailable: {e}"))?;
+    opencode_audit_input_with(&server, session, seen)
+}
+
+fn opencode_audit_input_with(
+    server: &crate::opencode_api::Server,
+    session: &str,
+    seen: &crate::opencode_api::Permission,
+) -> Result<(String, Option<String>), String> {
+    const MAX_INPUT_CHARS: usize = 16_000;
+    let input = seen
+        .source
+        .as_ref()
+        .ok_or_else(|| io::Error::other("the request names no tool call"))
+        .and_then(|source| server.tool_input(session, source))
+        .map(|input| serde_json::to_string_pretty(&input).unwrap_or_default());
+    let intent = server.last_user_text(session).ok().flatten();
+    let shell = matches!(seen.action.as_str(), "shell" | "bash");
+    match input {
+        Ok(input) if input.chars().count() <= MAX_INPUT_CHARS => {
+            Ok((format!("{}\n{input}", seen.summary()), intent))
+        }
+        _ if shell => Ok((seen.summary(), intent)),
+        Ok(_) => Err("the tool input is too large to show the auditor".to_string()),
+        Err(e) => Err(format!("cannot read the tool input: {e}")),
+    }
+}
+
 /// Capture the target's live screen and prove it shows a permission prompt
 /// whose highlighted option makes Enter (approve) or Escape (deny) correct.
 /// Returns the prompt body for the audit trail.
 fn inspect_permission_prompt(target: &Session, deny: bool) -> Result<String, String> {
+    if target.provider == Provider::Pi {
+        return Err(PI_HAS_NO_PROMPTS.to_string());
+    }
     let Some(pane) = &target.pane else {
         return Err("target has no tmux pane".to_string());
     };
@@ -319,9 +664,7 @@ fn evaluate_approve_gate(
             }
             Ok(tmux::parse_codex_pending_full(&plain).unwrap_or_default())
         }
-        Provider::Opencode | Provider::Pi => {
-            Err("approve is not supported for opencode or pi agents")
-        }
+        Provider::Opencode | Provider::Pi => Err("no pane prompt to inspect"),
     }
 }
 
@@ -1729,7 +2072,8 @@ fn agent_row(store: &Store, s: &Session) -> AgentRow {
         can_receive: gate.can_send,
         no_progress_seconds: classifier::no_progress_age(s, SystemTime::now())
             .map(|age| age.as_secs()),
-        pending_tool: s.provider == Provider::Codex && s.last_tool_use.is_some(),
+        pending_tool: matches!(s.provider, Provider::Codex | Provider::Opencode)
+            && s.last_tool_use.is_some(),
         deny_reason: (!gate.can_send).then_some(gate.reason),
         pane_target: s.pane.as_ref().map(|p| p.target.clone()),
         pane_id: s.pane.as_ref().map(|p| p.pane_id.clone()),
@@ -2818,6 +3162,161 @@ mod tests {
             active: false,
         });
         s
+    }
+
+    #[test]
+    fn opencode_interrupt_needs_a_busy_turn_quiet_for_the_threshold() {
+        let threshold = classifier::NO_PROGRESS_THRESHOLD.as_millis() as u64;
+        let quiet = crate::opencode_api::Turn {
+            busy: true,
+            progress_ms: 1_000,
+            running_tool: None,
+            whole_turn_seen: true,
+            pending_permissions: 0,
+            pending_forms: 0,
+            stamp: String::new(),
+        };
+        let now = 1_000 + threshold;
+        let building = crate::opencode_api::Turn {
+            running_tool: Some("shell".to_string()),
+            ..quiet.clone()
+        };
+        assert!(opencode_interrupt_eligibility(&building, now).is_err());
+        let truncated = crate::opencode_api::Turn {
+            whole_turn_seen: false,
+            ..quiet.clone()
+        };
+        assert!(opencode_interrupt_eligibility(&truncated, now).is_err());
+        assert_eq!(opencode_interrupt_eligibility(&quiet, now), Ok(()));
+        assert!(opencode_interrupt_eligibility(&quiet, now - 1).is_err());
+        let idle = crate::opencode_api::Turn {
+            busy: false,
+            ..quiet.clone()
+        };
+        assert!(opencode_interrupt_eligibility(&idle, now).is_err());
+        let asking = crate::opencode_api::Turn {
+            pending_permissions: 1,
+            ..quiet.clone()
+        };
+        assert!(opencode_interrupt_eligibility(&asking, now).is_err());
+        let questioning = crate::opencode_api::Turn {
+            pending_forms: 1,
+            ..quiet
+        };
+        assert!(opencode_interrupt_eligibility(&questioning, now).is_err());
+    }
+
+    fn permission(id: &str, action: &str) -> crate::opencode_api::Permission {
+        crate::opencode_api::Permission {
+            id: id.to_string(),
+            action: action.to_string(),
+            resources: vec!["ls".to_string()],
+            source: Some(crate::opencode_api::PermissionSource {
+                message_id: "msg_1".to_string(),
+                id: "call_1".to_string(),
+            }),
+        }
+    }
+
+    fn listing(ids: &[&str]) -> String {
+        let items: Vec<_> = ids
+            .iter()
+            .map(|id| serde_json::json!({"id": id, "action": "shell", "resources": ["rm -rf /w"]}))
+            .collect();
+        serde_json::json!({ "data": items }).to_string()
+    }
+
+    #[test]
+    fn a_decision_answers_only_the_request_that_was_shown() {
+        let (server, requests) = crate::opencode_api::fake_server(|method, _| match method {
+            "GET" => (200, listing(&["per_2"])),
+            _ => (200, "{}".to_string()),
+        });
+        let shown = permission("per_1", "shell");
+        let result = decide_opencode_with(&server, "ses_a", &shown, true);
+        assert!(matches!(result, Err(Failure::NotDelivered(_))));
+        assert!(requests.try_iter().all(|(method, _, _)| method == "GET"));
+
+        let (server, requests) = crate::opencode_api::fake_server(|method, _| match method {
+            "GET" => (200, listing(&["per_2", "per_1"])),
+            _ => (200, "{}".to_string()),
+        });
+        assert!(decide_opencode_with(&server, "ses_a", &shown, true).is_ok());
+        let posts: Vec<_> = requests
+            .try_iter()
+            .filter(|(m, _, _)| m == "POST")
+            .collect();
+        assert_eq!(
+            posts,
+            [(
+                "POST".to_string(),
+                "/api/session/ses_a/permission/per_1/reply".to_string(),
+                r#"{"decision":"once"}"#.to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_dashboard_decision_needs_a_blocked_row_with_one_request_seen() {
+        let mut row = pane_only_session(Provider::Opencode, 200);
+        row.session_id = "ses_a".to_string();
+        row.opencode_permissions = vec![permission("per_1", "shell")];
+        row.state = AttentionState::Working;
+        let err =
+            decide_seen_opencode_permission(&row, true, std::time::Duration::from_millis(1), "t")
+                .unwrap_err();
+        assert!(err.contains("not blocked"), "{err}");
+        row.state = AttentionState::Blocked;
+        row.opencode_permissions.push(permission("per_2", "edit"));
+        let err =
+            decide_seen_opencode_permission(&row, true, std::time::Duration::from_millis(1), "t")
+                .unwrap_err();
+        assert!(err.contains("several"), "{err}");
+    }
+
+    #[test]
+    fn a_reply_that_may_have_landed_is_audited_with_its_verdict() {
+        let unconfirmed = Err(Failure::Unconfirmed(io::Error::other("no answer")));
+        assert_eq!(
+            audited_verdict(false, &unconfirmed),
+            Some((
+                "denied-unconfirmed".to_string(),
+                Some("no answer".to_string())
+            ))
+        );
+        assert_eq!(
+            audited_verdict(true, &Ok(())),
+            Some(("approved".to_string(), None))
+        );
+        let refused = Err(Failure::NotDelivered(io::Error::other("gone")));
+        assert_eq!(audited_verdict(true, &refused), None);
+    }
+
+    #[test]
+    fn the_auditor_sees_an_edit_in_full_or_waits() {
+        let message = serde_json::json!({"data": {"id": "msg_1", "content": [
+            {"type": "tool", "id": "call_1", "name": "edit",
+             "state": {"status": "running", "input": {"path": "/w/a.rs", "newString": "fn main() {}"}}}
+        ]}})
+        .to_string();
+        let user = r#"{"data":[{"type":"assistant"},{"type":"user","text":"fix the build"}]}"#;
+        let (server, _requests) = crate::opencode_api::fake_server(move |_, path| {
+            if path.contains("/message/msg_1") {
+                (200, message.clone())
+            } else {
+                (200, user.to_string())
+            }
+        });
+        let (input, intent) =
+            opencode_audit_input_with(&server, "ses_a", &permission("per_1", "edit")).unwrap();
+        assert!(input.contains("fn main() {}"), "{input}");
+        assert_eq!(intent.as_deref(), Some("fix the build"));
+
+        let (server, _requests) = crate::opencode_api::fake_server(|_, _| (404, String::new()));
+        assert!(opencode_audit_input_with(&server, "ses_a", &permission("per_1", "edit")).is_err());
+        let (input, _) =
+            opencode_audit_input_with(&server, "ses_a", &permission("per_1", "shell")).unwrap();
+        assert_eq!(input, "shell: ls");
     }
 
     #[test]

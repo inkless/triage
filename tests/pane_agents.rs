@@ -57,7 +57,7 @@ case "$*" in
 *"where id = 'ses_oc'"*|*"where id = 'ses_twin'"*) printf '[{"directory":"/work/oc"}]' ;;
 *"time_updated >="*) printf '[{"id":"ses_oc","directory":"/work/oc","time_updated":2000000000000}%s]' "$EXTRA_OC_ROWS" ;;
 *"where id ="*) printf '[{"directory":"/work/other"}]' ;;
-*session_v2*) printf '[{"id":"ses_oc","directory":"/work/oc","title":"Fix the parser","time_created":1,"time_updated":2000000000000,"time_busy":10,"time_idle":20,"last_user_text":"please fix the parser"}]' ;;
+*session_v2*) printf '[{"id":"ses_oc","directory":"/work/oc","title":"Fix the parser","time_created":1,"time_updated":2000000000000,"time_busy":%s,"time_idle":20,"last_user_text":"please fix the parser"}]' "${OC_BUSY_AT:-10}" ;;
 esac
 "#,
             ),
@@ -646,16 +646,24 @@ fn opencode_and_pi_sessions_have_mailboxes() {
 }
 
 struct Request {
+    method: String,
     path: String,
     authorization: String,
     body: serde_json::Value,
 }
 
-/// A loopback stand-in for the opencode server: answers each request with
-/// `status_for(path)` and hands the requests back once the test is done.
 fn fake_opencode_server(
     fx: &Fixture,
     status_for: fn(&str) -> u16,
+) -> std::sync::mpsc::Receiver<Request> {
+    fake_opencode_api(fx, move |_, path| (status_for(path), String::new()))
+}
+
+/// A loopback stand-in for the opencode server: answers each request with
+/// `respond(method, path)` and hands the requests back once the test is done.
+fn fake_opencode_api(
+    fx: &Fixture,
+    respond: impl Fn(&str, &str) -> (u16, String) + Send + 'static,
 ) -> std::sync::mpsc::Receiver<Request> {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
@@ -673,6 +681,7 @@ fn fake_opencode_server(
             let mut reader = BufReader::new(stream.try_clone().unwrap());
             let mut line = String::new();
             reader.read_line(&mut line).unwrap();
+            let method = line.split_whitespace().next().unwrap_or("").to_string();
             let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
             let (mut authorization, mut len) = (String::new(), 0);
             loop {
@@ -691,10 +700,11 @@ fn fake_opencode_server(
             }
             let mut body = vec![0; len];
             reader.read_exact(&mut body).unwrap();
-            let status = status_for(&path);
-            let body = serde_json::from_slice(&body).unwrap();
+            let (status, answer) = respond(&method, &path);
+            let body = serde_json::from_slice(&body).unwrap_or_default();
             // Recorded before answering, so it is there once the sender exits.
             let sent = tx.send(Request {
+                method,
                 path,
                 authorization,
                 body,
@@ -703,7 +713,12 @@ fn fake_opencode_server(
                 std::thread::sleep(std::time::Duration::from_secs(2));
                 continue;
             }
-            write!(stream, "HTTP/1.1 {status} X\r\nContent-Length: 0\r\n\r\n").unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\r\n{answer}",
+                answer.len()
+            )
+            .unwrap();
             if sent.is_err() {
                 break;
             }
@@ -999,4 +1014,260 @@ fn an_opencode_caller_is_pane_grade_when_another_session_shares_its_directory() 
         assert_eq!(entry["from_session"], serde_json::Value::Null);
     }
     assert_eq!(audit(&fx).len(), 2);
+}
+
+const ONE_PENDING: &str = r#"{"data":[{"id":"per_1","sessionID":"ses_oc","action":"shell","resources":["rm -rf build"],"save":["rm *"],"source":{"type":"tool","messageID":"msg_1","id":"call_1"}}]}"#;
+const TWO_PENDING: &str = r#"{"data":[{"id":"per_1","action":"shell","resources":["rm -rf build"]},{"id":"per_2","action":"edit","resources":["/etc/hosts"]}]}"#;
+
+fn answer_permissions(listing: &'static str) -> impl Fn(&str, &str) -> (u16, String) + Send {
+    move |method, path| match (method, path.ends_with("/permission")) {
+        ("GET", true) => (200, listing.to_string()),
+        _ => (200, "{}".to_string()),
+    }
+}
+
+fn replies(requests: &std::sync::mpsc::Receiver<Request>) -> Vec<(String, serde_json::Value)> {
+    requests
+        .try_iter()
+        .filter(|r| r.method == "POST")
+        .map(|r| (r.path, r.body))
+        .collect()
+}
+
+#[test]
+fn a_busy_opencode_session_waiting_on_a_permission_is_blocked() {
+    let fx = Fixture::new(
+        "ocblocked",
+        r#"  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'"#,
+    );
+    let state = || {
+        let output = fx
+            .command(&["agents", "--json"])
+            .env("OC_BUSY_AT", "30")
+            .env("TRIAGE_TEST_PANE_HARNESS", pi_and_test_server())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&output.stdout).unwrap();
+        let oc = row(&rows, "%30");
+        (oc["state"].clone(), oc["pending_tool"].clone())
+    };
+    // No server: the row is just busy.
+    assert_eq!(state(), ("Working".into(), false.into()));
+
+    let requests = fake_opencode_api(&fx, answer_permissions(ONE_PENDING));
+    assert_eq!(state(), ("Blocked".into(), true.into()));
+    let asked: Vec<String> = requests.try_iter().map(|r| r.path).collect();
+    assert_eq!(asked, ["/api/session/ses_oc/permission"]);
+
+    // An idle session is not asked.
+    let rows = fx.agents();
+    assert_ne!(row(&rows, "%30")["state"], "Blocked");
+    assert!(requests.try_recv().is_err());
+}
+
+#[test]
+fn approve_answers_the_pending_opencode_request_once_or_rejects_it() {
+    let fx = Fixture::new("ocapprove", PI_CALLER_AND_OC_TARGET);
+    let requests = fake_opencode_api(&fx, answer_permissions(ONE_PENDING));
+
+    let output = fx.as_pi(&["approve", "--to", "%30", "--dry-run"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("would approve %30"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(replies(&requests).is_empty());
+
+    let output = fx.as_pi(&["approve", "--to", "%30"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let output = fx.as_pi(&["approve", "--to", "%30", "--deny"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let reply = "/api/session/ses_oc/permission/per_1/reply".to_string();
+    assert_eq!(
+        replies(&requests),
+        [
+            (reply.clone(), serde_json::json!({"decision": "once"})),
+            (reply, serde_json::json!({"decision": "reject"})),
+        ]
+    );
+    assert!(!fx.dir.join("keys").exists());
+
+    let audit = audit(&fx);
+    let verdicts: Vec<_> = audit.iter().map(|e| e["verdict"].clone()).collect();
+    assert_eq!(verdicts, ["approved", "denied"]);
+    assert_eq!(audit[0]["message_preview"], "shell: rm -rf build");
+    assert_eq!(audit[0]["target_provider"], "oc");
+}
+
+#[test]
+fn approve_refuses_an_opencode_row_without_exactly_one_named_request() {
+    let fx = Fixture::new("ocambiguous", PI_CALLER_AND_OC_TARGET);
+    let requests = fake_opencode_api(&fx, answer_permissions(TWO_PENDING));
+    let output = fx.as_pi(&["approve", "--to", "%30"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("2 permission requests are pending"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(replies(&requests).is_empty());
+    assert_eq!(audit(&fx)[0]["verdict"], "approve-refused");
+
+    let output = fx.as_pi(&["approve", "--to", "%30", "--request", "per_2"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        replies(&requests),
+        [(
+            "/api/session/ses_oc/permission/per_2/reply".to_string(),
+            serde_json::json!({"decision": "once"})
+        )]
+    );
+
+    let fx = Fixture::new("ocnone", PI_CALLER_AND_OC_TARGET);
+    let requests = fake_opencode_api(&fx, answer_permissions(r#"{"data":[]}"#));
+    let output = fx.as_pi(&["approve", "--to", "%30"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(stderr(&output).contains("no pending permission request"));
+    assert!(replies(&requests).is_empty());
+}
+
+#[test]
+fn approve_refuses_an_opencode_pane_not_matched_to_a_session() {
+    // Two opencode panes in one directory: neither borrows the session.
+    let fx = Fixture::new(
+        "ocunmatched",
+        r#"  echo 'pi|1.0|777000|/dev/null|pi|/work/pi|1|%31|pi'
+  echo 'oc|1.0|501|/dev/null|opencode|/work/oc|1|%30|opencode'
+  echo 'oc|2.0|503|/dev/null|opencode|/work/oc|1|%32|opencode'"#,
+    );
+    let requests = fake_opencode_api(&fx, answer_permissions(ONE_PENDING));
+    let output = fx.as_pi(&["approve", "--to", "%30"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not matched to an opencode session"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(requests.try_recv().is_err());
+}
+
+#[test]
+fn pi_rows_can_be_neither_approved_nor_interrupted() {
+    let fx = Fixture::new("pirefuse", OC_CALLER_AND_PI_TARGET);
+    let output = fx.as_opencode(&["approve", "--to", "%31"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("pi has no tool-permission prompts"),
+        "{}",
+        stderr(&output)
+    );
+    let output = fx.run(&["interrupt", "--to", "%31"]);
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("not supported for pi"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(!fx.dir.join("keys").exists());
+}
+
+/// A server whose session `ses_oc` went busy long ago (though a person
+/// looked at it just now) and whose newest messages are `newest`.
+fn quiet_turn(newest: &'static str) -> impl Fn(&str, &str) -> (u16, String) + Send {
+    move |method, path| {
+        match (method, path) {
+        ("GET", "/api/session/ses_oc") => (
+            200,
+            r#"{"data":{"id":"ses_oc","time":{"created":1,"updated":5,"busy":4,"idle":3,"viewed":9999999999999}}}"#
+                .to_string(),
+        ),
+        ("GET", "/api/session/ses_oc/message?limit=50") => {
+            (200, format!(r#"{{"data":[{newest}]}}"#))
+        }
+        ("GET", _) => (200, r#"{"data":[]}"#.to_string()),
+        ("POST", "/api/session/ses_oc/interrupt") => (200, r#"{"interrupted":true}"#.to_string()),
+        _ => (404, String::new()),
+    }
+    }
+}
+
+#[test]
+fn interrupt_stops_a_quiet_opencode_turn_through_its_server() {
+    let fx = Fixture::new("ocinterrupt", PI_CALLER_AND_OC_TARGET);
+    let requests = fake_opencode_api(
+        &fx,
+        quiet_turn(
+            r#"{"id":"msg_2","type":"assistant","time":{"created":5,"firstToken":6},"content":[{"type":"tool","name":"shell","state":{"status":"completed"},"time":{"created":6,"ran":7,"completed":8}}]}"#,
+        ),
+    );
+    let output = fx
+        .command(&["interrupt", "--to", "%30"])
+        .env("TRIAGE_TEST_PANE_HARNESS", pi_and_test_server())
+        .env("TRIAGE_TEST_INTERRUPT_SETTLE_MS", "0")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        replies(&requests),
+        [(
+            "/api/session/ses_oc/interrupt".to_string(),
+            serde_json::json!({})
+        )]
+    );
+    assert!(!fx.dir.join("keys").exists());
+    assert_eq!(audit(&fx)[0]["verdict"], "interrupted");
+}
+
+#[test]
+fn interrupt_leaves_an_opencode_turn_with_a_running_tool() {
+    // Mail queued behind the turn is the newest message; the build under it
+    // is still running.
+    let fx = Fixture::new("ocbusytool", PI_CALLER_AND_OC_TARGET);
+    let requests = fake_opencode_api(
+        &fx,
+        quiet_turn(
+            r#"{"id":"msg_3","type":"user","text":"mail","time":{"created":9}},{"id":"msg_2","type":"assistant","time":{"created":5},"content":[{"type":"tool","name":"shell","state":{"status":"running"},"time":{"created":6,"ran":7}}]}"#,
+        ),
+    );
+    let output = fx
+        .command(&["interrupt", "--to", "%30"])
+        .env("TRIAGE_TEST_PANE_HARNESS", pi_and_test_server())
+        .env("TRIAGE_TEST_INTERRUPT_SETTLE_MS", "0")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("unfinished tool call"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(replies(&requests).is_empty());
+    assert!(audit(&fx).is_empty());
+}
+
+#[test]
+fn an_unanswered_opencode_approve_is_reported_uncertain_and_not_retried() {
+    let fx = Fixture::new("ocapprovestall", PI_CALLER_AND_OC_TARGET);
+    let requests = fake_opencode_api(&fx, |method, path| match method {
+        "GET" => answer_permissions(ONE_PENDING)(method, path),
+        _ => (STALL, String::new()),
+    });
+    let output = fx
+        .command(&["approve", "--to", "%30"])
+        .env("TRIAGE_TEST_PANE_HARNESS", pi_and_test_server())
+        .env("PI_SESSION_ID", PI_SESSION)
+        .env("PI_SESSION_FILE", "/unused")
+        .env("TRIAGE_TEST_HTTP_TIMEOUT_MS", "300")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("may have taken effect, so it was not retried"),
+        "{}",
+        stderr(&output)
+    );
+    assert_eq!(replies(&requests).len(), 1);
+    assert_eq!(audit(&fx)[0]["verdict"], "approved-unconfirmed");
 }

@@ -32,8 +32,8 @@ impl Provider {
     }
 
     /// Harnesses triage discovers through their tmux pane rather than a
-    /// session record. They get no approve or interrupt, and a caller is
-    /// identified by its session only when its own environment names one.
+    /// session record. A caller is identified by its session only when its
+    /// own environment names one.
     pub fn pane_only(self) -> bool {
         match self {
             Provider::Claude | Provider::Codex => false,
@@ -175,6 +175,8 @@ pub struct Session {
     /// These enrich the headline/detail and hook-mode `a`/`d` flow, but they
     /// are only actionable when Claude itself reports `status == "waiting"`.
     pub pending_approvals: Vec<PendingApproval>,
+    /// opencode permission requests the server reported pending at discovery.
+    pub opencode_permissions: Vec<crate::opencode_api::Permission>,
     /// When the harness process in an opencode or pi pane started, if known.
     pub harness_started_ms: Option<u64>,
 }
@@ -237,6 +239,7 @@ impl Session {
             watched: false,
             pinned: false,
             pending_approvals: Vec::new(),
+            opencode_permissions: Vec::new(),
             harness_started_ms: None,
         }
     }
