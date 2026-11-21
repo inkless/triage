@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.1](https://github.com/inkless/triage/compare/v0.8.0...v0.8.1) (2026-11-21)
+
+
+### Bug Fixes
+
+* **codex:** ignore zombie processes during discovery ([97f9f82](https://github.com/inkless/triage/commit/97f9f8239dc016b4720177ad0a301917d763611d))
+
 ## [0.8.0](https://github.com/inkless/triage/compare/v0.7.0...v0.8.0) (2026-11-15)
 
 
