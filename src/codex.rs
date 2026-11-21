@@ -746,7 +746,7 @@ impl CodexProcess {
 
 fn codex_processes() -> Result<Vec<CodexProcess>, String> {
     let stdout = checked_output(
-        Command::new("ps").args(["-A", "-o", "pid=,tty=,comm="]),
+        Command::new("ps").args(["-A", "-o", "pid=,stat=,tty=,comm="]),
         "ps Codex discovery failed",
     )?;
     Ok(parse_codex_processes(&String::from_utf8_lossy(&stdout)))
@@ -758,12 +758,20 @@ fn parse_codex_processes(text: &str) -> Vec<CodexProcess> {
         let Some((pid_raw, rest)) = split_first_ws(line.trim()) else {
             continue;
         };
+        let Some((stat, rest)) = split_first_ws(rest) else {
+            continue;
+        };
         let Some((tty, command)) = split_first_ws(rest) else {
             continue;
         };
         let Ok(pid) = pid_raw.parse::<u32>() else {
             continue;
         };
+        // Zombies keep their command name but have no file descriptors, so
+        // lsof cannot inspect them. They are never live sessions.
+        if matches!(stat.chars().next(), Some('Z' | 'X')) {
+            continue;
+        }
         if command_basename(command) == Some("codex") {
             processes.push(CodexProcess {
                 pid,
@@ -781,10 +789,9 @@ fn rollout_paths_for_pid(pid: u32) -> Result<Vec<PathBuf>, String> {
     ) {
         Ok(stdout) => stdout,
         Err(error) => {
-            // A process may exit between ps and lsof.
-            if unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
-            {
+            // The process may have exited or become a zombie between ps and
+            // lsof. Neither has rollouts to discover.
+            if process_is_gone_or_zombie(pid) {
                 return Ok(Vec::new());
             }
             return Err(error);
@@ -796,6 +803,34 @@ fn rollout_paths_for_pid(pid: u32) -> Result<Vec<PathBuf>, String> {
         .filter(|path| is_codex_rollout(path))
         .map(PathBuf::from)
         .collect())
+}
+
+fn process_is_gone_or_zombie(pid: u32) -> bool {
+    if unsafe { libc::kill(pid as libc::pid_t, 0) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    {
+        return true;
+    }
+    matches!(process_state(pid), Some('Z' | 'X'))
+}
+
+fn process_state(pid: u32) -> Option<char> {
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
+        return stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.trim_start().chars().next());
+    }
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim_start()
+        .chars()
+        .next()
 }
 
 fn select_rollout(
@@ -1863,7 +1898,7 @@ mod tests {
     #[test]
     fn detached_daemon_does_not_own_its_launching_clients_pane() {
         let processes = parse_codex_processes(
-            "8633 ?? /opt/codex/bin/codex\n9284 ?? /opt/codex/bin/codex\n9170 ttys031 codex\n24666 ttys038 codex\n99 ? /opt/codex/bin/codex\n100 ttys031 codex-code-mode-host\nmalformed\n",
+            "8633 Ss ?? /opt/codex/bin/codex\n9284 S ?? /opt/codex/bin/codex\n9170 S+ ttys031 codex\n24666 S+ ttys038 codex\n99 S ? /opt/codex/bin/codex\n100 S+ ttys031 codex-code-mode-host\n4242 Zs ?? codex\n4243 Z ?? [codex] <defunct>\nmalformed\n",
         );
         assert_eq!(
             processes.iter().map(|p| p.pid).collect::<Vec<_>>(),

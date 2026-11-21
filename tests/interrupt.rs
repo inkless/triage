@@ -42,13 +42,13 @@ esac
             "ps",
             r#"
 case "$*" in
+*tty*) echo "$FIXTURE_PID S+ null codex"; echo "999998 S ? codex" ;;
 *stat*)
   [ "$SCENARIO" = process-failure ] && exit 1
   echo "$FIXTURE_PID 1 S 00:01 codex"
   [ "$SCENARIO" = child ] && echo "999999 $FIXTURE_PID S 00:00 sleep 60"
   [ "$SCENARIO" = changed ] && printf '\n{}\n' >> "$FIXTURE_ROLLOUT"
   ;;
-*tty*) echo "$FIXTURE_PID null codex"; echo "999998 ? codex" ;;
 *comm*) echo "$FIXTURE_PID codex"; echo "999998 codex" ;;
 *) echo "$FIXTURE_PID 1"; echo "999998 1"; echo "$PPID 999998" ;;
 esac

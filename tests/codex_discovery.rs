@@ -23,7 +23,7 @@ fn shared_daemon_descended_from_a_client_preserves_each_threads_pane_and_status(
             "ps",
             r#"
 case "$*" in
-*tty*) printf '8633 ?? /opt/codex/bin/codex\n9284 ?? /opt/codex/bin/codex\n9170 ttys031 codex\n24666 ttys038 codex\n' ;;
+*tty*) printf '8633 Ss ?? /opt/codex/bin/codex\n9284 S ?? /opt/codex/bin/codex\n9170 S+ ttys031 codex\n24666 S+ ttys038 codex\n' ;;
 *) printf '8633 9284\n9284 9170\n9170 9028\n24666 21893\n' ;;
 esac
 "#,

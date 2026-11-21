@@ -54,7 +54,7 @@ esac
                 r#"
 [ -n "$SANDBOXED" ] && { echo "ps: Operation not permitted" >&2; exit 1; }
 case "$*" in
-*tty*) echo "$CALLER_PID null codex"; echo "$TARGET_PID null codex" ;;
+*tty*) echo "$CALLER_PID S+ null codex"; echo "$TARGET_PID S+ null codex" ;;
 *comm*) echo "$CALLER_PID codex"; echo "$TARGET_PID codex" ;;
 *) echo "$CALLER_PID 1"; echo "$TARGET_PID 1"; echo "$PPID $CALLER_PID" ;;
 esac

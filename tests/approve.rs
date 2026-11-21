@@ -55,7 +55,7 @@ esac
             "ps",
             r#"
 case "$*" in
-*tty*) echo "$FIXTURE_PID null codex"; echo "999998 ? codex" ;;
+*tty*) echo "$FIXTURE_PID S+ null codex"; echo "999998 S ? codex" ;;
 *comm*) echo "$FIXTURE_PID codex"; echo "999998 codex" ;;
 *) echo "$FIXTURE_PID 1"; echo "999998 1"; echo "$PPID 999998" ;;
 esac
